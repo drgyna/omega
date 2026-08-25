@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Omega: conversación local y verificable con los documentos de un negocio"
 authors = ["Omega"]
 edition = "2024"
+default-run = "omega"
 
 [lib]
 name = "omega_core"

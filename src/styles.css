@@ -237,3 +237,13 @@ nav { padding: 2px 12px; display: flex; flex-direction: column; gap: 1px; }
   .source-card { flex-wrap: wrap; }
   .source-copy { flex-basis: calc(100% - 56px); }
 }
+
+/* Contexto conversacional: distintivo, alcance y aclaración. */
+.context-badge { display: flex; align-items: center; gap: 4px; background: var(--fill); color: var(--ink-2); border: 1px solid var(--border); border-radius: 5px; padding: 2px 7px; font-size: 9.5px; font-weight: 600; }
+.context-badge svg { width: 10px; height: 10px; stroke-width: 2; fill: none; stroke: currentColor; }
+.scope-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0 28px; }
+.scope-chips span { background: var(--fill); border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; font-size: 10.5px; color: var(--ink-2); }
+.clarification { margin: 10px 0 0 28px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px; background: var(--fill); }
+.clarification strong { display: block; font-size: 11px; color: var(--ink-2); margin-bottom: 4px; }
+.clarification p { font-size: 12.5px; margin: 0; }
+.clarification ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--ink-2); }

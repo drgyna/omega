@@ -7,10 +7,12 @@ use rusqlite::{OptionalExtension, ToSql, params, params_from_iter};
 use serde_json::{Value, json};
 
 use crate::{
+    calc::Operand,
     db::Database,
     error::{OmegaError, Result},
     model::{
-        AggregateRequest, AggregateRow, ConceptSummary, Evidence, SearchHit, ToolFilter, ToolResult,
+        AggregateRequest, AggregateRow, ConceptSummary, DateConstraint, Evidence, SearchHit,
+        ToolFilter, ToolResult,
     },
     normalize::{
         canonical_identifier, canonical_key, normalize_exact, normalize_literal, normalize_spanish,
@@ -1439,6 +1441,18 @@ impl ToolEngine {
         Ok(matches.into_iter().next().map(|(_, origin)| origin))
     }
 
+    /// Una pregunta que fija un literal entre comillas es una búsqueda literal
+    /// y no una consulta de razonamiento. El plan estructurado la deja pasar.
+    pub fn query_has_quoted_literal(query: &str) -> bool {
+        static QUOTED: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r#"["\u{201c}\u{201d}']([^"\u{201c}\u{201d}']+)["\u{201c}\u{201d}']"#)
+                .expect("valid quote regex")
+        });
+        QUOTED
+            .captures_iter(query)
+            .any(|capture| !normalize_spanish(&capture[1]).is_empty())
+    }
+
     /// Señales que obligan a conservar la semántica exacta de la búsqueda.
     /// El planificador la consulta antes de cualquier expansión textual.
     pub fn query_has_exact_signal(query: &str) -> bool {
@@ -1542,7 +1556,26 @@ impl ToolEngine {
             canonical_key(&left.concept) == canonical_key(&right.concept)
                 && normalize_spanish(&left.equals) == normalize_spanish(&right.equals)
         });
-        Ok(explicit)
+        Ok(prefer_literal_values(explicit, &exact_query))
+    }
+
+    /// Filtros de una pregunta, dando prioridad absoluta a los pares
+    /// «Campo: valor» escritos por el usuario.
+    ///
+    /// Cuando la pregunta nombra explícitamente un campo y un valor, ningún
+    /// otro campo entra por inferencia: el usuario ya dijo qué quería, y
+    /// añadirle un filtro adivinado cambia la respuesta sin avisar.
+    pub fn resolved_filters(
+        &self,
+        query: &str,
+        origin: Option<&str>,
+        allow_implicit_values: bool,
+    ) -> Result<Vec<ToolFilter>> {
+        let written = self.written_filters(query)?;
+        if !written.is_empty() {
+            return Ok(written.filters);
+        }
+        self.filters_from_query(query, origin, allow_implicit_values)
     }
 
     pub fn query_documents(
@@ -2135,6 +2168,42 @@ fn format_number(value: f64) -> String {
     }
 }
 
+/// Dos valores distintos del mismo campo no pueden cumplirse a la vez dentro de
+/// un documento: aplicados como intersección dan siempre cero. Cuando eso pasa,
+/// se conserva el valor que la pregunta escribe literalmente y se descartan los
+/// que sólo coincidieron por raíces compartidas —«Documentación pendiente»
+/// emparejaba con una pregunta que decía «documentos» y «Pendiente de emisión»,
+/// y entre los dos apagaban la consulta entera—.
+///
+/// Si más de un valor aparece literalmente, se conservan todos: eso ya no es
+/// una coincidencia accidental sino una comparación explícita entre dos grupos.
+fn prefer_literal_values(filters: Vec<ToolFilter>, exact_query: &str) -> Vec<ToolFilter> {
+    let mut competing: HashMap<String, usize> = HashMap::new();
+    for filter in &filters {
+        *competing.entry(canonical_key(&filter.concept)).or_insert(0) += 1;
+    }
+    let literal_by_concept = filters
+        .iter()
+        .filter(|filter| whole_phrase_in(exact_query, &normalize_exact(&filter.equals)))
+        .fold(HashMap::<String, usize>::new(), |mut counts, filter| {
+            *counts.entry(canonical_key(&filter.concept)).or_insert(0) += 1;
+            counts
+        });
+    filters
+        .into_iter()
+        .filter(|filter| {
+            let key = canonical_key(&filter.concept);
+            if competing.get(&key).copied().unwrap_or(0) < 2 {
+                return true;
+            }
+            if literal_by_concept.get(&key).copied().unwrap_or(0) != 1 {
+                return true;
+            }
+            whole_phrase_in(exact_query, &normalize_exact(&filter.equals))
+        })
+        .collect()
+}
+
 fn append_filters(sql: &mut String, values: &mut Vec<Box<dyn ToSql>>, filters: &[ToolFilter]) {
     for filter in filters {
         sql.push_str(
@@ -2639,4 +2708,587 @@ mod tabular_tests {
             Some("hoja Registros, fila 12")
         );
     }
+}
+
+/// Referencia mínima a un documento del alcance. No lleva contenido: sirve
+/// para definir un conjunto y para citarlo por su ruta real.
+#[derive(Clone, Debug)]
+pub struct DocumentRef {
+    pub id: i64,
+    pub path: String,
+    pub origin: String,
+    pub title: String,
+}
+
+/// Consulta de valores para el motor aritmético. Todos los límites del alcance
+/// viajan juntos, de modo que un cálculo nunca puede ejecutarse sobre un
+/// conjunto distinto del que la respuesta declara.
+#[derive(Clone, Debug, Default)]
+pub struct ValueQuery<'a> {
+    pub concept: &'a str,
+    pub filters: &'a [ToolFilter],
+    pub origin: Option<&'a str>,
+    /// Conjunto explícito de documentos. Cuando está presente manda sobre los
+    /// filtros: es el «conjunto anterior» de una conversación.
+    pub documents: Option<&'a [i64]>,
+    pub date: Option<&'a DateConstraint>,
+    pub group_by: Option<&'a str>,
+    pub currency: Option<&'a str>,
+}
+
+const ID_CHUNK: usize = 400;
+
+impl ToolEngine {
+    /// Acceso de sólo lectura a la base para los módulos que construyen
+    /// relaciones. Ningún módulo abre la base por su cuenta.
+    pub(crate) fn database(&self) -> &Database {
+        &self.database
+    }
+
+    pub fn concept_by_name(&self, name: &str) -> Result<Option<ConceptSummary>> {
+        let Some(id) = resolve_concept(&self.database, name)? else {
+            return Ok(None);
+        };
+        let connection = self.database.connect()?;
+        Ok(connection
+            .query_row(
+                "SELECT c.canonical_key, c.display_name, c.value_type,
+                        (SELECT COUNT(*) FROM extracted_values v WHERE v.concept_id = c.id)
+                 FROM concepts c WHERE c.id = ?1",
+                [id],
+                |row| {
+                    Ok(ConceptSummary {
+                        key: row.get(0)?,
+                        display_name: row.get(1)?,
+                        value_type: row.get(2)?,
+                        occurrences: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Conceptos presentes en un conjunto concreto de documentos, ordenados por
+    /// cuántos documentos del conjunto los contienen. Permite elegir el campo
+    /// fecha o el campo numérico de un conjunto sin conocer el negocio.
+    pub fn concepts_in_documents(&self, documents: &[i64]) -> Result<Vec<ConceptSummary>> {
+        if documents.is_empty() {
+            return Ok(vec![]);
+        }
+        let connection = self.database.connect()?;
+        let mut totals: BTreeMap<String, ConceptSummary> = BTreeMap::new();
+        for chunk in documents.chunks(ID_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT c.canonical_key, c.display_name, c.value_type, COUNT(DISTINCT v.document_id)
+                 FROM extracted_values v JOIN concepts c ON c.id = v.concept_id
+                 WHERE v.document_id IN ({placeholders})
+                 GROUP BY c.id"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+                Ok(ConceptSummary {
+                    key: row.get(0)?,
+                    display_name: row.get(1)?,
+                    value_type: row.get(2)?,
+                    occurrences: row.get(3)?,
+                })
+            })?;
+            for concept in rows {
+                let concept = concept?;
+                totals
+                    .entry(concept.key.clone())
+                    .and_modify(|stored| stored.occurrences += concept.occurrences)
+                    .or_insert(concept);
+            }
+        }
+        let mut concepts = totals.into_values().collect::<Vec<_>>();
+        concepts.sort_by(|left, right| {
+            right
+                .occurrences
+                .cmp(&left.occurrences)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        Ok(concepts)
+    }
+
+    /// Documentos que cumplen simultáneamente el alcance completo.
+    ///
+    /// El rango de fechas se ancla a un campo: ambos extremos se comprueban
+    /// contra el mismo valor, de modo que un documento con dos fechas
+    /// distintas no puede satisfacer un extremo con cada una.
+    pub fn documents_matching(
+        &self,
+        filters: &[ToolFilter],
+        origin: Option<&str>,
+        date: Option<&DateConstraint>,
+    ) -> Result<Vec<DocumentRef>> {
+        let connection = self.database.connect()?;
+        let mut sql =
+            String::from("SELECT d.id, d.path, d.origin, d.title FROM documents d WHERE 1 = 1");
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        append_origin(&mut sql, &mut values, origin);
+        append_filters(&mut sql, &mut values, filters);
+        append_date(&mut sql, &mut values, date);
+        sql.push_str(" ORDER BY d.id");
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(values.iter().map(|value| value.as_ref())),
+            |row| {
+                Ok(DocumentRef {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    origin: row.get(2)?,
+                    title: row.get(3)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Recupera los operandos de un cálculo con su evidencia y, si se pidió,
+    /// la etiqueta del grupo al que pertenece cada valor dentro de su propio
+    /// registro.
+    pub fn collect_operands(&self, query: &ValueQuery<'_>) -> Result<Vec<Operand>> {
+        let Some(concept_id) = resolve_concept(&self.database, query.concept)? else {
+            return Ok(vec![]);
+        };
+        let group_id = match query.group_by {
+            Some(name) => match resolve_concept(&self.database, name)? {
+                Some(id) => Some(id),
+                None => return Ok(vec![]),
+            },
+            None => None,
+        };
+        let connection = self.database.connect()?;
+        let mut operands = Vec::new();
+        let chunks: Vec<Vec<i64>> = match query.documents {
+            Some(documents) => {
+                if documents.is_empty() {
+                    return Ok(vec![]);
+                }
+                documents
+                    .chunks(ID_CHUNK)
+                    .map(<[i64]>::to_vec)
+                    .collect::<Vec<_>>()
+            }
+            None => vec![vec![]],
+        };
+        for chunk in chunks {
+            let mut sql = String::from(
+                "SELECT v.document_id, v.numeric_value, v.currency, v.location, v.excerpt,
+                        v.evidence_id, v.text_value, d.path, d.origin, c.display_name
+                 FROM extracted_values v
+                 JOIN documents d ON d.id = v.document_id
+                 JOIN concepts c ON c.id = v.concept_id
+                 WHERE v.concept_id = ?",
+            );
+            let mut values: Vec<Box<dyn ToSql>> = vec![Box::new(concept_id)];
+            if !chunk.is_empty() {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                sql.push_str(&format!(" AND v.document_id IN ({placeholders})"));
+                for id in &chunk {
+                    values.push(Box::new(*id));
+                }
+            } else {
+                append_origin(&mut sql, &mut values, query.origin);
+                append_filters(&mut sql, &mut values, query.filters);
+                append_date(&mut sql, &mut values, query.date);
+            }
+            if let Some(currency) = query.currency {
+                sql.push_str(" AND upper(v.currency) = upper(?)");
+                values.push(Box::new(currency.to_owned()));
+            }
+            sql.push_str(" ORDER BY v.document_id, v.id");
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement
+                .query_map(
+                    params_from_iter(values.iter().map(|value| value.as_ref())),
+                    |row| {
+                        let document_id: i64 = row.get(0)?;
+                        let text: String = row.get(6)?;
+                        Ok((
+                            document_id,
+                            row.get::<_, Option<f64>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            Evidence {
+                                id: row.get(5)?,
+                                document_id,
+                                path: row.get(7)?,
+                                origin: row.get(8)?,
+                                location: row.get(3)?,
+                                excerpt: row.get(4)?,
+                                normalized_value: Some(normalize_exact(&text)),
+                                value: Some(text.clone()),
+                                matched: Some(text),
+                                field: Some(row.get(9)?),
+                                match_kind: "campo".into(),
+                                reliable: true,
+                                confidence: None,
+                            },
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (document_id, numeric, currency, location, evidence) in rows {
+                let groups = match group_id {
+                    Some(group) => self.group_labels(&connection, document_id, group, &location)?,
+                    None => vec![None],
+                };
+                for group in groups {
+                    operands.push(Operand {
+                        document_id,
+                        numeric,
+                        currency: currency.clone(),
+                        group,
+                        evidence: evidence.clone(),
+                    });
+                }
+            }
+        }
+        Ok(operands)
+    }
+
+    /// Etiquetas de grupo aplicables a un valor. Reutiliza la unidad de
+    /// registro tabular para que el importe de una fila se asocie al grupo de
+    /// esa misma fila y no a todos los del archivo.
+    fn group_labels(
+        &self,
+        connection: &rusqlite::Connection,
+        document_id: i64,
+        group_concept: i64,
+        location: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT text_value, location FROM extracted_values
+             WHERE document_id = ?1 AND concept_id = ?2",
+        )?;
+        let found = statement
+            .query_map(params![document_id, group_concept], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        let scope = tabular_record_scope(location);
+        let labels = match scope {
+            Some(scope) => found
+                .into_iter()
+                .filter(|(_, place)| tabular_record_scope(place).as_deref() == Some(&scope))
+                .map(|(value, _)| value)
+                .collect::<Vec<_>>(),
+            None => found.into_iter().map(|(value, _)| value).collect(),
+        };
+        Ok(if labels.is_empty() {
+            vec![Some(NO_GROUP_VALUE.to_owned())]
+        } else {
+            labels.into_iter().map(Some).collect()
+        })
+    }
+}
+
+/// Etiqueta para el grupo de documentos que no declaran el campo de
+/// agrupación. Nombrarlo evita presentarlos como si pertenecieran a otro grupo.
+pub const NO_GROUP_VALUE: &str = "Sin valor";
+
+fn append_date(sql: &mut String, values: &mut Vec<Box<dyn ToSql>>, date: Option<&DateConstraint>) {
+    if let Some(date) = date {
+        sql.push_str(
+            " AND EXISTS (
+                SELECT 1 FROM extracted_values vd JOIN concepts cd ON cd.id = vd.concept_id
+                WHERE vd.document_id = d.id AND cd.canonical_key = ?
+                  AND vd.date_value IS NOT NULL
+                  AND vd.date_value >= ? AND vd.date_value <= ?
+              )",
+        );
+        values.push(Box::new(canonical_key(&date.concept)));
+        values.push(Box::new(date.from.clone()));
+        values.push(Box::new(date.to.clone()));
+    }
+}
+
+impl ToolEngine {
+    /// Una cita por documento del conjunto: su primer fragmento real. Permite
+    /// respaldar un conteo con los documentos que lo produjeron.
+    pub fn evidence_for_documents(&self, documents: &[i64], limit: usize) -> Result<Vec<Evidence>> {
+        if documents.is_empty() {
+            return Ok(vec![]);
+        }
+        let connection = self.database.connect()?;
+        let selected = documents.iter().take(limit.min(50)).collect::<Vec<_>>();
+        let placeholders = vec!["?"; selected.len()].join(",");
+        let sql = format!(
+            "SELECT d.id, d.path, d.origin, c.location, c.content
+             FROM documents d JOIN chunks c ON c.document_id = d.id
+             WHERE d.id IN ({placeholders})
+             GROUP BY d.id ORDER BY d.id"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(selected.iter()), |row| {
+            let document_id: i64 = row.get(0)?;
+            Ok(Evidence {
+                id: format!("doc-{document_id}"),
+                document_id,
+                path: row.get(1)?,
+                origin: row.get(2)?,
+                location: row.get(3)?,
+                excerpt: row.get(4)?,
+                normalized_value: None,
+                value: None,
+                matched: None,
+                field: None,
+                match_kind: "campo".into(),
+                reliable: true,
+                confidence: None,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
+/// Un par «Campo: valor» escrito por el usuario y ya resuelto contra el acervo.
+#[derive(Clone, Debug)]
+pub struct WrittenFilters {
+    /// Pares cuyo campo **y** valor existen tal cual.
+    pub filters: Vec<ToolFilter>,
+    /// Pares cuyo campo existe pero cuyo valor no aparece completo en el
+    /// acervo. Nunca se degradan a una coincidencia parcial.
+    pub unresolved: Vec<UnresolvedPair>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UnresolvedPair {
+    /// Nombre real del concepto que el usuario nombró.
+    pub concept: String,
+    /// Valor tal como lo escribió el usuario.
+    pub written: String,
+    /// Valores existentes emparentados con el escrito. Se ofrecen como
+    /// aclaración; jamás se aplican solos.
+    pub near: Vec<String>,
+}
+
+impl WrittenFilters {
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty() && self.unresolved.is_empty()
+    }
+}
+
+impl ToolEngine {
+    /// Resuelve los pares «Campo: valor» que la pregunta escribe literalmente.
+    ///
+    /// Un valor escrito por el usuario se exige **completo**: si pide
+    /// «Estado: Pendiente de emisión» y el acervo sólo tiene «Pendiente», el
+    /// par queda sin resolver y el motor tendrá que preguntar, nunca responder
+    /// con el valor recortado como si fuera el pedido.
+    pub fn written_filters(&self, question: &str) -> Result<WrittenFilters> {
+        let concepts = self.list_concepts(None)?;
+        let mut filters = Vec::new();
+        let mut unresolved = Vec::new();
+        let pairs = written_pairs(question);
+        for (index, (field_text, raw_value)) in pairs.iter().enumerate() {
+            let Some(concept) = concept_named_in(&concepts, field_text) else {
+                // Sin un campo real detrás, los dos puntos son puntuación, no
+                // un filtro. La pregunta sigue su curso normal.
+                continue;
+            };
+            let next_field = pairs
+                .get(index + 1)
+                .and_then(|(next, _)| concept_named_in(&concepts, next));
+            let value_text = trim_next_field(raw_value, next_field.as_ref());
+            if value_text.is_empty() {
+                continue;
+            }
+            let values = self.concept_values(&concept.display_name)?;
+            let wanted = normalize_spanish(&value_text);
+            if let Some(exact) = values
+                .iter()
+                .find(|value| normalize_spanish(value) == wanted)
+            {
+                filters.push(ToolFilter {
+                    concept: concept.display_name.clone(),
+                    equals: exact.clone(),
+                });
+                continue;
+            }
+            let near = values
+                .iter()
+                .filter(|value| {
+                    let candidate = normalize_spanish(value);
+                    candidate.contains(&wanted) || wanted.contains(&candidate)
+                })
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>();
+            unresolved.push(UnresolvedPair {
+                concept: concept.display_name.clone(),
+                written: value_text.clone(),
+                near,
+            });
+        }
+        Ok(WrittenFilters {
+            filters,
+            unresolved,
+        })
+    }
+
+    /// Valores de campos de texto o estado que la pregunta menciona
+    /// literalmente, con el campo al que pertenecen.
+    ///
+    /// A diferencia de la inferencia de filtros, aquí se exige que el valor
+    /// completo aparezca como frase en la pregunta: es lo que permite
+    /// reconocer los dos grupos de una comparación sin adivinar.
+    pub fn values_mentioned(&self, question: &str, origin: Option<&str>) -> Result<Vec<(String, String)>> {
+        let exact_query = normalize_exact(question);
+        let connection = self.database.connect()?;
+        let mut sql = String::from(
+            "SELECT DISTINCT c.display_name, v.text_value
+             FROM extracted_values v
+             JOIN concepts c ON c.id = v.concept_id
+             JOIN documents d ON d.id = v.document_id
+             WHERE v.value_type IN ('text', 'state')",
+        );
+        let mut parameters: Vec<Box<dyn ToSql>> = Vec::new();
+        append_origin(&mut sql, &mut parameters, origin);
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(
+                params_from_iter(parameters.iter().map(|value| value.as_ref())),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, value)| {
+                let normalized = normalize_exact(value);
+                !normalized.is_empty()
+                    && normalized.split_whitespace().count() <= 8
+                    && whole_phrase_in(&exact_query, &normalized)
+            })
+            .collect())
+    }
+
+    /// Posición de un valor dentro de la pregunta, para conservar el orden en
+    /// que el usuario nombró los grupos de una comparación.
+    pub fn mention_position(question: &str, value: &str) -> usize {
+        phrase_position(&normalize_exact(question), &normalize_exact(value)).unwrap_or(usize::MAX)
+    }
+}
+
+/// Extrae los pares «texto: texto» de una pregunta.
+///
+/// El valor de cada par llega hasta los siguientes dos puntos —o hasta el final
+/// de la pregunta—, sin cortarlo por conectores: un valor puede contener « y »
+/// («Evaluación de seguridad y notificación al responsable de turno») y
+/// partirlo ahí convertiría el filtro en otro más corto que el usuario no pidió.
+/// Separar dos filtros escritos seguidos es trabajo de quien conoce los nombres
+/// de campo reales.
+fn written_pairs(question: &str) -> Vec<(String, String)> {
+    let chars = question.char_indices().collect::<Vec<_>>();
+    let colons = chars
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, character))| *character == ':')
+        .filter(|(position, _)| !is_time_like_colon(&chars, *position))
+        .map(|(_, (index, _))| *index)
+        .collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+    for (position, colon) in colons.iter().enumerate() {
+        let start = position
+            .checked_sub(1)
+            .map(|previous| colons[previous] + 1)
+            .unwrap_or(0);
+        let end = colons.get(position + 1).copied().unwrap_or(question.len());
+        let field = question[start..*colon].trim();
+        let value = question[colon + 1..end].trim();
+        if field.is_empty() || value.is_empty() {
+            continue;
+        }
+        pairs.push((field.to_owned(), value.to_owned()));
+    }
+    pairs
+}
+
+/// ¿Es este colon parte de una hora u otro valor «dígito:dígito», como
+/// «10:30», en vez de un separador «Campo: valor»?
+///
+/// El nombre de un campo siempre termina en una letra, nunca en un dígito
+/// pegado al colon sin espacio: por eso basta con mirar los dos caracteres
+/// que rodean al colon. Sin esta distinción, «Hora: 10:30» se partía en dos
+/// pares por el colon interno y el valor quedaba truncado en «10».
+fn is_time_like_colon(chars: &[(usize, char)], position: usize) -> bool {
+    let before = position.checked_sub(1).map(|index| chars[index].1);
+    let after = chars.get(position + 1).map(|(_, character)| *character);
+    matches!(before, Some(character) if character.is_ascii_digit())
+        && matches!(after, Some(character) if character.is_ascii_digit())
+}
+
+/// Recorta del final de un valor el nombre de campo del par siguiente.
+///
+/// «Ciudad base: Norte y Estado: Abierto» deja «Norte y Estado» como valor del
+/// primer par; aquí se quitan las palabras justas que forman «Estado» y el
+/// conector que las unía, sin tocar valores que legítimamente contienen « y ».
+fn trim_next_field(value: &str, next: Option<&ConceptSummary>) -> String {
+    let cleaned = |text: &str| {
+        text.trim()
+            .trim_end_matches(['?', '.', '!', ',', ';'])
+            .trim()
+            .trim_end_matches(" y")
+            .trim_end_matches(" e")
+            .trim()
+            .to_owned()
+    };
+    let Some(concept) = next else {
+        return cleaned(value);
+    };
+    let wanted = search_terms(&concept.display_name);
+    let words = value.split_whitespace().collect::<Vec<_>>();
+    let limit = words.len().min(wanted.len() + 3);
+    for dropped in 1..=limit {
+        let tail = words[words.len() - dropped..].join(" ");
+        let tail_terms = search_terms(&tail);
+        if wanted.iter().all(|term| {
+            tail_terms
+                .iter()
+                .any(|candidate| stems_match(candidate, term))
+        }) {
+            return cleaned(&words[..words.len() - dropped].join(" "));
+        }
+    }
+    cleaned(value)
+}
+
+/// Concepto nombrado al final de un texto: se prueba con las últimas palabras,
+/// de la frase más larga a la más corta, y gana el nombre más específico.
+fn concept_named_in(concepts: &[ConceptSummary], text: &str) -> Option<ConceptSummary> {
+    let words = normalize_exact(text)
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut best: Option<ConceptSummary> = None;
+    for concept in concepts {
+        let concept_terms = search_terms(&concept.display_name);
+        if concept_terms.is_empty() {
+            continue;
+        }
+        // El nombre del campo debe aparecer completo y pegado al final del
+        // texto que precede a los dos puntos.
+        let tail = words
+            .iter()
+            .rev()
+            .take(concept_terms.len() + 2)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tail_terms = search_terms(&tail);
+        if concept_terms
+            .iter()
+            .all(|term| tail_terms.iter().any(|candidate| stems_match(candidate, term)))
+            && best
+                .as_ref()
+                .is_none_or(|current| search_terms(&current.display_name).len() < concept_terms.len())
+        {
+            best = Some(concept.clone());
+        }
+    }
+    best
 }

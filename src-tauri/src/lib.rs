@@ -1,6 +1,9 @@
 mod agent;
 mod answer;
 mod app;
+mod calc;
+mod conversation;
+mod dates;
 mod db;
 mod error;
 pub mod evaluation;
@@ -11,10 +14,13 @@ mod normalize;
 mod ocr;
 mod parser;
 mod planner;
+mod relations;
+mod report;
 mod tools;
 mod verifier;
 
 pub use app::OmegaEngine;
+pub use dates::{CivilDate, Clock};
 pub use db::Database;
 pub use error::{OmegaError, Result};
 pub use model::*;
@@ -68,6 +74,24 @@ fn ask(engine: State<'_, OmegaEngine>, question: String) -> Result<Answer> {
     engine.ask(&question)
 }
 
+/// Pregunta dentro de una conversación. La interfaz decide la clave; el motor
+/// nunca mezcla dos conversaciones ni persiste ninguna.
+#[tauri::command]
+fn ask_in_conversation(
+    engine: State<'_, OmegaEngine>,
+    conversation: String,
+    question: String,
+) -> Result<Answer> {
+    engine.ask_in_conversation(&conversation, &question)
+}
+
+/// Inicia una conversación nueva borrando el contexto de la anterior.
+#[tauri::command]
+fn reset_conversation(engine: State<'_, OmegaEngine>, conversation: String) -> Result<()> {
+    engine.reset_conversation(&conversation);
+    Ok(())
+}
+
 #[tauri::command]
 fn open_document(engine: State<'_, OmegaEngine>, path: String) -> Result<()> {
     engine.open_document(std::path::Path::new(&path))
@@ -94,6 +118,8 @@ pub fn run() {
             list_concepts,
             search_documents,
             ask,
+            ask_in_conversation,
+            reset_conversation,
             open_document,
         ])
         .run(tauri::generate_context!())

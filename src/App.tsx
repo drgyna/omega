@@ -1,5 +1,5 @@
 import { Fragment, FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
-import { Answer, AppStatus, ConceptSummary, IndexReport, SourceSummary, ViewName, api, displayError } from "./api";
+import { Answer, AnswerScope, AppStatus, ConceptSummary, IndexReport, SourceSummary, ViewName, api, displayError } from "./api";
 
 const EMPTY_STATUS: AppStatus = {
   sources: 0,
@@ -21,6 +21,7 @@ export default function App() {
   const [sources, setSources] = useState<SourceSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [thread, setThread] = useState(0);
+  const [conversation, setConversation] = useState(() => newConversationId());
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   const refresh = useCallback(async () => {
@@ -39,11 +40,18 @@ export default function App() {
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-hidden"}`}>
       {sidebarOpen && <Sidebar active={view} sources={sources} onNavigate={setView}
-        onNewConversation={() => { setThread((n) => n + 1); setView("conversation"); }} />}
+        onNewConversation={() => {
+          // Borrar el contexto es una operación del motor, no de la interfaz:
+          // el hilo visual y la memoria del backend se reinician juntos.
+          void api.resetConversation(conversation).catch(() => undefined);
+          setConversation(newConversationId());
+          setThread((n) => n + 1);
+          setView("conversation");
+        }} />}
       <main className="workspace">
         <Topbar status={status} sidebarOpen={sidebarOpen} onToggleSidebar={() => setSidebarOpen((open) => !open)} />
         {error && <Toast message={error} onClose={() => setError(null)} />}
-        {view === "conversation" && <Conversation key={thread} status={status} sources={sources} onNavigate={setView} onError={setError} />}
+        {view === "conversation" && <Conversation key={thread} conversation={conversation} status={status} sources={sources} onNavigate={setView} onError={setError} />}
         {view === "sources" && <Sources sources={sources} onChanged={refresh} onError={setError} />}
         {view === "settings" && <Settings status={status} onError={setError} />}
       </main>
@@ -106,7 +114,7 @@ function Topbar({ status, sidebarOpen, onToggleSidebar }: { status: AppStatus; s
   );
 }
 
-function Conversation({ status, sources, onNavigate, onError }: { status: AppStatus; sources: SourceSummary[]; onNavigate: (view: ViewName) => void; onError: (error: string) => void }) {
+function Conversation({ conversation, status, sources, onNavigate, onError }: { conversation: string; status: AppStatus; sources: SourceSummary[]; onNavigate: (view: ViewName) => void; onError: (error: string) => void }) {
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<ChatItem[]>([]);
@@ -122,7 +130,7 @@ function Conversation({ status, sources, onNavigate, onError }: { status: AppSta
     setQuestion("");
     setBusy(true);
     try {
-      const answer = await api.ask(text);
+      const answer = await api.ask(conversation, text);
       setMessages((items) => [...items, { id: id + 1, role: "omega", text: answer.text, answer }]);
     } catch (reason) {
       onError(displayError(reason));
@@ -179,22 +187,45 @@ function PromptIdeas({ onSelect }: { onSelect: (value: string) => void }) {
 function Message({ item }: { item: ChatItem }) {
   if (item.role === "user") return <div className="user-message">{item.text}</div>;
   const answer = item.answer!;
-  const [visibleResults, setVisibleResults] = useState(20);
+  // Un cálculo cita su nota local y una muestra de operandos; el resto se pide
+  // a propósito.
+  const isCalculation = answer.citations.some((citation) => citation.match_kind === "cálculo");
+  const [visibleResults, setVisibleResults] = useState(isCalculation ? 8 : 20);
   const visibleCitations = answer.citations.slice(0, visibleResults);
   return (
     <article className="omega-message">
-      <div className="answer-heading"><div className="mini-mark">Ω</div><strong>Omega</strong>{answer.verified && <span className="verified"><CheckIcon /> Verificada</span>}<em>Local</em></div>
-      <div className="answer-body"><MarkdownLite text={item.text} /></div>
+      <div className="answer-heading"><div className="mini-mark">Ω</div><strong>Omega</strong>{answer.verified && <span className="verified"><CheckIcon /> Verificada</span>}{answer.used_context && <span className="context-badge" title="Esta respuesta continúa el resultado anterior de la conversación"><LinkIcon /> Usa el contexto anterior</span>}<em>Local</em></div>
+      {/* Una aclaración se muestra sólo en su bloque: repetirla en el cuerpo
+          obligaba a leer dos veces la misma pregunta. */}
+      {!answer.clarification && <div className="answer-body"><MarkdownLite text={item.text} /></div>}
+      {answer.scope && <ScopeChips scope={answer.scope} />}
+      {answer.clarification && <div className="clarification"><strong>Necesito una aclaración</strong><p>{answer.clarification.question}</p>{answer.clarification.options.length > 0 && <ul>{answer.clarification.options.map((option) => <li key={option}>{option}</li>)}</ul>}</div>}
       {answer.warning && <div className="answer-warning">{answer.warning}</div>}
       {answer.citations.length > 0 && (
         <div className="citations"><h3>Documentos y evidencia</h3>{visibleCitations.map((source, index) => (
           <button key={source.id} onClick={() => void api.openDocument(source.path)}>
             <span>{index + 1}</span><div><strong>{fileName(source.path)}</strong><small>{source.match_kind} · {source.origin} · {source.location}{source.field ? ` · ${source.field}` : ""}</small>{source.value && <small>Valor: {source.value}{source.normalized_value ? ` · Canónico: ${source.normalized_value}` : ""}</small>}<small className="evidence-excerpt">{highlight(source.excerpt, source.matched)}</small>{!source.reliable && <small className="evidence-warning">OCR de baja confianza</small>}</div><ExternalIcon />
           </button>
-        ))}{visibleResults < answer.citations.length && <button className="quiet-button" onClick={() => setVisibleResults((count) => count + 20)}>Ver más resultados</button>}</div>
+        ))}{visibleResults < answer.citations.length && <button className="quiet-button" onClick={() => setVisibleResults((count) => count + 20)}>Ver más evidencia ({answer.citations.length - visibleResults})</button>}</div>
       )}
     </article>
   );
+}
+
+/** Filtros, periodo y tamaño del conjunto que produjeron la respuesta. Es el
+ * mismo dato que consultó el motor, no un resumen escrito aparte. */
+function ScopeChips({ scope }: { scope: AnswerScope }) {
+  const chips: string[] = [];
+  if (scope.inherited) chips.push("Resultado anterior");
+  if (scope.origin) chips.push(`Carpeta: ${scope.origin}`);
+  scope.filters.forEach((filter) => chips.push(`${filter.concept}: ${filter.equals}`));
+  if (scope.date) chips.push(`${scope.date.concept}: ${scope.date.from} → ${scope.date.to}`);
+  if (scope.concept) chips.push(`Campo: ${scope.concept}`);
+  if (scope.group_by) chips.push(`Agrupado por: ${scope.group_by}`);
+  if (scope.document_count !== null) chips.push(`${scope.document_count.toLocaleString("es-MX")} documentos`);
+  if (scope.value_count !== null) chips.push(`${scope.value_count.toLocaleString("es-MX")} valores`);
+  if (chips.length === 0) return null;
+  return <div className="scope-chips">{chips.map((chip) => <span key={chip}>{chip}</span>)}</div>;
 }
 
 /// Renderizador mínimo para el texto que redacta `answer.rs`: reconoce
@@ -351,6 +382,9 @@ function Toast({ message, onClose }: { message: string; onClose: () => void }) {
   return <div className="toast"><span>!</span><p>{message}</p><button onClick={onClose}>×</button></div>;
 }
 
+function newConversationId() {
+  return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 function fileName(path: string) { return path.split(/[\\/]/).filter(Boolean).pop() ?? path; }
 function highlight(text: string, matched: string | null) {
   if (!matched?.trim()) return text;
@@ -372,4 +406,5 @@ function DocumentIcon() { return icon(<><path d="M14 3.5H7.5A1.5 1.5 0 0 0 6 5v1
 function ArrowIcon() { return icon(<><path d="M5 12h14M14 7l5 5-5 5" /></>); }
 function CheckIcon() { return icon(<path d="m5 12 4 4L19 6" />); }
 function ExternalIcon() { return icon(<><path d="M13 5h6v6M19 5l-8 8" /><path d="M17 13v5H6V7h5" /></>); }
+function LinkIcon() { return icon(<><path d="M10 13.5a3.5 3.5 0 0 0 5 0l2.5-2.5a3.5 3.5 0 0 0-5-5L11 7.5" /><path d="M14 10.5a3.5 3.5 0 0 0-5 0L6.5 13a3.5 3.5 0 0 0 5 5l1.5-1.5" /></>); }
 function DatabaseIcon() { return icon(<><ellipse cx="12" cy="5.5" rx="7" ry="3" /><path d="M5 5.5v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6M5 11.5v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" /></>); }

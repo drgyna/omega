@@ -40,9 +40,40 @@ export interface Evidence {
   value: string | null;
   matched: string | null;
   field: string | null;
-  match_kind: "exacta" | "canónica" | "campo" | "texto" | "prefijo" | "contiene";
+  match_kind: "exacta" | "canónica" | "campo" | "texto" | "prefijo" | "contiene" | "cálculo";
   reliable: boolean;
   confidence: number | null;
+}
+
+export interface DateConstraint {
+  concept: string;
+  from: string;
+  to: string;
+}
+
+export interface ToolFilter {
+  concept: string;
+  equals: string;
+}
+
+/** Alcance exacto que el motor consultó para producir la respuesta. */
+export interface AnswerScope {
+  filters: ToolFilter[];
+  origin: string | null;
+  concept: string | null;
+  group_by: string | null;
+  date: DateConstraint | null;
+  currency: string | null;
+  document_count: number | null;
+  value_count: number | null;
+  inherited: boolean;
+}
+
+/** Pregunta que Omega devuelve cuando no puede saber a qué se refiere. */
+export interface Clarification {
+  question: string;
+  options: string[];
+  reason: string;
 }
 
 export interface Answer {
@@ -51,6 +82,9 @@ export interface Answer {
   verified: boolean;
   citations: Evidence[];
   warning: string | null;
+  used_context: boolean;
+  scope: AnswerScope | null;
+  clarification: Clarification | null;
 }
 
 export interface ConceptSummary {
@@ -77,7 +111,10 @@ export const api = {
   index: (sourceId: number) => mutation(() => invoke<IndexReport>("index_source", { sourceId })),
   revoke: (sourceId: number) => mutation(() => invoke<void>("revoke_source", { sourceId })),
   concepts: (query?: string) => desktopOnly(() => invoke<ConceptSummary[]>("list_concepts", { query: query || null }), []),
-  ask: (question: string) => mutation(() => invoke<Answer>("ask", { question })),
+  ask: (conversation: string, question: string) =>
+    mutation(() => invoke<Answer>("ask_in_conversation", { conversation, question })),
+  resetConversation: (conversation: string) =>
+    mutation(() => invoke<void>("reset_conversation", { conversation })),
   openDocument: (path: string) => mutation(() => invoke<void>("open_document", { path }))
 };
 

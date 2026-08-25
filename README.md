@@ -19,6 +19,16 @@ construida con Tauri v2, Rust, SQLite/FTS5 y React/TypeScript.
   no salen del equipo.
 - El planificador local decide la ruta de búsqueda; Rust calcula y devuelve evidencia. Un
   verificador bloquea cualquier cifra, fecha, identificador o nombre propio no respaldado.
+- La conversación recuerda hechos estructurados —predicado del conjunto, campo, agrupación,
+  periodo, moneda y evidencia—, nunca una interpretación libre del texto. «Nueva conversación»
+  borra ese contexto en el motor, no sólo en la pantalla.
+- Los importes se suman como enteros de escala fija, nunca en coma flotante, y dos monedas
+  distintas jamás comparten un total. Toda cifra derivada se cita como cálculo local con el
+  número de valores que la produjeron.
+- Dos documentos sólo se relacionan cuando comparten una clave estable. Nombres parecidos no
+  crean vínculos: Omega lo dice en lugar de unirlos.
+- La fecha actual es inyectable: «el mes anterior» se resuelve a fechas concretas visibles en
+  la respuesta, nunca a un implícito.
 
 ## Desarrollo
 

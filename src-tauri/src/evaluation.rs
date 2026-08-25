@@ -1520,10 +1520,17 @@ fn run_corpus(corpus: &OracleCorpus, cases: Vec<EvalCase>) -> Vec<CaseResult> {
         let _ = fs::remove_dir_all(&temp);
         return vec![result];
     }
-    let results = cases
+    let mut results = cases
         .into_iter()
         .map(|case| evaluate_case(&engine, case))
         .collect::<Vec<_>>();
+    // Los escenarios conversacionales usan el mismo motor ya indexado, pero
+    // cada uno con su propia clave de conversación.
+    results.extend(run_conversations(
+        &engine,
+        &corpus.id,
+        generate_conversations(corpus),
+    ));
     drop(engine);
     let _ = fs::remove_dir_all(&temp);
     results
@@ -2006,7 +2013,435 @@ mod tests {
             verified: true,
             citations: vec![],
             warning: None,
+            ..Answer::default()
         };
         assert!(!evaluate_answer(&expectation, &answer).0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Escenarios conversacionales
+//
+// Un escenario encadena varios turnos sobre una misma conversación. El oráculo
+// vuelve a leer el corpus por su cuenta —los mismos ficheros, con su propio
+// lector y su propio parser de importes— y calcula qué debe responder cada
+// turno. La lógica de producción no participa en el cálculo esperado.
+// ---------------------------------------------------------------------------
+
+/// Turno de una conversación evaluada.
+#[derive(Clone, Debug)]
+struct ConversationTurn {
+    question: String,
+    facts: Value,
+    expectation: TurnExpectation,
+    /// Antes de preguntar, se borra el contexto: sirve para comprobar que una
+    /// conversación nueva no hereda nada.
+    reset_before: bool,
+}
+
+#[derive(Clone, Debug)]
+enum TurnExpectation {
+    /// La respuesta cuenta documentos del conjunto y sólo cita esos.
+    DocumentCount {
+        count: usize,
+        paths: BTreeSet<String>,
+    },
+    /// La suma se calcula sobre el conjunto anterior, no sobre todo el acervo.
+    ContextTotal {
+        field: String,
+        total: f64,
+        values: usize,
+        paths: BTreeSet<String>,
+        /// Total de todo el acervo para ese campo: aparecer aquí significaría
+        /// que el contexto se perdió.
+        acervo_total: f64,
+    },
+    /// La petición de evidencia devuelve exactamente los documentos usados.
+    SupportingDocuments { paths: BTreeSet<String> },
+    /// El motor pide aclaración con un motivo concreto.
+    Clarification { reason: String },
+}
+
+#[derive(Clone, Debug)]
+struct ConversationScenario {
+    id: String,
+    category: &'static str,
+    turns: Vec<ConversationTurn>,
+}
+
+/// Deriva escenarios conversacionales del corpus, sin vocabulario fijo: elige
+/// un campo repetido con al menos dos documentos y un campo monetario presente
+/// en todos ellos.
+fn generate_conversations(corpus: &OracleCorpus) -> Vec<ConversationScenario> {
+    let Some(series) = discover_money_series(corpus)
+        .into_iter()
+        .find(|series| series.values.len() >= 3)
+    else {
+        return vec![];
+    };
+    let documents_with_money = series
+        .values
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<BTreeSet<_>>();
+    let amount_by_document = series
+        .values
+        .iter()
+        .copied()
+        .collect::<BTreeMap<usize, f64>>();
+    let acervo_total = series.values.iter().map(|(_, value)| value).sum::<f64>();
+
+    // Campo repetido que parte el acervo en un subconjunto propio: ni un solo
+    // documento ni todos.
+    let mut candidates: Vec<(String, String, BTreeSet<usize>)> = Vec::new();
+    for ((label, value), _) in field_value_paths(corpus) {
+        if label == series.field || is_identifier_field(&label, &value) {
+            continue;
+        }
+        let members = corpus
+            .documents
+            .iter()
+            .enumerate()
+            .filter(|(_, document)| {
+                document
+                    .fields
+                    .iter()
+                    .any(|(field, item)| field == &label && item == &value)
+            })
+            .map(|(index, _)| index)
+            .collect::<BTreeSet<_>>();
+        let inside = members
+            .intersection(&documents_with_money)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if inside.len() >= 2 && inside.len() < documents_with_money.len() && inside == members {
+            candidates.push((label, value, inside));
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .2
+            .len()
+            .cmp(&left.2.len())
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let Some((field, value, members)) = candidates.into_iter().next() else {
+        return vec![];
+    };
+
+    let paths = members
+        .iter()
+        .map(|index| corpus.documents[*index].path.clone())
+        .collect::<BTreeSet<_>>();
+    let total = members
+        .iter()
+        .filter_map(|index| amount_by_document.get(index))
+        .sum::<f64>();
+    let values = members.len();
+
+    // ¿Cuántos campos numéricos distintos conviven en ese conjunto? De eso
+    // depende qué debe responder el motor: con uno solo la continuación se
+    // resuelve sola; con varios, «¿cuánto suman?» es genuinamente ambigua y lo
+    // correcto es preguntar en vez de elegir un campo.
+    //
+    // El oráculo reimplementa la regla del índice —el tipo de un campo lo fija
+    // su primera aparición, en el mismo orden alfabético en que se recorren los
+    // archivos— con sus propias expresiones regulares.
+    let mut first_value: BTreeMap<String, String> = BTreeMap::new();
+    for document in &corpus.documents {
+        for (label, raw) in &document.fields {
+            first_value
+                .entry(label.clone())
+                .or_insert_with(|| raw.clone());
+        }
+    }
+    let money_fields = corpus
+        .documents
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| members.contains(index))
+        .flat_map(|(_, document)| document.fields.iter().map(|(label, _)| label.clone()))
+        .filter(|label| {
+            first_value
+                .get(label)
+                .is_some_and(|value| oracle_value_is_numeric(value))
+        })
+        .collect::<BTreeSet<_>>();
+    let ambiguous_field = money_fields.len() > 1;
+
+    let count_question = format!("¿Cuántos documentos tienen {field}: {value}?");
+    let mut continuity = vec![
+        ConversationTurn {
+            question: count_question.clone(),
+            facts: json!({ "campo": field, "valor": value, "documentos": values }),
+            expectation: TurnExpectation::DocumentCount {
+                count: values,
+                paths: paths.clone(),
+            },
+            reset_before: true,
+        },
+    ];
+    if ambiguous_field {
+        // Con varios campos numéricos en el mismo conjunto, la continuación sin
+        // campo debe pedir aclaración en vez de elegir uno.
+        continuity.push(ConversationTurn {
+            question: "¿Cuánto suman?".into(),
+            facts: json!({
+                "espera": "aclaracion",
+                "campos_numericos": money_fields.iter().cloned().collect::<Vec<_>>()
+            }),
+            expectation: TurnExpectation::Clarification {
+                reason: "campo_ambiguo".into(),
+            },
+            reset_before: false,
+        });
+    }
+    // Responder con una de las opciones ofrecidas debe ejecutar la operación
+    // pendiente sobre el mismo conjunto, no lanzar una consulta nueva sobre
+    // todo el acervo.
+    let sum_question = if ambiguous_field {
+        series.field.clone()
+    } else {
+        "¿Cuánto suman?".to_owned()
+    };
+    let mut scenarios = vec![ConversationScenario {
+        id: "conversacion-continuidad".into(),
+        category: "H",
+        turns: {
+            continuity.push(ConversationTurn {
+                question: sum_question,
+                facts: json!({
+                    "campo_sumado": series.field,
+                    "total_del_conjunto": total,
+                    "valores": values,
+                    "total_del_acervo": acervo_total
+                }),
+                expectation: TurnExpectation::ContextTotal {
+                    field: series.field.clone(),
+                    total,
+                    values,
+                    paths: paths.clone(),
+                    acervo_total,
+                },
+                reset_before: false,
+            });
+            continuity.push(ConversationTurn {
+                question: "¿Qué documentos respaldan ese total?".into(),
+                facts: json!({ "documentos": paths.len() }),
+                expectation: TurnExpectation::SupportingDocuments {
+                    paths: paths.clone(),
+                },
+                reset_before: false,
+            });
+            continuity
+        },
+    }];
+
+    scenarios.push(ConversationScenario {
+        id: "valor-inexistente".into(),
+        category: "H",
+        turns: vec![ConversationTurn {
+            // El valor real más una palabra que no está en el acervo: el motor
+            // no puede recortarlo hasta encontrar algo parecido.
+            question: format!("¿Cuántos documentos tienen {field}: {value} inexistente?"),
+            facts: json!({
+                "campo": field,
+                "valor_pedido": format!("{value} inexistente"),
+                "espera": "aclaracion sin degradar el valor"
+            }),
+            expectation: TurnExpectation::Clarification {
+                reason: "valor_inexistente".into(),
+            },
+            reset_before: true,
+        }],
+    });
+
+    scenarios.push(ConversationScenario {
+        id: "conversacion-referencia-ambigua".into(),
+        category: "H",
+        turns: vec![ConversationTurn {
+            question: "¿Cuánto suman esos?".into(),
+            facts: json!({ "espera": "aclaracion" }),
+            expectation: TurnExpectation::Clarification {
+                reason: "referencia_sin_contexto".into(),
+            },
+            reset_before: true,
+        }],
+    });
+
+    scenarios.push(ConversationScenario {
+        id: "conversacion-contexto-borrado".into(),
+        category: "H",
+        turns: vec![
+            ConversationTurn {
+                question: count_question,
+                facts: json!({ "documentos": values }),
+                expectation: TurnExpectation::DocumentCount {
+                    count: values,
+                    paths,
+                },
+                reset_before: true,
+            },
+            ConversationTurn {
+                question: "¿Cuánto suman?".into(),
+                facts: json!({ "espera": "aclaracion tras borrar el contexto" }),
+                expectation: TurnExpectation::Clarification {
+                    reason: "sin_contexto".into(),
+                },
+                // El borrado ocurre entre los dos turnos: es la prueba de que
+                // «Nueva conversación» olvida de verdad.
+                reset_before: true,
+            },
+        ],
+    });
+    scenarios
+}
+
+/// ¿Este valor sería numérico para el índice? Reproduce, de forma
+/// independiente, las tres formas que el clasificador reconoce como número:
+/// importe, porcentaje y número simple.
+fn oracle_value_is_numeric(raw: &str) -> bool {
+    let money = Regex::new(r"^\$?\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s*(?:[A-Z]{3})?$")
+        .expect("valid independent money regex");
+    let percentage = Regex::new(r"^[0-9][0-9,]*(?:\.[0-9]+)?\s*%$")
+        .expect("valid independent percentage regex");
+    let value = raw.trim();
+    (money.is_match(value) && (value.contains('$') || value.ends_with(char::is_uppercase)))
+        || percentage.is_match(value)
+        || value
+            .replace(',', "")
+            .parse::<f64>()
+            .is_ok()
+}
+
+fn run_conversations(
+    engine: &OmegaEngine,
+    corpus: &str,
+    scenarios: Vec<ConversationScenario>,
+) -> Vec<CaseResult> {
+    let mut results = Vec::new();
+    for scenario in scenarios {
+        let conversation = format!("{corpus}-{}", scenario.id);
+        for (index, turn) in scenario.turns.into_iter().enumerate() {
+            if turn.reset_before {
+                engine.reset_conversation(&conversation);
+            }
+            let started = Instant::now();
+            let id = format!("{}-{}-t{}", corpus, scenario.id, index + 1);
+            match engine.ask_in_conversation(&conversation, &turn.question) {
+                Ok(answer) => {
+                    let (passed, message) = evaluate_turn(&turn.expectation, &answer);
+                    results.push(CaseResult {
+                        id,
+                        corpus: corpus.to_owned(),
+                        category: scenario.category.to_owned(),
+                        format: None,
+                        file: None,
+                        question: turn.question,
+                        expected: turn.facts,
+                        obtained: json!({
+                            "text": answer.text,
+                            "verified": answer.verified,
+                            "used_context": answer.used_context,
+                            "citation_count": answer.citations.len()
+                        }),
+                        status: if passed {
+                            CaseStatus::Passed
+                        } else {
+                            CaseStatus::Failed
+                        },
+                        duration_ms: started.elapsed().as_millis(),
+                        citations: answer
+                            .citations
+                            .iter()
+                            .map(|evidence| CitationRecord {
+                                path: evidence.path.clone(),
+                                origin: evidence.origin.clone(),
+                                location: evidence.location.clone(),
+                                excerpt: evidence.excerpt.clone(),
+                                field: evidence.field.clone(),
+                                value: evidence.value.clone(),
+                            })
+                            .collect(),
+                        indexing_errors: vec![],
+                        error: (!passed).then_some(message),
+                    });
+                }
+                Err(error) => results.push(system_failure(corpus, "conversacion", error.to_string())),
+            }
+        }
+    }
+    results
+}
+
+fn evaluate_turn(expectation: &TurnExpectation, answer: &Answer) -> (bool, String) {
+    let cited = answer
+        .citations
+        .iter()
+        .filter(|evidence| evidence.match_kind != "cálculo")
+        .map(|evidence| canonical_path_string(Path::new(&evidence.path)))
+        .collect::<BTreeSet<_>>();
+    match expectation {
+        TurnExpectation::DocumentCount { count, paths } => {
+            let expected_paths = paths
+                .iter()
+                .map(|path| canonical_path_string(Path::new(path)))
+                .collect::<BTreeSet<_>>();
+            let outside = cited.difference(&expected_paths).count();
+            (
+                text_has_usize(&answer.text, *count) && answer.verified && outside == 0,
+                "el conteo, la verificación o las citas del conjunto no coinciden".into(),
+            )
+        }
+        TurnExpectation::ContextTotal {
+            field,
+            total,
+            values,
+            paths,
+            acervo_total,
+        } => {
+            let expected_paths = paths
+                .iter()
+                .map(|path| canonical_path_string(Path::new(path)))
+                .collect::<BTreeSet<_>>();
+            let outside = cited.difference(&expected_paths).count();
+            let leaked = (acervo_total - total).abs() > 0.005
+                && text_has_number(&answer.text, *acervo_total);
+            let scope_is_right = answer
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.inherited && scope.value_count == Some(*values as i64));
+            (
+                text_has_number(&answer.text, *total)
+                    && answer.used_context
+                    && answer.verified
+                    && scope_is_right
+                    && outside == 0
+                    && !leaked
+                    && answer.text.contains(field.as_str()),
+                "la suma contextual, su alcance o sus citas no corresponden al conjunto anterior"
+                    .into(),
+            )
+        }
+        TurnExpectation::SupportingDocuments { paths } => {
+            let expected_paths = paths
+                .iter()
+                .map(|path| canonical_path_string(Path::new(path)))
+                .collect::<BTreeSet<_>>();
+            (
+                answer.used_context && !cited.is_empty() && cited.is_subset(&expected_paths),
+                "la evidencia del total no corresponde a los documentos usados".into(),
+            )
+        }
+        TurnExpectation::Clarification { reason } => (
+            answer
+                .clarification
+                .as_ref()
+                .is_some_and(|clarification| clarification.reason == *reason)
+                && !answer.verified
+                && answer.citations.is_empty(),
+            format!("se esperaba una aclaración con motivo «{reason}»"),
+        ),
     }
 }

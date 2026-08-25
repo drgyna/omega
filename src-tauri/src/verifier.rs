@@ -143,6 +143,7 @@ pub fn verify_model_answer(raw: &str, available: &[Evidence]) -> Result<Answer> 
         verified: true,
         citations: used,
         warning: None,
+        ..Answer::default()
     })
 }
 

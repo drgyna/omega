@@ -56,3 +56,44 @@ En macOS el OCR usa Vision/PDFKit local. Un sandbox de automatización que niegu
 Vision puede devolver cero líneas aunque la aplicación nativa funcione; por eso la validación OCR
 debe ejecutarse en el mismo contexto nativo en que se distribuirá Omega. No hay OCR remoto ni una
 ruta de red alternativa.
+
+## Escenarios conversacionales
+
+Además de las preguntas sueltas, la fábrica encadena turnos sobre una misma
+conversación (`ask_in_conversation`) y comprueba que el contexto se comporte:
+
+- **Continuidad.** Un conteo con filtro establece un conjunto; el turno siguiente
+  suma sobre ese conjunto y no sobre el acervo. El oráculo calcula por su cuenta
+  el total del subconjunto y el total del acervo: si el motor devolviera el
+  segundo, el caso falla. Después se pide la evidencia del total y se verifica
+  que las citas sean exactamente los documentos usados.
+- **Ambigüedad de campo.** Si el conjunto tiene más de un campo numérico, el
+  oráculo espera una **aclaración**, no una cifra. El oráculo decide esto
+  releyendo el corpus y reimplementando la regla del índice (el tipo de un campo
+  lo fija su primera aparición), sin llamar a la lógica de producción.
+- **Elección de la aclaración.** Cuando el motor pregunta qué campo usar, el
+  escenario responde con una de las opciones ofrecidas y comprueba que la suma
+  se calcule sobre el conjunto anterior, con su alcance heredado y sus citas
+  —no sobre todo el acervo—.
+- **Valor inexistente.** El valor real más una palabra que no está en el acervo
+  debe producir una aclaración con motivo `valor_inexistente`, nunca el conteo
+  del valor recortado.
+- **Referencia sin contexto.** «¿Cuánto suman esos?» en una conversación nueva
+  debe pedir aclaración con el motivo `referencia_sin_contexto`.
+- **Contexto borrado.** Tras `reset_conversation`, la misma continuación que
+  antes funcionaba debe volver a pedir aclaración: «Nueva conversación» olvida de
+  verdad.
+
+Estos casos se generan a partir del propio corpus —un campo repetido que parta el
+acervo y un campo monetario presente en esos documentos—, así que no dependen del
+vocabulario de ningún giro concreto.
+
+## Cobertura conversacional en `cargo test`
+
+`src-tauri/tests/conversational_reasoning.rs` cubre con fixtures propias los
+casos que un corpus no siempre contiene: variación porcentual con base cero, lado
+sin datos, monedas incompatibles, relación válida por identificador, falsa
+relación por nombres parecidos, contradicciones, resumen de expediente,
+reindexación sin contaminar el contexto y ausencia de evidencia. También
+comprueba, leyendo el propio código fuente, que el motor de producción no
+contenga vocabulario de los corpus de control de calidad.

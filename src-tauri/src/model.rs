@@ -149,7 +149,7 @@ pub struct ConceptSummary {
     pub occurrences: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ToolFilter {
     pub concept: String,
     pub equals: String,
@@ -190,13 +190,108 @@ pub struct ToolResult {
     pub evidence: Vec<Evidence>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Restricción de fecha anclada a un campo concreto del acervo.
+///
+/// El ancla importa: sin ella, un documento con varias fechas puede satisfacer
+/// el extremo inferior con una y el superior con otra, y quedar dentro de un
+/// rango al que no pertenece por ninguna de las dos.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DateConstraint {
+    pub concept: String,
+    pub from: String,
+    pub to: String,
+}
+
+impl DateConstraint {
+    pub fn label(&self) -> String {
+        format!("{} entre {} y {}", self.concept, self.from, self.to)
+    }
+}
+
+/// Alcance efectivo de una respuesta. Es lo que la interfaz muestra como
+/// «filtros y alcance aplicados»: no es prosa, son los mismos datos que el
+/// motor usó para consultar.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AnswerScope {
+    #[serde(default)]
+    pub filters: Vec<ToolFilter>,
+    pub origin: Option<String>,
+    /// Campo sobre el que se calculó, cuando la respuesta es un cálculo.
+    pub concept: Option<String>,
+    pub group_by: Option<String>,
+    pub date: Option<DateConstraint>,
+    pub currency: Option<String>,
+    /// Documentos que entraron en el alcance, cuando el motor los contó.
+    pub document_count: Option<i64>,
+    /// Cuántos valores individuales alimentaron el cálculo.
+    pub value_count: Option<i64>,
+    /// El alcance se heredó del turno anterior de la conversación.
+    #[serde(default)]
+    pub inherited: bool,
+}
+
+impl AnswerScope {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Pregunta de aclaración. Omega la emite en lugar de adivinar a qué se
+/// refiere una referencia ambigua o qué campo debe usar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Clarification {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Motivo legible por máquina; permite a la interfaz y a las pruebas
+    /// distinguir una aclaración de otra sin leer el texto.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Answer {
     pub text: String,
     pub mode: String,
     pub verified: bool,
     pub citations: Vec<Evidence>,
     pub warning: Option<String>,
+    /// La respuesta se apoyó en el resultado del turno anterior.
+    #[serde(default)]
+    pub used_context: bool,
+    #[serde(default)]
+    pub scope: Option<AnswerScope>,
+    #[serde(default)]
+    pub clarification: Option<Clarification>,
+}
+
+impl Answer {
+    /// Respuesta local con evidencia. Es el único constructor que marca una
+    /// respuesta como verificada.
+    pub fn verified(text: impl Into<String>, citations: Vec<Evidence>) -> Self {
+        Self {
+            text: text.into(),
+            mode: "local".into(),
+            verified: true,
+            citations,
+            ..Self::default()
+        }
+    }
+
+    /// Respuesta que no afirma nada del acervo: sin evidencia no hay hecho.
+    pub fn unverified(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            mode: "local".into(),
+            verified: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_scope(mut self, scope: AnswerScope) -> Self {
+        self.used_context = scope.inherited;
+        self.scope = (!scope.is_empty()).then_some(scope);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
