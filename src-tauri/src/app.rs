@@ -63,34 +63,7 @@ impl OmegaEngine {
     }
 
     pub fn status(&self) -> Result<AppStatus> {
-        self.database.status(read_api_key().is_ok())
-    }
-
-    pub fn configure_ai(&self, enabled: bool, consent: bool) -> Result<()> {
-        if enabled && !consent {
-            return Err(OmegaError::InvalidArguments(
-                "se requiere consentimiento explícito para activar la IA".into(),
-            ));
-        }
-        self.database.set_ai_enabled(enabled)
-    }
-
-    pub fn store_api_key(&self, key: &str) -> Result<()> {
-        if !key.starts_with("sk-") || key.len() < 20 {
-            return Err(OmegaError::InvalidArguments(
-                "la clave no tiene un formato válido".into(),
-            ));
-        }
-        keyring_entry()?
-            .set_password(key)
-            .map_err(|error| OmegaError::Ai(error.to_string()))
-    }
-
-    pub fn clear_api_key(&self) -> Result<()> {
-        match keyring_entry()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(OmegaError::Ai(error.to_string())),
-        }
+        self.database.status()
     }
 
     pub fn open_document(&self, path: &Path) -> Result<()> {
@@ -103,17 +76,6 @@ impl OmegaEngine {
     pub fn database_path(&self) -> PathBuf {
         self.database.path().to_path_buf()
     }
-}
-
-fn keyring_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new("com.omega.desktop", "openai_api_key")
-        .map_err(|error| OmegaError::Ai(error.to_string()))
-}
-
-fn read_api_key() -> Result<String> {
-    keyring_entry()?
-        .get_password()
-        .map_err(|error| OmegaError::Ai(error.to_string()))
 }
 
 fn open_with_system(path: &Path) -> Result<()> {

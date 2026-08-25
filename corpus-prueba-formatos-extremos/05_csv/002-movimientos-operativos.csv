@@ -1,0 +1,9 @@
+Folio,Tipo de documento,Estado,Ciudad base,Fecha de registro,Importe total,Observación
+CSV-26-0108,Movimiento operativo,Activo,Guadalajara,2026-01-10,2438,"Registro sintético; validar origen, importe y estado antes de cerrar."
+CSV-26-0109,Movimiento operativo,Cerrado,Monterrey,2026-02-11,2449,"Registro sintético; validar origen, importe y estado antes de cerrar."
+CSV-26-0110,Movimiento operativo,Activo,Puebla,2026-03-12,2460,"Registro sintético; validar origen, importe y estado antes de cerrar."
+CSV-26-0111,Movimiento operativo,Cerrado,Querétaro,2026-04-13,2471,"Registro sintético; validar origen, importe y estado antes de cerrar."
+CSV-26-0112,Movimiento operativo,Activo,Mérida,2026-05-14,2482,"Registro sintético; validar origen, importe y estado antes de cerrar."
+CSV-26-0113,Movimiento operativo,Cerrado,Ciudad de México,2026-06-15,2493,"Registro sintético; validar origen, importe y estado antes de cerrar."
+CSV-26-0114,Movimiento operativo,Activo,Guadalajara,2026-07-16,2504,"Registro sintético; validar origen, importe y estado antes de cerrar."
+CSV-26-0115,Movimiento operativo,Cerrado,Monterrey,2026-08-17,2515,"Registro sintético; validar origen, importe y estado antes de cerrar."

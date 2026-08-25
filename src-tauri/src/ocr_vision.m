@@ -4,10 +4,10 @@
 #import <Vision/Vision.h>
 
 static void recognize_image(NSImage *image, NSInteger page, NSMutableArray *lines) {
-  NSRect rect = NSMakeRect(0, 0, image.size.width, image.size.height);
-  CGImageRef cg_image = [image CGImageForProposedRect:&rect context:nil hints:nil];
-  if (cg_image == nil) return;
-
+  NSData *tiff = [image TIFFRepresentation];
+  NSBitmapImageRep *bitmap = tiff == nil ? nil : [NSBitmapImageRep imageRepWithData:tiff];
+  NSData *png = bitmap == nil ? nil : [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+  if (png == nil) return;
   VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc]
       initWithCompletionHandler:^(VNRequest *completed, NSError *error) {
         if (error != nil) return;
@@ -24,8 +24,9 @@ static void recognize_image(NSImage *image, NSInteger page, NSMutableArray *line
       }];
   request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
   request.usesLanguageCorrection = NO;
+  request.recognitionLanguages = @[ @"es-ES", @"en-US" ];
   NSError *error = nil;
-  VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cg_image options:@{}];
+  VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithData:png options:@{}];
   [handler performRequests:@[ request ] error:&error];
 }
 
@@ -42,8 +43,11 @@ int main(int argc, const char *argv[]) {
         if (image != nil) recognize_image(image, index + 1, lines);
       }
     } else {
-      NSImage *image = [[NSImage alloc] initWithContentsOfURL:url];
-      if (image != nil) recognize_image(image, 1, lines);
+      NSData *data = [NSData dataWithContentsOfURL:url];
+      if (data != nil) {
+        NSImage *image = [[NSImage alloc] initWithData:data];
+        if (image != nil) recognize_image(image, 1, lines);
+      }
     }
     NSError *error = nil;
     NSData *json = [NSJSONSerialization dataWithJSONObject:lines options:0 error:&error];

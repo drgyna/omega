@@ -41,8 +41,8 @@ pub fn recognize(path: &Path) -> OcrOutcome {
     if lines.is_empty() {
         return OcrOutcome {
             chunks: vec![],
-            status: OcrStatus::Complete,
-            confidence: Some(1.0),
+            status: OcrStatus::LowConfidence,
+            confidence: Some(0.0),
         };
     }
     let confidence = lines.iter().map(|line| line.confidence).sum::<f64>() / lines.len() as f64;

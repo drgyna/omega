@@ -16,8 +16,6 @@ pub enum OmegaError {
     InvalidArguments(String),
     #[error("La respuesta no superó la verificación: {0}")]
     Verification(String),
-    #[error("Integración de IA: {0}")]
-    Ai(String),
 }
 
 pub type Result<T> = std::result::Result<T, OmegaError>;

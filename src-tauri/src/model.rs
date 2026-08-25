@@ -161,6 +161,10 @@ pub struct AggregateRequest {
     pub operation: String,
     #[serde(default)]
     pub filters: Vec<ToolFilter>,
+    /// Carpeta de origen descubierta en el propio índice. No es una etiqueta
+    /// de negocio: permite limitar cualquier agregación a una fuente real.
+    #[serde(default)]
+    pub origin: Option<String>,
     pub currency: Option<String>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
@@ -170,6 +174,10 @@ pub struct AggregateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateRow {
     pub group: Option<String>,
+    /// Moneda de esta fila. Una suma sin moneda explícita se separa por esta
+    /// dimensión para impedir que importes incompatibles se combinen.
+    #[serde(default)]
+    pub currency: Option<String>,
     pub value: f64,
     pub matched_values: i64,
     pub evidence: Vec<Evidence>,
@@ -197,6 +205,4 @@ pub struct AppStatus {
     pub documents: i64,
     pub concepts: i64,
     pub values: i64,
-    pub ai_enabled: bool,
-    pub api_key_stored: bool,
 }

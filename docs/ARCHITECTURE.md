@@ -11,13 +11,13 @@
    herramienta genera prosa libre.
 5. La fase actual devuelve resultados de recuperación: ruta real, carpeta de origen, campo,
    líneas y fragmento. No compone resúmenes ni respuestas narrativas.
-6. La IA y la composición de respuestas quedan fuera de esta fase. Las herramientas siguen
-   disponibles para una fase posterior que conserve estas mismas restricciones de evidencia.
+6. El agente local compone únicamente respuestas extractivas y cálculos respaldados. Si no hay
+   evidencia suficiente, responde que no la encontró en lugar de inferir o inventar contenido.
 
 ## Catálogo semántico
 
-`concepts` define clave y tipo. `concept_aliases` conserva tanto origen (`local_rule`, `ai`, `user`)
-como estado (`system`, `suggested`, `confirmed`, `rejected`). `extracted_values` exige concepto,
+`concepts` define clave y tipo. `concept_aliases` conserva el origen y estado de cada alias.
+`extracted_values` exige concepto,
 tipo, valor normalizado, ubicación y `evidence_id`. Las entidades conservan el concepto que actuó
 como rol y distinguen propietario/mención.
 
@@ -55,5 +55,4 @@ se conserva.
   para verificar cifras que son derivadas y no aparecen literalmente en un solo archivo.
 - Las rutas solicitadas al abrir una cita se vuelven a validar contra documentos pertenecientes a
   una fuente activa antes de invocar el visor del sistema.
-- `store: false`, límites de seis vueltas y 25 segundos acotan el bucle de agente. La integración
-  sigue el contrato de function calling de Responses API.
+- El motor no realiza solicitudes de red ni depende de modelos o credenciales externas.

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::LazyLock,
 };
 
@@ -14,7 +14,7 @@ use crate::{
     },
     normalize::{
         canonical_identifier, canonical_key, normalize_exact, normalize_literal, normalize_spanish,
-        search_terms,
+        search_terms, stems_match,
     },
 };
 
@@ -22,6 +22,44 @@ use crate::{
 struct FieldValuePair {
     field: String,
     value: String,
+}
+
+/// Un valor estructurado leído de un documento concreto, con su posición
+/// dentro de ese documento. Nunca cruza la frontera con la interfaz: sólo lo
+/// consume la capa de síntesis para resolver un campo puntual.
+#[derive(Clone, Debug)]
+pub struct DocumentValue {
+    /// Posición del valor dentro de su propio documento, en orden de
+    /// extracción. Que un identificador aparezca entre los primeros campos
+    /// distingue al documento que trata de esa entidad de otro que sólo la
+    /// menciona de pasada.
+    pub ordinal: usize,
+    pub field: String,
+    pub value: String,
+    pub value_type: String,
+    pub identifier_canonical: Option<String>,
+    pub evidence: Evidence,
+}
+
+#[derive(Clone, Debug)]
+pub struct OriginSummary {
+    pub origin: String,
+    pub document_count: i64,
+    pub evidence: Evidence,
+}
+
+#[derive(Clone, Debug)]
+pub struct DocumentQueryResult {
+    pub document_count: i64,
+    /// Evidencia de una cantidad acotada de documentos. Para intersecciones
+    /// contiene una cita por cada filtro aplicado al mismo `document_id`.
+    pub evidence: Vec<Evidence>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TextQueryResult {
+    pub document_count: usize,
+    pub hits: Vec<SearchHit>,
 }
 
 #[derive(Clone, Copy)]
@@ -118,12 +156,13 @@ impl ToolEngine {
                         "concept": { "type": "string" },
                         "operation": { "type": "string", "enum": ["sum", "count"] },
                         "filters": { "type": "array", "items": { "$ref": "#/$defs/filter" } },
+                        "origin": { "type": ["string", "null"] },
                         "currency": { "type": ["string", "null"] },
                         "date_from": { "type": ["string", "null"] },
                         "date_to": { "type": ["string", "null"] },
                         "group_by": { "type": ["string", "null"] }
                     },
-                    "required": ["concept", "operation", "filters", "currency", "date_from", "date_to", "group_by"],
+                    "required": ["concept", "operation", "filters", "origin", "currency", "date_from", "date_to", "group_by"],
                     "additionalProperties": false,
                     "$defs": { "filter": {
                         "type": "object",
@@ -741,6 +780,11 @@ impl ToolEngine {
                 Ok(None)
             };
         }
+        let mut required_filters = filters.to_vec();
+        required_filters.extend(pairs.iter().map(|pair| ToolFilter {
+            concept: pair.field.clone(),
+            equals: pair.value.clone(),
+        }));
         let connection = self.database.connect()?;
         let mut sql = String::from(
             "SELECT d.id, d.title, d.path, d.origin, d.ocr_status, d.ocr_confidence, v.location, v.excerpt,
@@ -751,7 +795,10 @@ impl ToolEngine {
              WHERE 1 = 1",
         );
         let mut values: Vec<Box<dyn ToSql>> = vec![];
-        append_filters(&mut sql, &mut values, filters);
+        // Cada par campo-valor es obligatorio en el mismo documento. La
+        // versión anterior filtraba las filas después del SELECT y terminaba
+        // uniendo documentos que cumplían sólo una de las condiciones.
+        append_filters(&mut sql, &mut values, &required_filters);
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
             params_from_iter(values.iter().map(|value| value.as_ref())),
@@ -879,9 +926,9 @@ impl ToolEngine {
     }
 
     /// Reconoce una petición campo–valor aun cuando el valor no exista. Se
-    /// basa exclusivamente en los nombres de concepto ya extraídos y en la
-    /// posición del texto que sigue al campo; no contiene vocabulario de un
-    /// rubro de negocio.
+    /// basa en los nombres de concepto ya extraídos, en la posición del texto
+    /// que sigue al campo y en las carpetas de origen que el propio acervo ya
+    /// autorizó; no contiene vocabulario de un rubro de negocio.
     fn query_names_field_with_value(&self, query: &str) -> Result<bool> {
         const QUERY_FILLER: &[&str] = &[
             "busca",
@@ -932,23 +979,88 @@ impl ToolEngine {
         let normalized_query = normalize_exact(query);
         let connection = self.database.connect()?;
         let mut statement = connection.prepare(
-            "SELECT DISTINCT display_name FROM concepts ORDER BY length(display_name) DESC",
+            "SELECT DISTINCT display_name, value_type FROM concepts
+             ORDER BY length(display_name) DESC",
         )?;
         let fields = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for field in fields {
+        // Las carpetas de origen ya autorizadas son metadato del propio
+        // acervo, igual que en `metadata_hits`/`structured_hits`. Sirven para
+        // reconocer cuándo lo que sigue al campo describe una categoría de
+        // documentos ("de mantenimiento", "de propiedades") en vez de un
+        // intento de valor.
+        let origins = connection
+            .prepare("SELECT DISTINCT origin FROM documents")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|origin| normalize_exact(&origin))
+            .collect::<Vec<_>>();
+        // Los campos se recorren del nombre más largo al más corto. Cuando uno
+        // de ellos ya explica su tramo de la pregunta sin dejar nada pendiente
+        // -o con un pendiente que no es un valor real, ver más abajo-, ese
+        // tramo queda resuelto: un campo más corto contenido por completo en
+        // él (p.ej. "estado", dentro de "Estado de la propiedad") no puede
+        // reabrir el cierre sólo porque, aislado, su propio resto de frase ya
+        // no es puro relleno. Sin esto, "¿cuál es el estado de la propiedad?"
+        // se cerraba a cero: el campo correcto y más específico no dejaba
+        // ningún valor pendiente, pero el campo corto "estado" —mero prefijo
+        // del anterior— sí veía "de la propiedad" como un intento de valor.
+        let mut resolved_spans: Vec<(usize, usize)> = Vec::new();
+        for (field, value_type) in fields {
             let normalized_field = normalize_exact(&field);
             let Some(start) = phrase_position(&normalized_query, &normalized_field) else {
                 continue;
             };
-            let after = &normalized_query[start + normalized_field.len()..];
+            let end = start + normalized_field.len();
+            if resolved_spans
+                .iter()
+                .any(|&(resolved_start, resolved_end)| {
+                    resolved_start <= start && end <= resolved_end
+                })
+            {
+                continue;
+            }
+            let after = &normalized_query[end..];
             if after
                 .split_whitespace()
                 .any(|word| !QUERY_FILLER.contains(&word))
             {
+                // Un campo numérico o de fecha sólo se cierra si lo que sigue
+                // podría ser en sí mismo un valor de ese tipo (un dígito). Sin
+                // este filtro, "el costo estimado de mantenimiento" se leía
+                // como un intento de valor fallido -"de mantenimiento"-, en
+                // vez de cómo lo que realmente es: cómo la pregunta describe
+                // el campo en lenguaje natural.
+                if requires_numeric_shape(&value_type) && !after.chars().any(|c| c.is_ascii_digit())
+                {
+                    resolved_spans.push((start, end));
+                    continue;
+                }
+                // Lo mismo para un campo de texto o estado cuando lo que sigue
+                // nombra una carpeta de origen real ("de propiedades", "de
+                // mantenimiento"): sigue describiendo el campo, no proponiendo
+                // un valor. Fuera de ese caso, cualquier palabra sí puede ser
+                // un valor legítimo (p.ej. "cuyo estado sea Vendida").
+                let significant = after
+                    .split_whitespace()
+                    .filter(|word| !QUERY_FILLER.contains(word))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !significant.is_empty()
+                    && origins
+                        .iter()
+                        .any(|origin| whole_phrase_in(origin, &significant))
+                {
+                    resolved_spans.push((start, end));
+                    continue;
+                }
                 return Ok(true);
             }
+            resolved_spans.push((start, end));
         }
         Ok(false)
     }
@@ -1094,10 +1206,10 @@ impl ToolEngine {
             let field_match = !field_terms.is_empty()
                 && field_terms
                     .iter()
-                    .all(|term| terms.iter().any(|query_term| query_term == term));
+                    .all(|term| terms.iter().any(|query_term| stems_match(query_term, term)));
             let field_overlap = field_terms
                 .iter()
-                .any(|term| terms.iter().any(|query_term| query_term == term));
+                .any(|term| terms.iter().any(|query_term| stems_match(query_term, term)));
             let value_phrase = phrase_in(&normalized_query, &normalized_value)
                 && normalized_value.split_whitespace().count() > 0;
             let origin_match = phrase_in(&normalized_query, &normalize_spanish(&origin));
@@ -1168,9 +1280,571 @@ impl ToolEngine {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Valores estructurados de un documento en el orden en que el parser los
+    /// encontró. Es una lectura puntual y aislada: no participa en la
+    /// recuperación, no altera qué documentos encuentra `search` ni cómo se
+    /// ordenan sus resultados.
+    ///
+    /// El orden se toma del propio `id` de la fila. El indexado reconstruye
+    /// cada documento completo en una sola transacción e inserta sus registros
+    /// en el orden en que el parser los leyó, así que la posición dentro del
+    /// documento ya está disponible sin añadir una columna al esquema (y sin
+    /// obligar a reindexar una base ya existente).
+    pub fn document_values(&self, document_id: i64) -> Result<Vec<DocumentValue>> {
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT v.evidence_id, c.display_name, v.text_value, v.value_type,
+                    v.identifier_canonical, v.location, v.excerpt,
+                    d.path, d.origin, d.ocr_status, d.ocr_confidence
+             FROM extracted_values v
+             JOIN documents d ON d.id = v.document_id
+             JOIN concepts c ON c.id = v.concept_id
+             WHERE v.document_id = ?1
+             ORDER BY v.id",
+        )?;
+        let rows = statement.query_map([document_id], |row| {
+            let evidence_id: String = row.get(0)?;
+            let field: String = row.get(1)?;
+            let text_value: String = row.get(2)?;
+            let value_type: String = row.get(3)?;
+            let identifier_canonical: Option<String> = row.get(4)?;
+            let location: String = row.get(5)?;
+            let excerpt: String = row.get(6)?;
+            let ocr_status: String = row.get(9)?;
+            let confidence: Option<f64> = row.get(10)?;
+            Ok(DocumentValue {
+                // La posición real la asigna el recorrido, no la consulta.
+                ordinal: 0,
+                field: field.clone(),
+                value: text_value.clone(),
+                value_type,
+                identifier_canonical,
+                evidence: Evidence {
+                    id: evidence_id,
+                    document_id,
+                    path: row.get(7)?,
+                    origin: row.get(8)?,
+                    location,
+                    excerpt: brief_excerpt(&excerpt, Some(&text_value)),
+                    normalized_value: Some(normalize_exact(&text_value)),
+                    value: Some(text_value.clone()),
+                    matched: Some(text_value),
+                    field: Some(field),
+                    match_kind: "campo".into(),
+                    reliable: ocr_is_reliable(&ocr_status, confidence),
+                    confidence,
+                },
+            })
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, mut value)| {
+                value.ordinal = ordinal;
+                value
+            })
+            .collect())
+    }
+
+    pub fn origin_summaries(&self) -> Result<Vec<OriginSummary>> {
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT origin, COUNT(*), MIN(id)
+             FROM documents GROUP BY origin ORDER BY origin",
+        )?;
+        let grouped = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut summaries = Vec::with_capacity(grouped.len());
+        for (origin, document_count, document_id) in grouped {
+            let (path, ocr_status, confidence): (String, String, Option<f64>) = connection
+                .query_row(
+                    "SELECT path, ocr_status, ocr_confidence FROM documents WHERE id = ?1",
+                    [document_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            summaries.push(OriginSummary {
+                origin: origin.clone(),
+                document_count,
+                evidence: Evidence {
+                    id: format!("m-{document_id}-carpeta de origen"),
+                    document_id,
+                    path,
+                    origin: origin.clone(),
+                    location: "metadato: carpeta de origen".into(),
+                    excerpt: origin.clone(),
+                    normalized_value: Some(normalize_exact(&origin)),
+                    value: Some(origin.clone()),
+                    matched: Some(origin),
+                    field: Some("carpeta de origen".into()),
+                    match_kind: "campo".into(),
+                    reliable: ocr_is_reliable(&ocr_status, confidence),
+                    confidence,
+                },
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Resuelve una carpeta exclusivamente contra los orígenes descubiertos.
+    /// Acepta el nombre completo y también la parte descriptiva posterior a
+    /// un prefijo ordinal (`02_reportes` -> `reportes`).
+    pub fn match_origin(&self, query: &str) -> Result<Option<String>> {
+        let normalized_query = normalize_exact(query);
+        let query_terms = search_terms(query);
+        let mut matches = self
+            .origin_summaries()?
+            .into_iter()
+            .filter_map(|summary| {
+                let full = normalize_exact(&summary.origin);
+                let descriptive = full
+                    .split_whitespace()
+                    .skip_while(|part| part.chars().all(char::is_numeric))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let score = if whole_phrase_in(&normalized_query, &full) {
+                    full.split_whitespace().count() + 200
+                } else if !descriptive.is_empty()
+                    && whole_phrase_in(&normalized_query, &descriptive)
+                {
+                    descriptive.split_whitespace().count() + 100
+                } else {
+                    // En lenguaje natural es habitual omitir parte del nombre
+                    // de la carpeta ("facturas" frente a
+                    // "07_facturas_emitidas"). Sólo se acepta el mejor match
+                    // descubierto en el índice; los empates se descartan más
+                    // abajo para no adivinar una categoría.
+                    let origin_terms = search_terms(&descriptive);
+                    origin_terms
+                        .iter()
+                        .filter(|candidate| {
+                            query_terms.iter().any(|term| stems_match(term, candidate))
+                        })
+                        .count()
+                };
+                (score > 0).then_some((score, summary.origin))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        if matches.len() > 1 && matches[0].0 == matches[1].0 {
+            return Ok(None);
+        }
+        Ok(matches.into_iter().next().map(|(_, origin)| origin))
+    }
+
+    /// Señales que obligan a conservar la semántica exacta de la búsqueda.
+    /// El planificador la consulta antes de cualquier expansión textual.
+    pub fn query_has_exact_signal(query: &str) -> bool {
+        explicit_identifier_mode(query).is_some()
+            || query_contains_filename(query)
+            || !canonical_identifier_candidates(query).is_empty()
+            || !exact_query_tokens(query).is_empty()
+            || requests_exact_but_incomplete(query)
+    }
+
+    /// Descubre filtros en la pregunta usando únicamente conceptos y valores
+    /// existentes. Los valores implícitos se aceptan sólo para intenciones de
+    /// lista/conteo y cuando identifican un único concepto dentro del alcance.
+    pub fn filters_from_query(
+        &self,
+        query: &str,
+        origin: Option<&str>,
+        allow_implicit_values: bool,
+    ) -> Result<Vec<ToolFilter>> {
+        let query_terms = search_terms(query);
+        let exact_query = normalize_exact(query);
+        let connection = self.database.connect()?;
+        let mut sql = String::from(
+            "SELECT DISTINCT c.display_name, v.text_value, v.value_type
+             FROM extracted_values v
+             JOIN concepts c ON c.id = v.concept_id
+             JOIN documents d ON d.id = v.document_id WHERE 1 = 1",
+        );
+        let mut parameters: Vec<Box<dyn ToSql>> = Vec::new();
+        append_origin(&mut sql, &mut parameters, origin);
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(
+                params_from_iter(parameters.iter().map(|value| value.as_ref())),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut explicit = Vec::new();
+        let mut explicit_values = Vec::new();
+        let mut implicit: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (field, value, value_type) in rows {
+            let field_terms = search_terms(&field);
+            let value_terms = search_terms(&value);
+            if value_terms.is_empty() || value_terms.len() > 8 {
+                continue;
+            }
+            let field_named = terms_contain_all(&query_terms, &field_terms);
+            let value_named = if value.chars().any(char::is_numeric) {
+                whole_phrase_in(&exact_query, &normalize_exact(&value))
+            } else {
+                terms_contain_all(&query_terms, &value_terms)
+            };
+            if !value_named {
+                continue;
+            }
+            if field_named {
+                explicit_values.push(normalize_spanish(&value));
+                explicit.push(ToolFilter {
+                    concept: field,
+                    equals: value,
+                });
+            } else if allow_implicit_values && (value_terms.len() >= 2 || value_type == "state") {
+                implicit
+                    .entry(normalize_spanish(&value))
+                    .or_default()
+                    .push((field, value));
+            }
+        }
+
+        for (implicit_value, candidates) in implicit {
+            if explicit_values
+                .iter()
+                .any(|explicit_value| whole_phrase_in(explicit_value, &implicit_value))
+            {
+                continue;
+            }
+            let distinct_fields = candidates
+                .iter()
+                .map(|(field, _)| canonical_key(field))
+                .collect::<HashSet<_>>();
+            if distinct_fields.len() == 1 {
+                let (concept, equals) = candidates[0].clone();
+                explicit.push(ToolFilter { concept, equals });
+            }
+        }
+        explicit.sort_by(|left, right| {
+            canonical_key(&left.concept)
+                .cmp(&canonical_key(&right.concept))
+                .then_with(|| {
+                    normalize_spanish(&left.equals).cmp(&normalize_spanish(&right.equals))
+                })
+        });
+        explicit.dedup_by(|left, right| {
+            canonical_key(&left.concept) == canonical_key(&right.concept)
+                && normalize_spanish(&left.equals) == normalize_spanish(&right.equals)
+        });
+        Ok(explicit)
+    }
+
+    pub fn query_documents(
+        &self,
+        filters: &[ToolFilter],
+        origin: Option<&str>,
+        evidence_document_limit: usize,
+    ) -> Result<DocumentQueryResult> {
+        let connection = self.database.connect()?;
+        let mut count_sql = String::from("SELECT COUNT(*) FROM documents d WHERE 1 = 1");
+        let mut count_parameters: Vec<Box<dyn ToSql>> = Vec::new();
+        append_origin(&mut count_sql, &mut count_parameters, origin);
+        append_filters(&mut count_sql, &mut count_parameters, filters);
+        let document_count = connection.query_row(
+            &count_sql,
+            params_from_iter(count_parameters.iter().map(|value| value.as_ref())),
+            |row| row.get(0),
+        )?;
+
+        let mut sample_sql = String::from(
+            "SELECT d.id, d.path, d.origin, d.ocr_status, d.ocr_confidence
+             FROM documents d WHERE 1 = 1",
+        );
+        let mut sample_parameters: Vec<Box<dyn ToSql>> = Vec::new();
+        append_origin(&mut sample_sql, &mut sample_parameters, origin);
+        append_filters(&mut sample_sql, &mut sample_parameters, filters);
+        sample_sql.push_str(" ORDER BY d.id LIMIT ?");
+        sample_parameters.push(Box::new(evidence_document_limit.min(50) as i64));
+        let mut statement = connection.prepare(&sample_sql)?;
+        let documents = statement
+            .query_map(
+                params_from_iter(sample_parameters.iter().map(|value| value.as_ref())),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<f64>>(4)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut evidence = Vec::new();
+        for (document_id, path, document_origin, ocr_status, confidence) in documents {
+            if origin.is_some() {
+                evidence.push(Evidence {
+                    id: format!("m-{document_id}-carpeta de origen"),
+                    document_id,
+                    path: path.clone(),
+                    origin: document_origin.clone(),
+                    location: "metadato: carpeta de origen".into(),
+                    excerpt: document_origin.clone(),
+                    normalized_value: Some(normalize_exact(&document_origin)),
+                    value: Some(document_origin.clone()),
+                    matched: Some(document_origin.clone()),
+                    field: Some("carpeta de origen".into()),
+                    match_kind: "campo".into(),
+                    reliable: ocr_is_reliable(&ocr_status, confidence),
+                    confidence,
+                });
+            }
+            for filter in filters {
+                let found = connection
+                    .query_row(
+                        "SELECT v.evidence_id, v.location, v.excerpt, v.text_value,
+                                c.display_name
+                         FROM extracted_values v
+                         JOIN concepts c ON c.id = v.concept_id
+                         WHERE v.document_id = ?1 AND c.canonical_key = ?2
+                           AND v.normalized_value = ?3 ORDER BY v.id LIMIT 1",
+                        params![
+                            document_id,
+                            canonical_key(&filter.concept),
+                            normalize_spanish(&filter.equals)
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((id, location, excerpt, value, field)) = found {
+                    evidence.push(Evidence {
+                        id,
+                        document_id,
+                        path: path.clone(),
+                        origin: document_origin.clone(),
+                        location,
+                        excerpt: brief_excerpt(&excerpt, Some(&value)),
+                        normalized_value: Some(normalize_exact(&value)),
+                        value: Some(value.clone()),
+                        matched: Some(value),
+                        field: Some(field),
+                        match_kind: "campo".into(),
+                        reliable: ocr_is_reliable(&ocr_status, confidence),
+                        confidence,
+                    });
+                }
+            }
+        }
+        Ok(DocumentQueryResult {
+            document_count,
+            evidence,
+        })
+    }
+
+    /// Recuperación textual extractiva con FTS OR y ranking por cobertura del
+    /// documento y del fragmento. No genera sinónimos ni conclusiones.
+    pub fn search_text(
+        &self,
+        query: &str,
+        origin: Option<&str>,
+        limit: usize,
+    ) -> Result<TextQueryResult> {
+        let terms = content_terms(query);
+        if terms.is_empty() {
+            return Ok(TextQueryResult {
+                document_count: 0,
+                hits: Vec::new(),
+            });
+        }
+        let fts_query = terms
+            .iter()
+            .map(|term| format!("\"{}\"*", term.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let connection = self.database.connect()?;
+        let mut sql = String::from(
+            "SELECT d.id, d.title, d.path, d.origin, d.ocr_status, d.ocr_confidence,
+                    c.location, c.content, bm25(chunks_fts), c.id
+             FROM chunks_fts
+             JOIN chunks c ON c.id = chunks_fts.chunk_id
+             JOIN documents d ON d.id = c.document_id
+             WHERE chunks_fts MATCH ?",
+        );
+        let mut parameters: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query)];
+        append_origin(&mut sql, &mut parameters, origin);
+        sql.push_str(" ORDER BY bm25(chunks_fts) LIMIT 4000");
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(parameters.iter().map(|value| value.as_ref())),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<f64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, f64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )?;
+
+        struct Candidate {
+            covered: HashSet<usize>,
+            best_coverage: usize,
+            best_specificity: usize,
+            best_length: usize,
+            best_rank: f64,
+            hit: SearchHit,
+        }
+        let mut candidates: HashMap<i64, Candidate> = HashMap::new();
+        for row in rows {
+            let (
+                document_id,
+                title,
+                path,
+                origin,
+                ocr_status,
+                confidence,
+                location,
+                content,
+                rank,
+                chunk_id,
+            ) = row?;
+            let normalized = search_terms(&content);
+            let covered = terms
+                .iter()
+                .enumerate()
+                .filter(|(_, term)| {
+                    normalized
+                        .iter()
+                        .any(|word| stems_match(word, term) || prefix_terms_match(word, term))
+                })
+                .map(|(index, _)| index)
+                .collect::<HashSet<_>>();
+            if covered.is_empty() {
+                continue;
+            }
+            let coverage = covered.len();
+            let specificity = covered
+                .iter()
+                .map(|index| terms[*index].len())
+                .sum::<usize>();
+            let content_length = content.chars().count();
+            let hit = SearchHit {
+                title,
+                score: coverage as f64 * 50.0
+                    + specificity as f64 * 3.0
+                    + content_length.min(1000) as f64 / 100.0
+                    + rank.abs(),
+                evidence: chunk_evidence(
+                    format!("c-{chunk_id}"),
+                    document_id,
+                    path,
+                    origin,
+                    ocr_status,
+                    confidence,
+                    &location,
+                    &content,
+                    &terms,
+                ),
+            };
+            match candidates.get_mut(&document_id) {
+                Some(candidate) => {
+                    candidate.covered.extend(covered);
+                    if coverage > candidate.best_coverage
+                        || (coverage == candidate.best_coverage
+                            && specificity > candidate.best_specificity)
+                        || (coverage == candidate.best_coverage
+                            && specificity == candidate.best_specificity
+                            && content_length > candidate.best_length)
+                        || (coverage == candidate.best_coverage
+                            && specificity == candidate.best_specificity
+                            && content_length == candidate.best_length
+                            && rank.abs() > candidate.best_rank)
+                    {
+                        candidate.best_coverage = coverage;
+                        candidate.best_specificity = specificity;
+                        candidate.best_length = content_length;
+                        candidate.best_rank = rank.abs();
+                        candidate.hit = hit;
+                    }
+                }
+                None => {
+                    candidates.insert(
+                        document_id,
+                        Candidate {
+                            covered,
+                            best_coverage: coverage,
+                            best_specificity: specificity,
+                            best_length: content_length,
+                            best_rank: rank.abs(),
+                            hit,
+                        },
+                    );
+                }
+            }
+        }
+        let minimum = if terms.len() <= 2 {
+            terms.len()
+        } else {
+            ((terms.len() + 2) / 3).max(2)
+        };
+        let mut ranked = candidates
+            .into_values()
+            .filter(|candidate| candidate.covered.len() >= minimum)
+            .map(|mut candidate| {
+                candidate.hit.score += candidate.covered.len() as f64 * 100.0;
+                candidate.hit
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        let document_count = ranked.len();
+        let mut seen_excerpts = HashSet::new();
+        ranked.retain(|hit| seen_excerpts.insert(normalize_exact(&hit.evidence.excerpt)));
+        ranked.truncate(limit.min(20));
+        Ok(TextQueryResult {
+            document_count,
+            hits: ranked,
+        })
+    }
+
     pub fn indexed_document_count(&self) -> Result<i64> {
         let connection = self.database.connect()?;
         Ok(connection.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?)
+    }
+
+    pub fn available_currencies(&self) -> Result<BTreeSet<String>> {
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT upper(currency) FROM extracted_values
+             WHERE currency IS NOT NULL AND trim(currency) != '' ORDER BY 1",
+        )?;
+        let values = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(values.collect::<rusqlite::Result<BTreeSet<_>>>()?)
     }
 
     pub fn count_documents(&self, filters: &[ToolFilter]) -> Result<(i64, Vec<Evidence>)> {
@@ -1259,6 +1933,7 @@ impl ToolEngine {
             sql.push_str(" AND EXISTS (SELECT 1 FROM extracted_values vd WHERE vd.document_id = v.document_id AND vd.date_value <= ?)");
             values.push(Box::new(to.clone()));
         }
+        append_origin(&mut sql, &mut values, request.origin.as_deref());
         append_filters(&mut sql, &mut values, &request.filters);
         sql.push_str(" ORDER BY v.document_id, v.id");
 
@@ -1271,6 +1946,7 @@ impl ToolEngine {
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<f64>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                         Evidence {
                             id: row.get(7)?,
                             document_id: row.get(1)?,
@@ -1294,15 +1970,32 @@ impl ToolEngine {
         if matches.is_empty() {
             return Ok(vec![]);
         }
-        let mut grouped: BTreeMap<Option<String>, AggregateRow> = BTreeMap::new();
-        for (document_id, numeric, _text, evidence) in matches {
+        let mut grouped: BTreeMap<(Option<String>, Option<String>), AggregateRow> = BTreeMap::new();
+        for (document_id, numeric, _text, currency, evidence) in matches {
             let groups = if let Some(group_id) = group_concept {
                 let mut group_statement = connection.prepare(
-                    "SELECT DISTINCT text_value FROM extracted_values WHERE document_id = ?1 AND concept_id = ?2",
+                    "SELECT DISTINCT text_value, location FROM extracted_values WHERE document_id = ?1 AND concept_id = ?2",
                 )?;
                 let found = group_statement
-                    .query_map(params![document_id, group_id], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                    .query_map(params![document_id, group_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+                let record_scope = tabular_record_scope(&evidence.location);
+                let found = if let Some(scope) = record_scope {
+                    found
+                        .into_iter()
+                        .filter(|(_, location)| {
+                            tabular_record_scope(location).as_deref() == Some(&scope)
+                        })
+                        .map(|(value, _)| value)
+                        .collect::<Vec<_>>()
+                } else {
+                    found
+                        .into_iter()
+                        .map(|(value, _)| value)
+                        .collect::<Vec<_>>()
+                };
                 if found.is_empty() {
                     vec![Some("Sin valor".into())]
                 } else {
@@ -1312,10 +2005,17 @@ impl ToolEngine {
                 vec![None]
             };
             for group in groups {
+                // Los conteos no tienen dimensión monetaria. Las sumas sí se
+                // separan por moneda cuando la pregunta no fijó una, para no
+                // sumar magnitudes incompatibles silenciosamente.
+                let row_currency = (request.operation == "sum")
+                    .then(|| currency.clone())
+                    .flatten();
                 let row = grouped
-                    .entry(group.clone())
+                    .entry((group.clone(), row_currency.clone()))
                     .or_insert_with(|| AggregateRow {
                         group,
+                        currency: row_currency,
                         value: 0.0,
                         matched_values: 0,
                         evidence: vec![],
@@ -1333,30 +2033,69 @@ impl ToolEngine {
         }
         Ok(grouped.into_values().collect())
     }
+
+    pub fn aggregate_calculation_evidence(
+        &self,
+        request: &AggregateRequest,
+        rows: &[AggregateRow],
+    ) -> Option<Evidence> {
+        calculation_evidence(request, rows)
+    }
+}
+
+/// Devuelve la unidad de registro de ubicaciones tabulares. Así una suma por
+/// Estado asocia el importe de una fila con el Estado de esa misma fila y no
+/// con todos los estados presentes en el archivo.
+fn tabular_record_scope(location: &str) -> Option<String> {
+    if location.starts_with("fila ") {
+        return location
+            .split_once(", celda")
+            .map(|(row, _)| row.to_owned());
+    }
+    if location.starts_with("hoja ") {
+        let (sheet, cell_part) = location.split_once(", celda ")?;
+        let cell = cell_part.split_whitespace().next()?;
+        let row = cell.trim_matches(|character: char| !character.is_ascii_digit());
+        if !row.is_empty() {
+            return Some(format!("{sheet}, fila {row}"));
+        }
+    }
+    if location.starts_with("tabla ") {
+        let (table_row, _) = location.split_once(", celda")?;
+        return Some(table_row.to_owned());
+    }
+    None
 }
 
 fn calculation_evidence(request: &AggregateRequest, rows: &[AggregateRow]) -> Option<Evidence> {
     let first = rows.iter().flat_map(|row| row.evidence.iter()).next()?;
     let total_matches = rows.iter().map(|row| row.matched_values).sum::<i64>();
     let rendered = if rows.len() == 1 {
-        format_number(rows[0].value)
+        format!(
+            "{}{}",
+            format_number(rows[0].value),
+            rows[0]
+                .currency
+                .as_deref()
+                .map(|value| format!(" {value}"))
+                .unwrap_or_default()
+        )
     } else {
         rows.iter()
             .map(|row| {
                 format!(
-                    "{}: {}",
+                    "{}: {}{}",
                     row.group.as_deref().unwrap_or("Total"),
-                    format_number(row.value)
+                    format_number(row.value),
+                    row.currency
+                        .as_deref()
+                        .map(|value| format!(" {value}"))
+                        .unwrap_or_default()
                 )
             })
             .collect::<Vec<_>>()
             .join("; ")
     };
-    let currency = request
-        .currency
-        .as_deref()
-        .map(|value| format!(" {value}"))
-        .unwrap_or_default();
     Some(Evidence {
         id: format!(
             "calc-{}-{}-{}",
@@ -1369,7 +2108,7 @@ fn calculation_evidence(request: &AggregateRequest, rows: &[AggregateRow]) -> Op
         origin: first.origin.clone(),
         location: format!("cálculo local exacto sobre {total_matches} valores extraídos"),
         excerpt: format!(
-            "Omega ejecutó {} para el concepto '{}' y obtuvo {}{} a partir de {total_matches} valores con evidencia.",
+            "Omega ejecutó {} para el concepto '{}' y obtuvo {} a partir de {total_matches} valores con evidencia.",
             if request.operation == "sum" {
                 "una suma"
             } else {
@@ -1377,11 +2116,10 @@ fn calculation_evidence(request: &AggregateRequest, rows: &[AggregateRow]) -> Op
             },
             request.concept,
             rendered,
-            currency,
         ),
         normalized_value: None,
-        value: Some(format!("{rendered}{currency}")),
-        matched: Some(format!("{rendered}{currency}")),
+        value: Some(rendered.clone()),
+        matched: Some(rendered),
         field: None,
         match_kind: "campo".into(),
         reliable: true,
@@ -1408,6 +2146,113 @@ fn append_filters(sql: &mut String, values: &mut Vec<Box<dyn ToSql>>, filters: &
         values.push(Box::new(canonical_key(&filter.concept)));
         values.push(Box::new(normalize_spanish(&filter.equals)));
     }
+}
+
+fn append_origin(sql: &mut String, values: &mut Vec<Box<dyn ToSql>>, origin: Option<&str>) {
+    if let Some(origin) = origin {
+        sql.push_str(" AND d.origin = ?");
+        values.push(Box::new(origin.to_owned()));
+    }
+}
+
+fn terms_contain_all(haystack: &[String], needles: &[String]) -> bool {
+    !needles.is_empty()
+        && needles.iter().all(|needle| {
+            haystack
+                .iter()
+                .any(|term| stems_match(term, needle) || prefix_terms_match(term, needle))
+        })
+}
+
+fn prefix_terms_match(left: &str, right: &str) -> bool {
+    left.len().min(right.len()) >= 4 && (left.starts_with(right) || right.starts_with(left))
+}
+
+/// Conserva sólo términos de contenido. La lista contiene palabras de
+/// formulación de consultas, nunca nombres propios de un dominio documental.
+fn content_terms(query: &str) -> Vec<String> {
+    const FILLER: &[&str] = &[
+        "a",
+        "al",
+        "ante",
+        "aplica",
+        "aplican",
+        "aplicar",
+        "como",
+        "con",
+        "cual",
+        "cuales",
+        "cuando",
+        "cuanto",
+        "cuantos",
+        "de",
+        "debe",
+        "del",
+        "despues",
+        "dime",
+        "donde",
+        "el",
+        "en",
+        "es",
+        "esta",
+        "este",
+        "existe",
+        "hacer",
+        "hay",
+        "la",
+        "las",
+        "lo",
+        "los",
+        "me",
+        "menciona",
+        "mencionan",
+        "mention",
+        "mentions",
+        "muestra",
+        "para",
+        "por",
+        "que",
+        "quien",
+        "quienes",
+        "se",
+        "sobre",
+        "son",
+        "su",
+        "sus",
+        "tiene",
+        "tienen",
+        "un",
+        "una",
+        "y",
+        "busca",
+        "buscar",
+        "documentacion",
+        "documento",
+        "documentos",
+        "informacion",
+        "registros",
+        "resume",
+        "the",
+        "what",
+        "which",
+        "who",
+        "where",
+        "when",
+        "show",
+        "find",
+        "documents",
+    ];
+    let filler = FILLER
+        .iter()
+        .map(|word| normalize_spanish(word))
+        .collect::<HashSet<_>>();
+    let mut terms = search_terms(query)
+        .into_iter()
+        .filter(|term| term.len() >= 3 && !filler.contains(term))
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 fn resolve_concept(database: &Database, value: &str) -> Result<Option<i64>> {
@@ -1521,6 +2366,7 @@ fn canonical_identifier_candidates(query: &str) -> Vec<String> {
         .find_iter(query)
         .chain(spaced.find_iter(query))
         .filter(|match_| !looks_like_ordinal_folder(match_.as_str()))
+        .filter(|match_| !looks_like_labeled_ordinal_folder(match_.as_str()))
         .filter_map(|match_| canonical_identifier(match_.as_str()))
         .collect::<Vec<_>>();
     values.sort();
@@ -1542,6 +2388,29 @@ fn looks_like_ordinal_folder(value: &str) -> bool {
             .expect("valid ordinal folder regex")
     });
     ORDINAL_FOLDER.is_match(value)
+}
+
+fn looks_like_labeled_ordinal_folder(value: &str) -> bool {
+    let mut words = value.split_whitespace();
+    let Some(label) = words.next() else {
+        return false;
+    };
+    let Some(candidate) = words.next() else {
+        return false;
+    };
+    words.next().is_none()
+        && [
+            "carpeta",
+            "categoria",
+            "categoría",
+            "origen",
+            "fuente",
+            "folder",
+            "category",
+            "source",
+        ]
+        .contains(&label.to_lowercase().as_str())
+        && looks_like_ordinal_folder(candidate)
 }
 
 fn explicit_identifier_mode(query: &str) -> Option<(IdentifierMode, String)> {
@@ -1592,6 +2461,15 @@ fn phrase_in(haystack: &str, needle: &str) -> bool {
         return false;
     }
     whole_phrase_in(haystack, needle)
+}
+
+/// Los tipos con forma reconocible (`extract::classify_value` ya sabe
+/// distinguirlos) sólo pueden tomar un valor literal que contenga un dígito:
+/// un importe, una cantidad, un porcentaje o una fecha. Un campo de texto o
+/// estado no tiene esa restricción, así que cualquier palabra puede seguir
+/// siendo un intento de valor legítimo.
+fn requires_numeric_shape(value_type: &str) -> bool {
+    matches!(value_type, "money" | "number" | "percentage" | "date")
 }
 
 fn whole_phrase_in(haystack: &str, needle: &str) -> bool {
@@ -1668,15 +2546,29 @@ fn chunk_evidence(
         .lines()
         .enumerate()
         .map(|(offset, line)| {
-            let normalized = normalize_spanish(line);
+            let normalized = search_terms(line);
             let score = terms
                 .iter()
-                .filter(|term| normalized.split_whitespace().any(|word| word == *term))
+                .filter(|term| {
+                    normalized
+                        .iter()
+                        .any(|word| stems_match(word, term) || prefix_terms_match(word, term))
+                })
                 .count();
             (score, offset, line.trim())
         })
         .max_by_key(|(score, _, _)| *score)
         .unwrap_or((0, 0, content.trim()));
+    let best_terms = search_terms(best.2);
+    let matched = terms
+        .iter()
+        .filter(|term| {
+            best_terms
+                .iter()
+                .any(|word| stems_match(word, term) || prefix_terms_match(word, term))
+        })
+        .max_by_key(|term| term.len())
+        .cloned();
     Evidence {
         id,
         document_id,
@@ -1687,10 +2579,10 @@ fn chunk_evidence(
         } else {
             location.to_owned()
         },
-        excerpt: brief_excerpt(best.2, terms.first().map(String::as_str)),
+        excerpt: brief_excerpt(best.2, matched.as_deref()),
         normalized_value: None,
         value: None,
-        matched: terms.first().cloned(),
+        matched,
         field: None,
         match_kind: "texto".into(),
         reliable: ocr_is_reliable(&ocr_status, confidence),
@@ -1702,11 +2594,11 @@ fn ocr_is_reliable(status: &str, confidence: Option<f64>) -> bool {
     status != "failed" && confidence.is_none_or(|value| value >= 0.55)
 }
 
-/// Mantiene una sola unidad de evidencia en un máximo de 220 caracteres. Si
+/// Mantiene una sola unidad de evidencia en un máximo de 360 caracteres. Si
 /// la coincidencia está en medio, conserva contexto a ambos lados sin añadir
 /// texto que no proceda del archivo.
 fn brief_excerpt(value: &str, matched: Option<&str>) -> String {
-    const MAX: usize = 220;
+    const MAX: usize = 360;
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= MAX {
         return compact;
@@ -1730,4 +2622,21 @@ fn brief_excerpt(value: &str, matched: Option<&str>) -> String {
         result.push('…');
     }
     result
+}
+
+#[cfg(test)]
+mod tabular_tests {
+    use super::tabular_record_scope;
+
+    #[test]
+    fn csv_and_workbook_cells_share_only_their_own_row_scope() {
+        assert_eq!(
+            tabular_record_scope("fila 8, celda F8 (Importe total)").as_deref(),
+            Some("fila 8")
+        );
+        assert_eq!(
+            tabular_record_scope("hoja Registros, celda C12 (Estado)").as_deref(),
+            Some("hoja Registros, fila 12")
+        );
+    }
 }

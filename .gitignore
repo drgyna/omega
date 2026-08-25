@@ -12,4 +12,5 @@ src-tauri/gen/
 *.log
 .cache/
 tmp/
+artifacts/evaluations/
 .DS_Store

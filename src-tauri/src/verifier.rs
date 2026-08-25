@@ -22,6 +22,31 @@ pub struct ModelClaim {
     pub verbatim_values: Vec<String>,
 }
 
+/// Candado único de respaldo literal: un valor sólo puede aparecer en una
+/// respuesta si figura en la evidencia citada. La comparación usa la misma
+/// normalización que el resto del motor y mira exactamente lo que la interfaz
+/// muestra de cada cita: su extracto y su valor.
+///
+/// Lo comparten la verificación de una respuesta del modelo y la síntesis
+/// local, para que ninguna de las dos invente un dato por su cuenta.
+pub fn value_is_supported(evidence: &[&Evidence], value: &str) -> bool {
+    if value.trim().is_empty() {
+        return false;
+    }
+    let evidence_text = evidence
+        .iter()
+        .map(|item| {
+            format!(
+                "{} {}",
+                item.excerpt,
+                item.value.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_spanish(&evidence_text).contains(&normalize_spanish(value))
+}
+
 pub fn verify_model_answer(raw: &str, available: &[Evidence]) -> Result<Answer> {
     let parsed: ModelAnswer = serde_json::from_str(raw)
         .map_err(|error| OmegaError::Verification(format!("JSON final inválido: {error}")))?;
@@ -60,26 +85,13 @@ pub fn verify_model_answer(raw: &str, available: &[Evidence]) -> Result<Answer> 
                     .ok_or_else(|| OmegaError::Verification(format!("evidencia inexistente: {id}")))
             })
             .collect::<Result<Vec<_>>>()?;
-        let evidence_text = cited
-            .iter()
-            .map(|item| {
-                format!(
-                    "{} {}",
-                    item.excerpt,
-                    item.value.as_deref().unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let normalized_evidence = normalize_spanish(&evidence_text);
-
         if claim.verbatim_values.is_empty() {
             return Err(OmegaError::Verification(
                 "cada afirmación debe declarar al menos un valor literal respaldado".into(),
             ));
         }
         for value in &claim.verbatim_values {
-            if value.trim().is_empty() || !normalized_evidence.contains(&normalize_spanish(value)) {
+            if !value_is_supported(&cited, value) {
                 return Err(OmegaError::Verification(format!(
                     "el valor '{}' no aparece en la evidencia citada",
                     value

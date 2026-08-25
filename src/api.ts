@@ -8,8 +8,6 @@ export interface AppStatus {
   documents: number;
   concepts: number;
   values: number;
-  ai_enabled: boolean;
-  api_key_stored: boolean;
 }
 
 export interface SourceSummary {
@@ -49,7 +47,7 @@ export interface Evidence {
 
 export interface Answer {
   text: string;
-  mode: "local" | "ai";
+  mode: "local";
   verified: boolean;
   citations: Evidence[];
   warning: string | null;
@@ -71,7 +69,7 @@ const mutation = <T,>(operation: () => Promise<T>): Promise<T> => {
 
 export const api = {
   status: () => desktopOnly(() => invoke<AppStatus>("get_status"), {
-    sources: 0, documents: 0, concepts: 0, values: 0, ai_enabled: false, api_key_stored: false
+    sources: 0, documents: 0, concepts: 0, values: 0
   }),
   sources: () => desktopOnly(() => invoke<SourceSummary[]>("list_sources"), []),
   selectFolder: () => mutation(() => open({ directory: true, multiple: false, title: "Autorizar una carpeta en Omega" })),
@@ -80,9 +78,6 @@ export const api = {
   revoke: (sourceId: number) => mutation(() => invoke<void>("revoke_source", { sourceId })),
   concepts: (query?: string) => desktopOnly(() => invoke<ConceptSummary[]>("list_concepts", { query: query || null }), []),
   ask: (question: string) => mutation(() => invoke<Answer>("ask", { question })),
-  configureAi: (enabled: boolean, consent: boolean) => mutation(() => invoke<void>("configure_ai", { enabled, consent })),
-  storeApiKey: (apiKey: string) => mutation(() => invoke<void>("store_api_key", { apiKey })),
-  clearApiKey: () => mutation(() => invoke<void>("clear_api_key")),
   openDocument: (path: string) => mutation(() => invoke<void>("open_document", { path }))
 };
 

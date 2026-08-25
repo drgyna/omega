@@ -8,8 +8,6 @@ construida con Tauri v2, Rust, SQLite/FTS5 y React/TypeScript.
 > dentro de la ventana nativa. Para instalar la aplicación en macOS, abre el `.dmg` generado en
 > `src-tauri/target/release/bundle/dmg/` y arrastra **Omega** a Aplicaciones.
 
-El instalador verificado de esta entrega es `Omega_0.1.0_final_aarch64.dmg`.
-
 ## Garantías del diseño
 
 - La búsqueda, el parsing, la extracción, los cálculos y las citas funcionan sin red.
@@ -17,12 +15,10 @@ El instalador verificado de esta entrega es `Omega_0.1.0_final_aarch64.dmg`.
   valores huérfanos.
 - La revocación elimina FTS, documentos, valores, entidades y aliases derivados mediante SQL
   de conjunto y dentro de una sola transacción.
-- La IA está apagada por defecto. Solo se activa con consentimiento explícito y la clave se
-  guarda en Keychain/Credential Manager mediante `keyring`, nunca en SQLite ni en el frontend.
-- La IA decide qué herramientas usar; Rust calcula y devuelve evidencia. Un verificador bloquea
-  cualquier cifra, fecha, identificador o nombre propio que no se haya declarado y respaldado.
-- Una falla de red, API o verificación nunca publica la salida del modelo: Omega vuelve a una
-  respuesta local legible e informa el motivo.
+- Omega no incluye modelos remotos, API, claves ni tráfico de red: los archivos y las preguntas
+  no salen del equipo.
+- El planificador local decide la ruta de búsqueda; Rust calcula y devuelve evidencia. Un
+  verificador bloquea cualquier cifra, fecha, identificador o nombre propio no respaldado.
 
 ## Desarrollo
 
@@ -45,23 +41,23 @@ npm run tauri:build
 
 ## Pruebas
 
-La prueba de integración usa un corpus externo en modo de solo lectura. No se genera ni se copia
-ningún acervo, ni se codifican su ruta, archivos, categorías o valores en la aplicación.
+Las pruebas normales validan el motor y sus parsers. La fábrica local agrega siete corpus
+sintéticos y aislados —incluidos formatos extremos— para detectar regresiones sin tocar la base
+real de la aplicación.
 
 ```sh
 cd src-tauri
-OMEGA_SCALE_CORPUS=/ruta/al/corpus cargo test --all -- --nocapture
+cargo test --all
 ```
 
-En otra máquina se puede señalar el mismo acervo sin cambiar código:
+Desde la raíz del repositorio, para ejecutar todos los corpus de evaluación:
 
 ```sh
-OMEGA_SCALE_CORPUS=/ruta/al/corpus cargo test --test legal_corpus_scale
+cargo run --manifest-path src-tauri/Cargo.toml --bin omega-eval -- --all
 ```
 
-La prueba descubre los datos del fixture en tiempo de ejecución y comprueba búsqueda por
-identificador, estado, tipo, carpeta de origen, evidencia de líneas reales, deduplicación,
-consulta global y ausencia de resúmenes.
+Consulta [docs/EVALUACIONES.md](docs/EVALUACIONES.md) para ejecutar un corpus concreto, la carga
+de 5,000 documentos y conocer los límites de OCR del entorno.
 
 ## Formatos y OCR
 
@@ -90,8 +86,8 @@ cargo test --test format_retrieval retrieves_ocr_fixture_when_explicitly_configu
 - `src-tauri/src/parser.rs`: TXT, Markdown, CSV, XLSX, DOCX, PDF de texto y contrato OCR.
 - `src-tauri/src/indexer.rs`: indexado transaccional y extracción unificada etiqueta/valor.
 - `src-tauri/src/tools.rs`: catálogo, búsqueda, lookup exacto y agregaciones.
-- `src-tauri/src/agent.rs`: Responses API, tool-calling, límites y fallback local.
-- `src-tauri/src/verifier.rs`: verificación fail-closed previa a publicación.
+- `src-tauri/src/agent.rs`: planificador local, búsqueda, cálculo y respuestas con citas.
+- `src-tauri/src/verifier.rs`: verificación de respaldo literal antes de publicar una respuesta.
 - `src/`: conversación, fuentes autorizadas, citas y configuración de privacidad.
 - `docs/ARCHITECTURE.md`: límites de confianza y decisiones técnicas.
 - `docs/OCR.md`: punto de extensión y plan de la siguiente implementación.

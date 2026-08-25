@@ -124,9 +124,25 @@ fn parse_workbook(path: &Path, extension: &str) -> Result<ParsedDocument> {
         let range = workbook
             .worksheet_range(&sheet_name)
             .map_err(|error| OmegaError::Parse(error.to_string()))?;
+        // Las hojas reales suelen tener un título o logotipo antes de la
+        // tabla. Se elige como encabezado la fila de texto con más celdas no
+        // vacías, en vez de asumir rígidamente la primera fila.
+        let mut header_index = 0usize;
+        let mut header_score = 0usize;
+        for (index, row) in range.rows().take(25).enumerate() {
+            let score = row
+                .iter()
+                .map(cell_text)
+                .filter(|value| !value.trim().is_empty())
+                .count();
+            if score > header_score {
+                header_index = index;
+                header_score = score;
+            }
+        }
         let headers = range
             .rows()
-            .next()
+            .nth(header_index)
             .unwrap_or_default()
             .iter()
             .map(cell_text)
@@ -139,7 +155,12 @@ fn parse_workbook(path: &Path, extension: &str) -> Result<ParsedDocument> {
             let cells = row.iter().map(cell_text).collect::<Vec<_>>();
             text.push_str(&cells.join(" | "));
             text.push('\n');
-            if row_index == 0 {
+            if row_index <= header_index {
+                continue;
+            }
+            // Filas parciales de totales/notas no se mezclan con registros
+            // tabulares: un registro necesita una clave en la primera columna.
+            if cells.first().is_none_or(|value| value.trim().is_empty()) {
                 continue;
             }
             for (column, value) in cells.iter().enumerate() {
@@ -200,14 +221,16 @@ fn parse_docx(path: &Path) -> Result<ParsedDocument> {
         .map_err(|error| OmegaError::Parse(error.to_string()))?
         .read_to_string(&mut xml)?;
 
+    let mut table_records = records_from_docx_tables(&xml);
     let paragraph = Regex::new(r"</w:p>").expect("valid regex");
     let tabs = Regex::new(r"<w:tab[^>]*/>").expect("valid regex");
     let tags = Regex::new(r"<[^>]+>").expect("valid regex");
     let xml = paragraph.replace_all(&xml, "\n");
     let xml = tabs.replace_all(&xml, "\t");
     let text = decode_xml_entities(&tags.replace_all(&xml, ""));
-    let records = records_from_text(&text, "párrafo");
-    let chunks = text
+    let mut records = records_from_text(&text, "párrafo");
+    records.append(&mut table_records);
+    let mut chunks = text
         .lines()
         .enumerate()
         .filter_map(|(index, paragraph)| {
@@ -217,7 +240,16 @@ fn parse_docx(path: &Path) -> Result<ParsedDocument> {
                 content: content.to_owned(),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    chunks.extend(
+        records
+            .iter()
+            .filter(|record| record.location.starts_with("tabla "))
+            .map(|record| ParsedChunk {
+                location: record.location.clone(),
+                content: record.excerpt.clone(),
+            }),
+    );
     let mut document = plain_document(text, "docx".into(), records);
     document.chunks = chunks;
     Ok(document)
@@ -243,13 +275,11 @@ fn records_from_pdf_pages(text: &str) -> Vec<ParsedRecord> {
                 .enumerate()
                 .filter_map(move |(line, value)| {
                     let trimmed = value.trim();
-                    let (label, raw) = trimmed.split_once(':')?;
-                    let label = label.trim();
-                    let raw = raw.trim();
+                    let (label, raw) = split_field_line(trimmed)?;
                     (!label.is_empty() && !raw.is_empty() && label.len() <= 120).then(|| {
                         ParsedRecord {
-                            label: label.to_owned(),
-                            value: raw.to_owned(),
+                            label,
+                            value: raw,
                             location: format!("página {}, línea {}", page + 1, line + 1),
                             excerpt: trimmed.to_owned(),
                         }
@@ -306,19 +336,88 @@ pub fn records_from_text(text: &str, location_prefix: &str) -> Vec<ParsedRecord>
                 return None;
             }
             let (label, value) = trimmed.split_once(':')?;
-            let label = label.trim();
-            let value = value.trim();
+            let label = label.trim().to_owned();
+            let value = value.trim().to_owned();
             if label.is_empty() || value.is_empty() || label.len() > 120 {
                 return None;
             }
             Some(ParsedRecord {
-                label: label.to_owned(),
-                value: value.to_owned(),
+                label,
+                value,
                 location: format!("{location_prefix} {}", index + 1),
                 excerpt: trimmed.to_owned(),
             })
         })
         .collect()
+}
+
+fn records_from_docx_tables(xml: &str) -> Vec<ParsedRecord> {
+    let rows = Regex::new(r"(?s)<w:tr\b.*?</w:tr>").expect("valid DOCX row regex");
+    let cells = Regex::new(r"(?s)<w:tc\b.*?</w:tc>").expect("valid DOCX cell regex");
+    let text_nodes =
+        Regex::new(r"(?s)<w:t(?:\s[^>]*)?>(.*?)</w:t>").expect("valid DOCX text regex");
+    rows.find_iter(xml)
+        .enumerate()
+        .filter_map(|(row_index, row)| {
+            let values = cells
+                .find_iter(row.as_str())
+                .map(|cell| {
+                    text_nodes
+                        .captures_iter(cell.as_str())
+                        .map(|capture| decode_xml_entities(&capture[1]))
+                        .collect::<Vec<_>>()
+                        .join("")
+                        .trim()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            if values.len() < 2 || values[0].is_empty() || values[1].is_empty() {
+                return None;
+            }
+            Some(ParsedRecord {
+                label: values[0].clone(),
+                value: values[1].clone(),
+                location: format!("tabla 1, fila {}, celda B{}", row_index + 1, row_index + 1),
+                excerpt: format!("{}: {}", values[0], values[1]),
+            })
+        })
+        .collect()
+}
+
+fn split_field_line(line: &str) -> Option<(String, String)> {
+    if let Some((label, value)) = line.split_once(':') {
+        let label = label.trim();
+        let value = value.trim();
+        return (!label.is_empty() && !value.is_empty())
+            .then(|| (label.to_owned(), value.to_owned()));
+    }
+    // Algunos extractores PDF conservan una fila de tabla como "Etiqueta
+    // Valor". Esta lista describe encabezados comunes, no valores ni giros de
+    // negocio, y sólo se usa cuando ocupa el inicio completo de la línea.
+    const TABLE_LABELS: &[&str] = &[
+        "Tipo de documento",
+        "Fecha de registro",
+        "Ciudad base",
+        "Importe total",
+        "Número de control",
+        "Numero de control",
+        "Fecha de emisión",
+        "Fecha de emision",
+        "Razón social",
+        "Razon social",
+        "Correo electrónico",
+        "Correo electronico",
+        "Folio",
+        "Estado",
+        "Responsable",
+        "Importe",
+        "Monto",
+        "Total",
+    ];
+    TABLE_LABELS.iter().find_map(|label| {
+        let value = line.strip_prefix(label)?.trim();
+        (!value.is_empty()).then(|| ((*label).to_owned(), value.to_owned()))
+    })
 }
 
 fn decode_xml_entities(value: &str) -> String {
@@ -346,5 +445,35 @@ mod tests {
         assert_eq!(column_name(26), "AA");
         let records = records_from_text("Clave: ITEM-7", "línea");
         assert_eq!(records[0].excerpt, "Clave: ITEM-7");
+    }
+
+    #[test]
+    fn fixture_docx_exposes_table_fields() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../corpus-prueba-formatos-extremos/03_word_docx/001-minuta-de-comité.docx");
+        if !path.is_file() {
+            return;
+        }
+        let document = parse_docx(&path).unwrap();
+        assert!(document.records.iter().any(|record| {
+            record.label == "Folio"
+                && record.value == "FMT-26-0051"
+                && record.location.starts_with("tabla 1")
+        }));
+    }
+
+    #[test]
+    fn fixture_xlsx_finds_the_table_header_after_its_title() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../corpus-prueba-formatos-extremos/04_excel_xlsx/001-reporte-operativo.xlsx");
+        if !path.is_file() {
+            return;
+        }
+        let document = parse_workbook(&path, "xlsx").unwrap();
+        assert!(document.records.iter().any(|record| {
+            record.label == "Folio"
+                && record.value == "XLS-26-0200"
+                && record.location.contains("celda A4")
+        }));
     }
 }

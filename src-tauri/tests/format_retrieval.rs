@@ -51,13 +51,25 @@ fn retrieves_precise_short_evidence_across_local_text_formats() {
     let quoted_phrase = engine
         .ask("Encuentra el documento que contiene \"target words appear here\"")
         .unwrap();
-    assert_eq!(quoted_phrase.citations.len(), 1);
+    // La frase literal sigue procediendo de un solo documento. La segunda cita
+    // no es otro resultado: es el identificador de ese mismo registro, que la
+    // respuesta nombra y por tanto tiene que respaldar con evidencia.
+    assert_eq!(
+        quoted_phrase.text,
+        "El campo «Detail» de ITEM-42 es target words appear here (notes.txt, línea 3)."
+    );
+    assert_eq!(quoted_phrase.citations.len(), 2);
+    assert!(
+        quoted_phrase
+            .citations
+            .iter()
+            .all(|evidence| evidence.path.ends_with("notes.txt"))
+    );
     assert_evidence(
         &quoted_phrase.citations[0],
         "target words appear here",
         "exacta",
     );
-    assert!(quoted_phrase.citations[0].path.ends_with("notes.txt"));
 
     let contains_phrase = engine.ask("menciona target words appear here").unwrap();
     assert_eq!(contains_phrase.citations.len(), 1);
@@ -189,7 +201,12 @@ fn reports_the_real_structured_total_independently_from_visual_pagination() {
 
     let answer = engine.ask("Lifecycle Ready").unwrap();
     assert_eq!(answer.citations.len(), 125);
-    assert!(answer.text.starts_with("125 resultados"));
+    // El texto sintetizado sigue reportando el total real recuperado, no el
+    // tamaño de página con el que la interfaz muestra las citas.
+    assert_eq!(
+        answer.text,
+        "Encontré 125 valores de «Lifecycle», todos «Ready»."
+    );
     assert!(answer.citations.iter().all(|evidence| {
         evidence.field.as_deref() == Some("Lifecycle")
             && evidence.value.as_deref() == Some("Ready")

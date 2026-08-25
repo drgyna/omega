@@ -78,6 +78,16 @@ impl<'a> Indexer<'a> {
         for path in files {
             match self.parser.parse(&path) {
                 Ok(document) => {
+                    if !has_indexable_evidence(&document) {
+                        report.skipped += 1;
+                        report.warnings.push(format!(
+                            "{}: sin contenido extraíble; no se creó un documento indexado (parser={}, OCR={})",
+                            path.display(),
+                            document.parser,
+                            document.ocr_status.as_str()
+                        ));
+                        continue;
+                    }
                     let canonical_path = match path.canonicalize() {
                         Ok(path) => path.to_string_lossy().to_string(),
                         Err(error) => {
@@ -138,6 +148,14 @@ impl<'a> Indexer<'a> {
         report.elapsed_ms = started.elapsed().as_millis();
         Ok(report)
     }
+}
+
+fn has_indexable_evidence(document: &ParsedDocument) -> bool {
+    !document.text.trim().is_empty()
+        || document
+            .chunks
+            .iter()
+            .any(|chunk| !chunk.content.trim().is_empty())
 }
 
 fn file_hash(path: &Path) -> Result<String> {
@@ -356,5 +374,17 @@ mod tests {
     fn chunk_locations_remain_navigable() {
         let result = chunks("uno\ndos\ntres");
         assert_eq!(result[0].0, "líneas 1-3");
+    }
+
+    #[test]
+    fn empty_parses_are_not_indexable_evidence() {
+        assert!(!has_indexable_evidence(&ParsedDocument {
+            text: String::new(),
+            chunks: vec![],
+            records: vec![],
+            parser: "empty".into(),
+            ocr_status: OcrStatus::Failed,
+            ocr_confidence: None,
+        }));
     }
 }

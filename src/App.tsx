@@ -1,13 +1,11 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { Answer, AppStatus, ConceptSummary, IndexReport, SourceSummary, ViewName, api, displayError } from "./api";
 
 const EMPTY_STATUS: AppStatus = {
   sources: 0,
   documents: 0,
   concepts: 0,
-  values: 0,
-  ai_enabled: false,
-  api_key_stored: false
+  values: 0
 };
 
 interface ChatItem {
@@ -22,6 +20,8 @@ export default function App() {
   const [status, setStatus] = useState<AppStatus>(EMPTY_STATUS);
   const [sources, setSources] = useState<SourceSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [thread, setThread] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
@@ -37,58 +37,81 @@ export default function App() {
   useEffect(() => { void refresh(); }, [refresh]);
 
   return (
-    <div className="app-shell">
-      <Sidebar active={view} status={status} onNavigate={setView} />
+    <div className={`app-shell ${sidebarOpen ? "" : "sidebar-hidden"}`}>
+      {sidebarOpen && <Sidebar active={view} sources={sources} onNavigate={setView}
+        onNewConversation={() => { setThread((n) => n + 1); setView("conversation"); }} />}
       <main className="workspace">
-        <Topbar status={status} />
+        <Topbar status={status} sidebarOpen={sidebarOpen} onToggleSidebar={() => setSidebarOpen((open) => !open)} />
         {error && <Toast message={error} onClose={() => setError(null)} />}
-        {view === "conversation" && <Conversation status={status} onNavigate={setView} onError={setError} />}
+        {view === "conversation" && <Conversation key={thread} status={status} sources={sources} onNavigate={setView} onError={setError} />}
         {view === "sources" && <Sources sources={sources} onChanged={refresh} onError={setError} />}
-        {view === "settings" && <Settings status={status} onChanged={refresh} onError={setError} />}
+        {view === "settings" && <Settings status={status} onError={setError} />}
       </main>
     </div>
   );
 }
 
-function Sidebar({ active, status, onNavigate }: { active: ViewName; status: AppStatus; onNavigate: (view: ViewName) => void }) {
+function Sidebar({ active, sources, onNavigate, onNewConversation }: { active: ViewName; sources: SourceSummary[]; onNavigate: (view: ViewName) => void; onNewConversation: () => void }) {
   return (
     <aside className="sidebar">
       <div className="brand">
         <div className="brand-mark">Ω</div>
-        <div><strong>OMEGA</strong><span>Inteligencia documental</span></div>
+        <span>Omega</span>
+      </div>
+      <div className="sidebar-actions">
+        <button type="button" className="new-chat" onClick={onNewConversation}><PlusIcon /> Nueva conversación</button>
       </div>
       <nav>
         <NavButton active={active === "conversation"} icon={<ChatIcon />} label="Conversación" onClick={() => onNavigate("conversation")} />
-        <NavButton active={active === "sources"} icon={<FolderIcon />} label="Fuentes" count={status.sources} onClick={() => onNavigate("sources")} />
+        <NavButton active={active === "sources"} icon={<FolderIcon />} label="Fuentes" onClick={() => onNavigate("sources")} />
         <NavButton active={active === "settings"} icon={<SettingsIcon />} label="Configuración" onClick={() => onNavigate("settings")} />
       </nav>
+      {sources.length > 0 && (
+        <div className="sidebar-sources">
+          <div className="sidebar-heading">Fuentes</div>
+          {sources.map((source) => (
+            <button key={source.id} type="button" className="sidebar-source" title={source.path} onClick={() => onNavigate("sources")}>
+              <span className="source-chip"><FolderIcon /></span>
+              <span className="sidebar-source-name">{fileName(source.path)}</span>
+              <em>{source.document_count}</em>
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="sidebar-spacer" />
       <div className="privacy-card">
         <ShieldIcon />
-        <div><strong>Privado por diseño</strong><span>Recuperación local con evidencia</span></div>
+        <span>Privado por diseño — recuperación local, sin salir del equipo.</span>
       </div>
-      <div className="sidebar-foot"><span className="status-dot" /> Motor de recuperación disponible</div>
     </aside>
   );
 }
 
-function NavButton({ active, icon, label, count, onClick }: { active: boolean; icon: ReactNode; label: string; count?: number; onClick: () => void }) {
-  return <button aria-label={label} className={`nav-button ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span>{count !== undefined && <em>{count}</em>}</button>;
+function NavButton({ active, icon, label, onClick }: { active: boolean; icon: ReactNode; label: string; onClick: () => void }) {
+  return <button aria-label={label} className={`nav-button ${active ? "active" : ""}`} onClick={onClick}>{icon}<span>{label}</span></button>;
 }
 
-function Topbar({ status }: { status: AppStatus }) {
+function Topbar({ status, sidebarOpen, onToggleSidebar }: { status: AppStatus; sidebarOpen: boolean; onToggleSidebar: () => void }) {
   return (
     <header className="topbar">
-      <div className="breadcrumb"><span>Espacio local</span><i>/</i><strong>{status.documents.toLocaleString("es-MX")} documentos</strong></div>
+      <div className="topbar-left">
+        <button type="button" className="icon-button" aria-pressed={sidebarOpen}
+          aria-label={sidebarOpen ? "Ocultar barra lateral" : "Mostrar barra lateral"}
+          title={sidebarOpen ? "Ocultar barra lateral" : "Mostrar barra lateral"}
+          onClick={onToggleSidebar}><SidebarIcon /></button>
+        <div className="breadcrumb"><span>Espacio local</span><i>/</i><strong>{status.documents.toLocaleString("es-MX")} documentos</strong></div>
+      </div>
       <div className="engine-badge"><span className="pulse" />Recuperación con evidencia</div>
     </header>
   );
 }
 
-function Conversation({ status, onNavigate, onError }: { status: AppStatus; onNavigate: (view: ViewName) => void; onError: (error: string) => void }) {
+function Conversation({ status, sources, onNavigate, onError }: { status: AppStatus; sources: SourceSummary[]; onNavigate: (view: ViewName) => void; onError: (error: string) => void }) {
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<ChatItem[]>([]);
   const ready = status.documents > 0;
+  const context = sources.length === 0 ? "Sin fuentes" : sources.length === 1 ? fileName(sources[0].path) : `${sources.length} fuentes`;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -112,9 +135,9 @@ function Conversation({ status, onNavigate, onError }: { status: AppStatus; onNa
     <section className="conversation-page">
       {messages.length === 0 ? (
         <div className="welcome">
-          <div className="eyebrow"><span /> Pregunta con evidencia</div>
-          <h1>Tu negocio, <em>en una conversación.</em></h1>
-          <p>Omega busca, calcula y responde usando únicamente tus documentos autorizados. Cada dato importante conserva su fuente.</p>
+          <div className="welcome-icon"><SearchIcon /></div>
+          <h1>¿Qué quieres saber de tus documentos?</h1>
+          <p>Omega responde solo lo que puede respaldar con una fuente citada.</p>
           {!ready && <button className="primary-action" onClick={() => onNavigate("sources")}><FolderIcon /> Añadir mi primera carpeta</button>}
           {ready && <PromptIdeas onSelect={setQuestion} />}
         </div>
@@ -125,11 +148,19 @@ function Conversation({ status, onNavigate, onError }: { status: AppStatus; onNa
         </div>
       )}
       <form className="composer" onSubmit={submit}>
+        <div className="composer-context">
+          <span><FolderIcon /><em>{context}</em></span>
+          <span><DocumentIcon /><em>{status.documents.toLocaleString("es-MX")} documentos</em></span>
+        </div>
         <div className="composer-inner">
           <textarea value={question} onChange={(event) => setQuestion(event.target.value)}
             onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }}
             placeholder={ready ? "Pregunta algo sobre tus documentos…" : "Añade una fuente para empezar…"} disabled={!ready || busy} rows={2} />
-          <button type="submit" disabled={!ready || !question.trim() || busy} aria-label="Enviar"><ArrowIcon /></button>
+          <div className="composer-controls">
+            <button type="button" className="composer-add" aria-label="Gestionar fuentes" title="Gestionar fuentes" onClick={() => onNavigate("sources")}><PlusIcon /></button>
+            <span className="engine-pill" title="Motor local activo">Local</span>
+            <button type="submit" className="composer-send" disabled={!ready || !question.trim() || busy} aria-label="Enviar"><ArrowIcon /></button>
+          </div>
         </div>
         <span>Omega solo afirma lo que puede respaldar con una fuente.</span>
       </form>
@@ -140,7 +171,7 @@ function Conversation({ status, onNavigate, onError }: { status: AppStatus; onNa
 function PromptIdeas({ onSelect }: { onSelect: (value: string) => void }) {
   return <div className="prompt-grid">
     {["Encuentra un documento por identificador", "Busca documentos por estado", "Muestra la evidencia de una categoría"].map((item) => (
-      <button key={item} onClick={() => onSelect(item)}><SparkIcon /><span>{item}</span><ArrowIcon /></button>
+      <button key={item} type="button" onClick={() => onSelect(item)}>{item}</button>
     ))}
   </div>;
 }
@@ -152,8 +183,8 @@ function Message({ item }: { item: ChatItem }) {
   const visibleCitations = answer.citations.slice(0, visibleResults);
   return (
     <article className="omega-message">
-      <div className="answer-heading"><div className="mini-mark">Ω</div><strong>Omega</strong><span className="verified"><CheckIcon /> Verificada</span><em>{answer.mode === "ai" ? "IA" : "Local"}</em></div>
-      <p>{item.text}</p>
+      <div className="answer-heading"><div className="mini-mark">Ω</div><strong>Omega</strong>{answer.verified && <span className="verified"><CheckIcon /> Verificada</span>}<em>Local</em></div>
+      <div className="answer-body"><MarkdownLite text={item.text} /></div>
       {answer.warning && <div className="answer-warning">{answer.warning}</div>}
       {answer.citations.length > 0 && (
         <div className="citations"><h3>Documentos y evidencia</h3>{visibleCitations.map((source, index) => (
@@ -163,6 +194,52 @@ function Message({ item }: { item: ChatItem }) {
         ))}{visibleResults < answer.citations.length && <button className="quiet-button" onClick={() => setVisibleResults((count) => count + 20)}>Ver más resultados</button>}</div>
       )}
     </article>
+  );
+}
+
+/// Renderizador mínimo para el texto que redacta `answer.rs`: reconoce
+/// negritas, listas (con viñeta y numeradas) y tablas simples separadas por
+/// líneas en blanco. No es un parser de Markdown general — sólo cubre lo que
+/// el backend puede llegar a producir — así el proyecto no suma una
+/// dependencia externa sólo para mostrar listas y tablas cortas.
+function MarkdownLite({ text }: { text: string }) {
+  const blocks = text.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  return <>{blocks.map((block, index) => <MarkdownBlock key={index} block={block} lead={index === 0} />)}</>;
+}
+
+function MarkdownBlock({ block, lead }: { block: string; lead: boolean }) {
+  const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length > 1 && lines.every((line) => line.startsWith("|"))) return <MarkdownTable lines={lines} />;
+  if (lines.length > 0 && lines.every((line) => /^-\s/.test(line))) {
+    return <ul className="answer-list">{lines.map((line, i) => <li key={i}>{inlineMarkdown(line.replace(/^-\s+/, ""))}</li>)}</ul>;
+  }
+  if (lines.length > 0 && lines.every((line) => /^\d+\.\s/.test(line))) {
+    return <ol className="answer-list">{lines.map((line, i) => <li key={i}>{inlineMarkdown(line.replace(/^\d+\.\s+/, ""))}</li>)}</ol>;
+  }
+  const joined = lines.join(" ");
+  if (/^\+\s?\d/.test(joined)) return <p className="answer-note">{inlineMarkdown(joined)}</p>;
+  return <p className={lead ? "answer-lead" : undefined}>{inlineMarkdown(joined)}</p>;
+}
+
+function MarkdownTable({ lines }: { lines: string[] }) {
+  const rows = lines.map((line) => line.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim()));
+  const [header, divider, ...rest] = rows;
+  const body = divider?.every((cell) => /^-+$/.test(cell)) ? rest : rows.slice(1);
+  return (
+    <div className="answer-table-wrap">
+      <table className="answer-table">
+        <thead><tr>{header.map((cell, i) => <th key={i}>{inlineMarkdown(cell)}</th>)}</tr></thead>
+        <tbody>{body.map((row, i) => <tr key={i}>{row.map((cell, j) => <td key={j}>{inlineMarkdown(cell)}</td>)}</tr>)}</tbody>
+      </table>
+    </div>
+  );
+}
+
+function inlineMarkdown(text: string): ReactNode {
+  return text.split(/(\*\*[^*]+\*\*)/g).filter(Boolean).map((part, i) =>
+    part.startsWith("**") && part.endsWith("**")
+      ? <strong key={i}>{part.slice(2, -2)}</strong>
+      : <Fragment key={i}>{part}</Fragment>
   );
 }
 
@@ -218,8 +295,9 @@ function Sources({ sources, onChanged, onError }: { sources: SourceSummary[]; on
         <button disabled={!path.trim() || busy !== null}>{busy === "new" ? "Indexando…" : "Autorizar e indexar"}</button>
       </form>
       {report && <><div className="report-strip"><CheckIcon /><strong>{report.indexed} documentos indexados</strong>{report.modified > 0 && <span>{report.modified} modificados</span>}<span>{report.values.toLocaleString("es-MX")} valores con evidencia</span><span>{report.elapsed_ms} ms</span>{report.ocr_pending > 0 && <span>{report.ocr_pending} pendientes de OCR</span>}</div>{report.warnings.map((warning) => <div key={warning} className="answer-warning">{warning}</div>)}</>}
-      <div className="source-list">
-        {sources.length === 0 && <EmptyCard icon={<FolderIcon />} title="Aún no hay fuentes" text="Autoriza una carpeta local de documentos para comenzar." />}
+      {sources.length === 0 && <EmptyCard icon={<FolderIcon />} title="Aún no hay fuentes" text="Autoriza una carpeta local de documentos para comenzar." />}
+      {sources.length > 0 && <div className="section-label">Autorizadas</div>}
+      {sources.length > 0 && <div className="source-list">
         {sources.map((source) => (
           <article key={source.id} className="source-card">
             <div className="source-icon"><FolderIcon /></div>
@@ -228,33 +306,14 @@ function Sources({ sources, onChanged, onError }: { sources: SourceSummary[]; on
             <button className="danger-button" disabled={busy !== null} onClick={() => void revoke(source)}>Revocar</button>
           </article>
         ))}
-      </div>
+      </div>}
     </section>
   );
 }
 
-function Settings({ status, onChanged, onError }: { status: AppStatus; onChanged: () => Promise<void>; onError: (error: string) => void }) {
-  const [consent, setConsent] = useState(false);
-  const [key, setKey] = useState("");
-  const [busy, setBusy] = useState(false);
+function Settings({ status, onError }: { status: AppStatus; onError: (error: string) => void }) {
   const [concepts, setConcepts] = useState<ConceptSummary[]>([]);
   const [showConcepts, setShowConcepts] = useState(false);
-
-  async function toggleAi(enabled: boolean) {
-    if (enabled && !consent) { onError("Marca primero el consentimiento explícito."); return; }
-    setBusy(true);
-    try { await api.configureAi(enabled, enabled ? consent : false); await onChanged(); }
-    catch (reason) { onError(displayError(reason)); }
-    finally { setBusy(false); }
-  }
-
-  async function saveKey(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    try { await api.storeApiKey(key); setKey(""); await onChanged(); }
-    catch (reason) { onError(displayError(reason)); }
-    finally { setBusy(false); }
-  }
 
   async function loadConcepts() {
     setShowConcepts((current) => !current);
@@ -265,13 +324,11 @@ function Settings({ status, onChanged, onError }: { status: AppStatus; onChanged
 
   return (
     <section className="page content-page settings-page">
-      <PageTitle eyebrow="Control y privacidad" title="Configuración" description="La búsqueda y los cálculos siempre funcionan localmente. La IA es opcional y permanece apagada hasta que tú decidas activarla." />
+      <PageTitle eyebrow="Control y privacidad" title="Configuración" description="La búsqueda, los cálculos y las respuestas verificadas se realizan únicamente en este equipo." />
       <div className="settings-grid">
         <section className="setting-card featured">
-          <div className="setting-title"><div className="setting-icon"><SparkIcon /></div><div><h2>Comprensión con IA</h2><p>Usa GPT-5.6 para interpretar lenguaje natural y elegir herramientas locales.</p></div><Toggle checked={status.ai_enabled} disabled={busy} onChange={toggleAi} /></div>
-          <div className="privacy-note"><ShieldIcon /><p>Los archivos completos nunca se envían. Solo viajan la pregunta y los fragmentos mínimos devueltos por las herramientas que el modelo solicite.</p></div>
-          {!status.ai_enabled && <label className="consent"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /><span>Entiendo que, al activar esta función, mi pregunta y evidencia mínima se enviarán a OpenAI.</span></label>}
-          <form className="key-form" onSubmit={saveKey}><input aria-label="Clave de API de OpenAI" type="password" value={key} onChange={(event) => setKey(event.target.value)} placeholder={status.api_key_stored ? "Clave guardada de forma segura" : "sk-…"} /><button disabled={!key || busy}>Guardar en Keychain</button>{status.api_key_stored && <button type="button" className="text-button" onClick={() => void api.clearApiKey().then(onChanged).catch((reason) => onError(displayError(reason)))}>Eliminar</button>}</form>
+          <div className="setting-title"><div className="setting-icon"><ShieldIcon /></div><div><h2>Motor local</h2><p>Omega analiza únicamente las carpetas que autorizas y responde con evidencia citable.</p></div></div>
+          <div className="privacy-note"><ShieldIcon /><p>No usa modelos remotos, API, claves ni conexión de red. Tus archivos y preguntas permanecen en este equipo.</p></div>
         </section>
         <section className="setting-card">
           <div className="setting-title"><div className="setting-icon muted"><DatabaseIcon /></div><div><h2>Catálogo descubierto</h2><p>{status.concepts.toLocaleString("es-MX")} conceptos · {status.values.toLocaleString("es-MX")} valores clasificados</p></div><button className="quiet-button" onClick={() => void loadConcepts()}>{showConcepts ? "Ocultar" : "Ver conceptos"}</button></div>
@@ -280,10 +337,6 @@ function Settings({ status, onChanged, onError }: { status: AppStatus; onChanged
       </div>
     </section>
   );
-}
-
-function Toggle({ checked, disabled, onChange }: { checked: boolean; disabled: boolean; onChange: (checked: boolean) => void }) {
-  return <button aria-label="Activar IA" aria-pressed={checked} disabled={disabled} className={`toggle ${checked ? "on" : ""}`} onClick={() => onChange(!checked)}><span /></button>;
 }
 
 function PageTitle({ eyebrow, title, description }: { eyebrow: string; title: string; description: string }) {
@@ -312,7 +365,10 @@ function ChatIcon() { return icon(<><path d="M5 5.5h14v10H9l-4 3v-13Z" /><path d
 function FolderIcon() { return icon(<path d="M3.5 6.5h6l2 2h9v9h-17v-11Z" />); }
 function SettingsIcon() { return icon(<><circle cx="12" cy="12" r="3" /><path d="M12 3.5v2M12 18.5v2M20.5 12h-2M5.5 12h-2M18 6l-1.5 1.5M7.5 16.5 6 18M18 18l-1.5-1.5M7.5 7.5 6 6" /></>); }
 function ShieldIcon() { return icon(<><path d="M12 3 5 6v5c0 4.5 2.5 7.5 7 10 4.5-2.5 7-5.5 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></>); }
-function SparkIcon() { return icon(<><path d="m12 3 1.5 5.5L19 10l-5.5 1.5L12 17l-1.5-5.5L5 10l5.5-1.5L12 3Z" /><path d="m18.5 16 .7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3Z" /></>); }
+function PlusIcon() { return icon(<path d="M12 5v14M5 12h14" />); }
+function SearchIcon() { return icon(<><circle cx="11" cy="11" r="6.5" /><path d="m20 20-3.6-3.6" /><path d="M8.5 11h5M11 8.5v5" /></>); }
+function SidebarIcon() { return icon(<><rect x="3" y="5" width="18" height="14" rx="2.5" /><path d="M9.5 5v14" /></>); }
+function DocumentIcon() { return icon(<><path d="M14 3.5H7.5A1.5 1.5 0 0 0 6 5v14a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 18 19V7.5L14 3.5Z" /><path d="M13.5 3.5V8H18" /></>); }
 function ArrowIcon() { return icon(<><path d="M5 12h14M14 7l5 5-5 5" /></>); }
 function CheckIcon() { return icon(<path d="m5 12 4 4L19 6" />); }
 function ExternalIcon() { return icon(<><path d="M13 5h6v6M19 5l-8 8" /><path d="M17 13v5H6V7h5" /></>); }

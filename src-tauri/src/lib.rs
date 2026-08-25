@@ -1,14 +1,18 @@
 mod agent;
+mod answer;
 mod app;
 mod db;
 mod error;
+pub mod evaluation;
 mod extract;
 mod indexer;
 mod model;
 mod normalize;
 mod ocr;
 mod parser;
+mod planner;
 mod tools;
+mod verifier;
 
 pub use app::OmegaEngine;
 pub use db::Database;
@@ -16,6 +20,7 @@ pub use error::{OmegaError, Result};
 pub use model::*;
 pub use parser::OcrProvider;
 pub use tools::ToolEngine;
+pub use verifier::{value_is_supported, verify_model_answer};
 
 use std::{fs, path::PathBuf};
 use tauri::{Manager, State};
@@ -64,21 +69,6 @@ fn ask(engine: State<'_, OmegaEngine>, question: String) -> Result<Answer> {
 }
 
 #[tauri::command]
-fn configure_ai(engine: State<'_, OmegaEngine>, enabled: bool, consent: bool) -> Result<()> {
-    engine.configure_ai(enabled, consent)
-}
-
-#[tauri::command]
-fn store_api_key(engine: State<'_, OmegaEngine>, api_key: String) -> Result<()> {
-    engine.store_api_key(&api_key)
-}
-
-#[tauri::command]
-fn clear_api_key(engine: State<'_, OmegaEngine>) -> Result<()> {
-    engine.clear_api_key()
-}
-
-#[tauri::command]
 fn open_document(engine: State<'_, OmegaEngine>, path: String) -> Result<()> {
     engine.open_document(std::path::Path::new(&path))
 }
@@ -104,9 +94,6 @@ pub fn run() {
             list_concepts,
             search_documents,
             ask,
-            configure_ai,
-            store_api_key,
-            clear_api_key,
             open_document,
         ])
         .run(tauri::generate_context!())

@@ -115,29 +115,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn set_ai_enabled(&self, enabled: bool) -> Result<()> {
-        let connection = self.connect()?;
-        connection.execute(
-            "INSERT INTO settings(key, value) VALUES ('ai_enabled', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [if enabled { "true" } else { "false" }],
-        )?;
-        Ok(())
-    }
-
-    pub fn ai_enabled(&self) -> Result<bool> {
-        let connection = self.connect()?;
-        let value: Option<String> = connection
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'ai_enabled'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(value.as_deref() == Some("true"))
-    }
-
-    pub fn status(&self, api_key_stored: bool) -> Result<AppStatus> {
+    pub fn status(&self) -> Result<AppStatus> {
         let connection = self.connect()?;
         let count = |table: &str| -> Result<i64> {
             let sql = format!("SELECT COUNT(*) FROM {table}");
@@ -152,8 +130,6 @@ impl Database {
             documents: count("documents")?,
             concepts: count("concepts")?,
             values: count("extracted_values")?,
-            ai_enabled: self.ai_enabled()?,
-            api_key_stored,
         })
     }
 
@@ -275,11 +251,6 @@ fn migrate(connection: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(normalized_name);
         CREATE INDEX IF NOT EXISTS idx_entities_document ON entities(document_id);
 
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        INSERT OR IGNORE INTO settings(key, value) VALUES ('ai_enabled', 'false');
         "#,
     )?;
     // SQLite no admite ADD COLUMN IF NOT EXISTS. Este esquema se distribuyó
@@ -327,16 +298,4 @@ fn migrate(connection: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ai_starts_disabled() {
-        let temporary = tempfile::NamedTempFile::new().unwrap();
-        let database = Database::open(temporary.path()).unwrap();
-        assert!(!database.ai_enabled().unwrap());
-    }
 }
