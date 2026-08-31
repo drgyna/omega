@@ -107,11 +107,22 @@ fn retrieves_precise_short_evidence_across_local_text_formats() {
         filename[0].evidence.field.as_deref(),
         Some("nombre de archivo")
     );
+    // La BÚSQUEDA sigue devolviendo la coincidencia por nombre de archivo
+    // (arriba): encontrar un archivo por su nombre es útil y es verdad. Lo que
+    // cambió en la ronda 4 es la RESPUESTA: repetir el nombre que la propia
+    // pregunta escribió no es haber extraído información del documento, así
+    // que no puede sostener una respuesta con citas ni darse por verificada.
     let filename_answer = engine.ask("notes.txt").unwrap();
-    assert_eq!(filename_answer.citations.len(), 1);
-    assert_eq!(
-        filename_answer.citations[0].field.as_deref(),
-        Some("nombre de archivo")
+    assert!(
+        filename_answer.citations.is_empty(),
+        "una coincidencia de sólo-nombre no es evidencia de contenido: {:?}",
+        filename_answer.citations
+    );
+    assert!(!filename_answer.verified);
+    assert!(
+        filename_answer.text.contains("nombre de archivo"),
+        "el texto nombra qué coincidió, sin suponerlo: {}",
+        filename_answer.text
     );
 
     let folder = tools.search("group-alpha", &[], 20).unwrap();
@@ -227,7 +238,13 @@ fn reindexing_replaces_changed_files_and_reports_unreadable_ones() {
     let text = root.join("mutable.txt");
     fs::write(&text, "Reference: RECORD-1\n").unwrap();
     fs::write(root.join("legacy.doc"), b"not a supported local document").unwrap();
-    fs::write(root.join("broken.xlsx"), b"not a workbook").unwrap();
+    // Contenido binario que no es un ZIP y tampoco es texto legible: un libro
+    // de cálculo genuinamente corrupto, que sigue siendo ilegible y sigue
+    // reportándose como tal. (Un archivo con nombre `.xlsx` cuyo contenido SÍ
+    // es texto llano ya no cae aquí: desde la ronda 4 se detecta el disfraz,
+    // se lee su contenido real y se declara la discrepancia — lo cubre
+    // `disguised_extension_regressions.rs`.)
+    fs::write(root.join("broken.xlsx"), b"\xff\xfe\x00not a workbook\x00\xfe").unwrap();
 
     let database = tempfile::NamedTempFile::new().unwrap();
     let engine = OmegaEngine::open(database.path()).unwrap();

@@ -4,10 +4,13 @@
 //! corpus concreto.
 
 use crate::{
+    census,
     error::Result,
     model::{AggregateRequest, ConceptSummary, ToolFilter},
-    normalize::{canonical_key, normalize_exact, normalize_spanish, search_terms, stems_match},
-    tools::ToolEngine,
+    normalize::{
+        canonical_key, normalize_exact, normalize_spanish, search_terms, stems_match,
+    },
+    tools::{FormatRequest, ToolEngine, ValueQuery},
 };
 
 #[derive(Clone, Debug)]
@@ -16,6 +19,9 @@ pub enum QueryIntent {
     Exact,
     Aggregate(AggregateRequest),
     CountDocuments,
+    /// Conteo real de documentos por formato de archivo, con la declaración de
+    /// cuántos archivos del alcance no se pudieron indexar.
+    CountByFormat(FormatRequest),
     ListDocuments,
     FreeText,
     BoundedSearch,
@@ -51,6 +57,24 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             filters: vec![],
             origin: None,
         });
+    }
+    // Conteo por formato de archivo. Va **antes** del corte por señal exacta
+    // porque estas preguntas entrecomillan el área («¿Cuántos documentos del
+    // área "…" están en formato DOCX?») y ese corte las mandaba a la ruta de
+    // búsqueda literal con tope de muestra: la respuesta decía «20 valores»,
+    // que era el tope, no un conteo. El desvío es deliberadamente estrecho —
+    // sólo una pregunta que pide un conteo Y nombra un formato existente en el
+    // índice— así que ninguna otra pregunta entrecomillada cambia de ruta.
+    if asks_count {
+        if let Some(request) = format_request(question, &tools.available_extensions()?) {
+            let origin = tools.match_origin(question)?;
+            let filters = tools.resolved_filters(question, origin.as_deref(), true)?;
+            return Ok(QueryPlan {
+                intent: QueryIntent::CountByFormat(request),
+                filters,
+                origin,
+            });
+        }
     }
     if ToolEngine::query_has_exact_signal(question) {
         return Ok(QueryPlan {
@@ -223,6 +247,599 @@ fn resolve_group_concept(
     )
 }
 
+/// La pregunta sin sus identificadores.
+///
+/// Un identificador de negocio mezcla letras y dígitos en la misma palabra
+/// (`OC-2024-00001`, `EMP-2019-0506`); un nombre de campo no. Quitarlos deja
+/// sólo las palabras con las que el usuario pudo nombrar un campo.
+fn question_without_identifiers(question: &str) -> String {
+    question
+        .split_whitespace()
+        .filter(|word| {
+            !(word.chars().any(char::is_alphabetic) && word.chars().any(char::is_numeric))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// ¿Pregunta si dos valores coinciden?
+///
+/// Palabras completas, como el resto de las listas de este módulo: «coincide»
+/// es la pregunta, «coincidencia» dentro de otra frase no tiene por qué serlo.
+fn asks_whether_values_coincide(question: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "coinciden",
+        "coincide",
+        "iguales",
+        "igual",
+        "difieren",
+        "coinciden",
+        "concuerdan",
+        "concuerda",
+    ];
+    let words = normalize_exact(question)
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    WORDS.iter().any(|word| words.iter().any(|item| item == word))
+}
+
+/// Comparación de un campo nombrado entre dos documentos señalados por su
+/// clave de localización.
+///
+/// Las tres condiciones son verificables y ninguna se infiere: la pregunta
+/// pregunta si algo coincide, señala exactamente **dos** documentos, y
+/// entrecomilla un nombre de campo que el acervo tiene. Con un documento o con
+/// tres no actúa; sin el campo entrecomillado tampoco, porque entonces no hay
+/// nada concreto que comparar y elegir un campo sería adivinar.
+fn field_comparison_between_documents(
+    tools: &ToolEngine,
+    question: &str,
+) -> Result<Option<(String, Vec<i64>, Vec<String>)>> {
+    if !asks_whether_values_coincide(question) {
+        return Ok(None);
+    }
+    let located = tools.locate_documents_by_key(question)?;
+    if located.len() != 2 {
+        return Ok(None);
+    }
+    let concepts = tools.list_concepts(None)?;
+    let quoted = ToolEngine::quoted_literals(question);
+    let Some(field) = quoted.iter().find_map(|literal| {
+        concepts
+            .iter()
+            .find(|concept| canonical_key(&concept.display_name) == canonical_key(literal))
+            .map(|concept| concept.display_name.clone())
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        field,
+        located.iter().map(|document| document.id).collect(),
+        located
+            .iter()
+            .map(|document| document.path.clone())
+            .collect(),
+    )))
+}
+
+/// Cómo nombra la pregunta uno de los dos operandos de una operación entre
+/// campos.
+///
+/// `Field` es el caso normal: el usuario escribió el nombre del campo.
+/// `Category` es el caso que faltaba: «el importe» no es el nombre de ningún
+/// campo del acervo —los campos se llaman «Importe del pedido», «Costo
+/// estimado de no conformidad», «Importe facturado»— sino la palabra genérica
+/// con la que se habla de una cantidad de dinero. Sobre un conjunto eso sería
+/// ambiguo; sobre un documento que registra **un solo** valor monetario, cuál
+/// es «el importe» lo decide el documento y no el motor. Es el mismo criterio
+/// que ya usa `ComputeCategory`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowOperandSpec {
+    Field(String),
+    Category(&'static str),
+}
+
+/// Palabras con las que el español nombra una cantidad de dinero sin nombrar
+/// ningún campo concreto. Como el resto de las listas de este módulo
+/// (`CONTAINER_WORDS`, `CALENDAR_WORDS`), son vocabulario del idioma, no de un
+/// acervo: ninguna es el nombre de un campo de un corpus concreto.
+const GENERIC_MONEY_WORDS: &[&str] = &["importe", "importes", "monto", "montos"];
+
+/// Ídem para una cuenta de unidades.
+const GENERIC_QUANTITY_WORDS: &[&str] = &["cantidad", "cantidades", "unidades"];
+
+/// Los dos operandos tal y como la pregunta los escribe, a los lados del
+/// conector de la operación («dividir X entre Y»).
+fn row_operand_phrases(question: &str, operation: RowOperation) -> Option<(String, String)> {
+    let words = question.split_whitespace().collect::<Vec<_>>();
+    let normalized = words
+        .iter()
+        .map(|word| normalize_exact(word))
+        .collect::<Vec<_>>();
+    let verb_at = normalized.iter().position(|word| match operation {
+        RowOperation::Divide => word.starts_with("dividi") || word.starts_with("division"),
+        RowOperation::Multiply => word.starts_with("multiplic"),
+        RowOperation::Subtract => word.starts_with("rest") || word.starts_with("diferenci"),
+    })?;
+    let connectors: &[&str] = match operation {
+        RowOperation::Divide => &["entre"],
+        RowOperation::Multiply => &["por"],
+        RowOperation::Subtract => &["menos", "y"],
+    };
+    let split_at = normalized
+        .iter()
+        .enumerate()
+        .skip(verb_at + 1)
+        .find(|(_, word)| connectors.contains(&word.as_str()))
+        .map(|(index, _)| index)?;
+    let clean = |slice: &[&str]| {
+        slice
+            .join(" ")
+            .trim_matches(['?', '¿', '.', ',', ';', ':', ' '])
+            .to_owned()
+    };
+    let left = clean(&words[verb_at + 1..split_at]);
+    let right = clean(&words[split_at + 1..]);
+    (!left.is_empty() && !right.is_empty()).then_some((left, right))
+}
+
+/// Qué designa un operando: un campo del acervo, o una categoría de valor
+/// nombrada de forma genérica. El campo manda: si el usuario escribió el
+/// nombre de un campo real, es ése y no una lectura genérica de la palabra.
+fn row_operand_spec(
+    concepts: &[ConceptSummary],
+    phrase: &str,
+) -> Option<RowOperandSpec> {
+    let terms = search_terms(phrase);
+    if terms.is_empty() {
+        return None;
+    }
+    if let Some(concept) = resolve_named_concept(concepts, &terms, None) {
+        return Some(RowOperandSpec::Field(concept.display_name));
+    }
+    let mentions = |list: &[&str]| {
+        list.iter().any(|word| {
+            let root = search_terms(word);
+            root.first()
+                .is_some_and(|root| terms.iter().any(|term| stems_match(term, root)))
+        })
+    };
+    if mentions(GENERIC_MONEY_WORDS) {
+        return Some(RowOperandSpec::Category("money"));
+    }
+    if mentions(GENERIC_QUANTITY_WORDS) {
+        return Some(RowOperandSpec::Category("number"));
+    }
+    None
+}
+
+/// Operación entre dos campos de un documento concreto.
+///
+/// Tres condiciones, todas comprobables y ninguna heurística: la pregunta trae
+/// el verbo de la operación, señala **un** documento por su clave de
+/// localización, y nombra los dos operandos a los lados del conector. Con
+/// varios documentos localizados no actúa: el resultado por documento no se
+/// puede presentar como uno solo.
+fn document_row_operation(
+    tools: &ToolEngine,
+    question: &str,
+    marks: &Signals,
+) -> Result<Option<(RowOperation, RowOperandSpec, RowOperandSpec, i64, String)>> {
+    let operation = if marks.divide {
+        RowOperation::Divide
+    } else if marks.multiply {
+        RowOperation::Multiply
+    } else {
+        return Ok(None);
+    };
+    let Some((left, right)) = row_operand_phrases(question, operation) else {
+        return Ok(None);
+    };
+    let located = tools.locate_documents_by_key(question)?;
+    let [document] = located.as_slice() else {
+        return Ok(None);
+    };
+    let concepts = tools.list_concepts(None)?;
+    let (Some(left), Some(right)) = (
+        row_operand_spec(&concepts, &left),
+        row_operand_spec(&concepts, &right),
+    ) else {
+        return Ok(None);
+    };
+    if left == right {
+        return Ok(None);
+    }
+    Ok(Some((
+        operation,
+        left,
+        right,
+        document.id,
+        document.path.clone(),
+    )))
+}
+
+/// Petición de censo del acervo: cuántos ARCHIVOS hay, no cuántos valores se
+/// extrajeron. Ver `census` para por qué la distinción decide si la cifra
+/// puede ser completa.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CensusRequest {
+    pub filter: census::CensusFilter,
+    /// Valor de campo con el que la pregunta nombró la carpeta, junto con
+    /// cuántos documentos indexados lo registran. La respuesta necesita los
+    /// dos números por separado: los archivos que hay en la carpeta y los
+    /// documentos que escriben ese valor no son la misma cifra, y presentarlos
+    /// como si lo fueran sería afirmar algo que el índice no dice.
+    pub origin_from_value: Option<(String, i64)>,
+    /// Reparte el conteo por tipo de documento en vez de dar un solo total.
+    pub group_by_kind: bool,
+    /// La pregunta escribió un filtro que nadie en el motor sabe aplicar: ni el
+    /// censo, ni un campo del acervo, ni ninguna otra ruta. Cuando está, no se
+    /// cuenta nada; se dice.
+    pub unknown_filter: Option<String>,
+}
+
+/// Claves de filtro escritas «clave=valor» que el censo sabe leer.
+///
+/// Devuelve `None` en cuanto la pregunta usa una clave que no está en esta
+/// lista. Es deliberado: la alternativa —quedarse con las que se entienden y
+/// seguir— es exactamente el defecto que esta ronda encontró, una respuesta
+/// que decía «cumplen simultáneamente los criterios» después de haber tirado
+/// en silencio el filtro que no supo leer.
+fn census_filter_pairs(question: &str) -> Option<Vec<(String, String)>> {
+    let pattern = regex::Regex::new(r"(?u)([A-Za-z_áéíóúñ]+)\s*=\s*([^,;?.]+)")
+        .expect("valid filter regex");
+    let mut pairs = Vec::new();
+    for capture in pattern.captures_iter(question) {
+        let key = normalize_exact(&capture[1]);
+        let value = capture[2].trim().trim_matches(['"', '«', '»', '\'']).to_owned();
+        if key.is_empty() || value.is_empty() {
+            return None;
+        }
+        pairs.push((key, value));
+    }
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// Lo que la pregunta escribe después de «área» o «carpeta»: el texto con el
+/// que nombró el ámbito.
+///
+/// Se recorre la pregunta palabra por palabra sobre la cadena original —no
+/// sobre una versión normalizada— porque normalizar cambia la longitud en
+/// bytes (una vocal acentuada ocupa dos y su equivalente sin acento uno), así
+/// que un desplazamiento calculado sobre el texto normalizado no señala el
+/// mismo punto del original.
+///
+/// El nombre termina donde empieza algo que ya no forma parte de él: el signo
+/// de interrogación o los dos puntos que cierran la frase, o una de las colas
+/// («en todo el corpus», «existen») con las que estas preguntas rematan.
+fn area_phrase(question: &str) -> Option<String> {
+    const MARKERS: [&str; 4] = ["area", "areas", "carpeta", "categoria"];
+    const TAILS: [&str; 5] = ["en todo", "en el corpus", "del corpus", "existen", "hay"];
+    let words = question
+        .split_whitespace()
+        .map(|word| (word, normalize_exact(word)))
+        .collect::<Vec<_>>();
+    let start = words
+        .iter()
+        .position(|(_, normalized)| MARKERS.contains(&normalized.as_str()))?
+        + 1;
+    let mut collected: Vec<&str> = Vec::new();
+    for (index, (word, normalized)) in words.iter().enumerate().skip(start) {
+        // Artículos de enlace, sólo si van pegados al marcador: «del área DE
+        // Recursos humanos». Más adentro ya son parte del nombre («Recursos
+        // humanos Y capacitación»).
+        if collected.is_empty() && matches!(normalized.as_str(), "de" | "del" | "la" | "el") {
+            continue;
+        }
+        // Una cola arranca aquí: se corta antes de tomar la palabra.
+        let rest = words[index..]
+            .iter()
+            .map(|(_, normalized)| normalized.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if TAILS.iter().any(|tail| rest.starts_with(tail)) {
+            break;
+        }
+        let trimmed = word.trim_end_matches(['?', ':', '.', '»', '"']);
+        let cut = trimmed.len() < word.len();
+        let trimmed = trimmed.trim_matches(['"', '«', '»', '\'']);
+        if !trimmed.is_empty() {
+            collected.push(trimmed);
+        }
+        if cut {
+            break;
+        }
+    }
+    let phrase = collected.join(" ");
+    let phrase = phrase.trim_end_matches(',').trim();
+    (!phrase.is_empty()).then(|| phrase.to_owned())
+}
+
+/// Tipo de documento que la pregunta nombra («documentos de tipo "factura"»).
+fn asked_kind(question: &str) -> Option<String> {
+    let pattern = regex::Regex::new(r#"(?ui)\btipo\s+"([^"]+)"|\btipo\s+«([^»]+)»"#)
+        .expect("valid kind regex");
+    let capture = pattern.captures(question)?;
+    let value = capture
+        .get(1)
+        .or_else(|| capture.get(2))?
+        .as_str()
+        .trim()
+        .to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Carpeta a la que se refiere la pregunta cuando cuenta archivos.
+///
+/// Primero el nombre de la carpeta tal cual (`match_origin`, que ya sabe
+/// reconocerlo escrito de varias formas). Si eso no da nada, se prueba con el
+/// valor de campo que la pregunta escribe después de «área» — pero sólo si el
+/// índice demuestra que ese valor identifica una sola carpeta. La
+/// correspondencia no se supone: se comprueba.
+fn census_origin(tools: &ToolEngine, question: &str) -> Result<Option<(String, Option<(String, i64)>)>> {
+    if let Some(origin) = tools.match_origin(question)? {
+        return Ok(Some((origin, None)));
+    }
+    let Some(phrase) = area_phrase(question) else {
+        return Ok(None);
+    };
+    if normalize_exact(&phrase).split_whitespace().count() < 2 {
+        return Ok(None);
+    }
+    let Some((origin, documents)) = tools.origin_identified_by_value(&phrase)? else {
+        return Ok(None);
+    };
+    Ok(Some((origin.clone(), Some((phrase, documents)))))
+}
+
+/// ¿Es esta pregunta un censo del acervo?
+///
+/// Tres formas, todas exigiendo que la pregunta cuente DOCUMENTOS (no valores
+/// de un campo):
+///
+///  1. Sintaxis explícita de filtro (`area=rh, kind=vacaciones`), y sólo si
+///     TODAS las claves se entienden.
+///  2. Un tipo de documento nombrado entre comillas, con o sin carpeta.
+///  3. Un total: la carpeta o el acervo entero, sin ningún campo de por medio.
+///
+/// La forma 3 exige que la pregunta no nombre ningún campo del acervo: en
+/// cuanto lo hace («¿cuántos documentos registran Moneda = EUR?») deja de ser
+/// un conteo de archivos y vuelve a la ruta de contenido, donde la cifra sólo
+/// puede hablar de lo que se logró leer.
+fn census_request(
+    tools: &ToolEngine,
+    question: &str,
+    marks: &Signals,
+) -> Result<Option<CensusRequest>> {
+    if !marks.count || !marks.container {
+        return Ok(None);
+    }
+    // Cualquier otra operación en la misma pregunta la saca de aquí: el censo
+    // sólo sabe contar archivos, y una pregunta que además suma, compara,
+    // ordena o busca contradicciones no es un censo aunque diga «cuántos».
+    if marks.sum
+        || marks.average
+        || marks.superlative
+        || marks.difference
+        || marks.percent
+        || marks.compare
+        || marks.contradictions
+        || marks.differing
+        || marks.multiply
+        || marks.divide
+        || marks.related
+        || marks.evidence
+    {
+        return Ok(None);
+    }
+    // Un conteo por formato ya tiene su propia ruta, que además declara los no
+    // indexados. El censo no se la quita.
+    if format_request(question, &tools.available_extensions()?).is_some() {
+        return Ok(None);
+    }
+    // Las señales de intención se leen FUERA de las comillas. Un texto
+    // entrecomillado es lo que la pregunta busca, no cómo lo pide: sin esta
+    // separación, «¿Cuántos documentos mencionan "AUSENCIA TOTAL …"?» pasaba
+    // por un censo del acervo entero porque la palabra «TOTAL» iba dentro de
+    // la cita, y una pregunta cuya respuesta correcta era «ninguno» se
+    // contestaba con el tamaño del acervo.
+    let intent = ToolEngine::query_without_quoted_literals(question);
+    // El inventario del acervo («¿cuántos documentos hay indexados y qué
+    // categorías contiene el acervo?») contesta más que un número: el total y
+    // el reparto por carpeta, y ya dice «indexados» sin fingir que son todos.
+    // El censo, que sólo sabe dar la cifra, le cedería una respuesta mejor por
+    // una peor.
+    let terms = search_terms(&intent);
+    let has = |root: &str| terms.iter().any(|term| term.starts_with(root));
+    let mentions_the_index = has("indic") || has("index") || has("acerv") || has("coleccion");
+    let mentions_documents =
+        has("document") || has("archiv") || has("expedient") || has("registro");
+    if mentions_the_index && mentions_documents {
+        return Ok(None);
+    }
+    let normalized = normalize_exact(&intent);
+    let group_by_kind = normalized.contains("de cada tipo") || normalized.contains("por tipo");
+
+    if let Some(pairs) = census_filter_pairs(question) {
+        let mut filter = census::CensusFilter::default();
+        let mut origin_from_value = None;
+        let concepts = tools.list_concepts(None)?;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "area" | "carpeta" | "folder" | "origen" | "fuente" => {
+                    let named = tools.match_origin(&value)?;
+                    match named {
+                        Some(origin) => filter.origin = Some(origin),
+                        None => match tools.origin_identified_by_value(&value)? {
+                            Some((origin, documents)) => {
+                                filter.origin = Some(origin);
+                                origin_from_value = Some((value, documents));
+                            }
+                            None => return Ok(None),
+                        },
+                    }
+                }
+                "tipo" | "kind" | "clase" => filter.kind = Some(value),
+                // Claves que otra ruta del motor sí sabe resolver: el censo se
+                // aparta y las deja pasar, tal cual se comportaba antes.
+                "doc_id" | "id" | "documento" | "archivo" | "ruta" | "path" => return Ok(None),
+                other => {
+                    // ¿La clave nombra un campo del acervo? Entonces es un
+                    // filtro de contenido y lo resuelve la ruta de siempre.
+                    if resolve_named_concept(&concepts, &search_terms(other), None).is_some() {
+                        return Ok(None);
+                    }
+                    // Nadie puede aplicarla. Antes se caía en silencio y la
+                    // respuesta seguía diciendo «cumplen simultáneamente los
+                    // criterios», en plural, sobre los filtros que sí se
+                    // entendieron: una cifra correcta presentada como respuesta
+                    // a una pregunta que no era la que se hizo.
+                    return Ok(Some(CensusRequest {
+                        filter: census::CensusFilter::default(),
+                        origin_from_value: None,
+                        group_by_kind: false,
+                        unknown_filter: Some(other.to_owned()),
+                    }));
+                }
+            }
+        }
+        return Ok(Some(CensusRequest {
+            filter,
+            origin_from_value,
+            group_by_kind,
+            unknown_filter: None,
+        }));
+    }
+
+    let origin = census_origin(tools, question)?;
+    // Si la pregunta nombra un ámbito y el motor no consigue resolverlo a una
+    // carpeta, el censo se retira. Contar sin ese recorte daría una cifra del
+    // acervo entero presentada como si fuera la del área que se preguntó: el
+    // mismo defecto que esta ronda corrigió para «kind=», cometido aquí.
+    let names_a_scope = ["area", "areas", "carpeta", "categoria"]
+        .iter()
+        .any(|marker| normalized.split_whitespace().any(|word| word == *marker));
+    if names_a_scope && origin.is_none() {
+        return Ok(None);
+    }
+    // Toda cita entrecomillada tiene que quedar explicada por el propio censo:
+    // el tipo que se cuenta, o el nombre del ámbito. Una cita que el censo no
+    // consume es un texto que buscar dentro de los documentos, y esa pregunta
+    // no es un recuento de archivos.
+    let kind = asked_kind(question);
+    for literal in ToolEngine::quoted_literals(question) {
+        let is_the_kind = kind
+            .as_deref()
+            .is_some_and(|kind| normalize_exact(kind) == normalize_exact(&literal));
+        let names_the_scope = match &origin {
+            Some((origin, from_value)) => {
+                tools.match_origin(&literal)?.as_deref() == Some(origin.as_str())
+                    || from_value.as_ref().is_some_and(|(value, _)| {
+                        normalize_exact(value) == normalize_exact(&literal)
+                    })
+            }
+            None => false,
+        };
+        if !is_the_kind && !names_the_scope {
+            return Ok(None);
+        }
+    }
+    if let Some(kind) = kind {
+        let (origin, origin_from_value) = match origin {
+            Some((origin, from_value)) => (Some(origin), from_value),
+            None => (None, None),
+        };
+        return Ok(Some(CensusRequest {
+            filter: census::CensusFilter {
+                origin,
+                kind: Some(kind),
+            },
+            origin_from_value,
+            group_by_kind,
+            unknown_filter: None,
+        }));
+    }
+
+    // Forma 3. Sin ningún filtro de contenido en pie, «cuántos documentos hay
+    // en total» es una pregunta por el acervo como conjunto de archivos.
+    //
+    // «En pie» hace todo el trabajo: la pregunta «¿cuántos documentos totales
+    // pertenecen al área X?» SÍ produce un filtro —el campo «Área» con ese
+    // valor— y aun así es un censo, porque ese valor es la forma en que la
+    // pregunta nombró la carpeta, no un recorte adicional dentro de ella.
+    // Cualquier filtro que no se explique así deja la pregunta donde estaba:
+    // un conteo de contenido no puede hablar de lo que no se logró leer.
+    let named_origin = origin.as_ref().map(|(origin, _)| origin.clone());
+    for filter in tools.resolved_filters(question, named_origin.as_deref(), false)? {
+        let names_the_same_folder = match named_origin.as_deref() {
+            Some(origin) => tools.value_lives_only_in_origin(origin, &filter.equals)?,
+            None => false,
+        };
+        if !names_the_same_folder {
+            return Ok(None);
+        }
+    }
+    // La palabra que convierte «cuántos documentos hay aquí» en «cuántos
+    // documentos hay en total» es lo que distingue esta ruta del conteo que ya
+    // existía. Sin ella se deja pasar: el conteo clásico sigue respondiendo lo
+    // que respondía, y esta ruta no le roba ninguna pregunta ya verificada.
+    let whole_archive = ["corpus", "acervo", "total", "totales", "todo", "todos"]
+        .iter()
+        .any(|word| normalized.split_whitespace().any(|term| term == *word));
+    if !whole_archive && !group_by_kind {
+        return Ok(None);
+    }
+    Ok(Some(CensusRequest {
+        filter: census::CensusFilter {
+            origin: origin.as_ref().map(|(origin, _)| origin.clone()),
+            kind: None,
+        },
+        origin_from_value: origin.and_then(|(_, from_value)| from_value),
+        group_by_kind,
+        unknown_filter: None,
+    }))
+}
+
+/// Formato de archivo nombrado en la pregunta.
+///
+/// Se exige que la pregunta hable de formato o extensión **y** que nombre una
+/// extensión que el índice realmente tiene: sin la primera condición, un
+/// nombre de archivo suelto («informe.pdf») se leería como una petición de
+/// conteo por formato; sin la segunda, se inventaría un formato que el acervo
+/// no contiene. La lista de extensiones no está escrita aquí: sale del índice.
+///
+/// «PDF_SCAN», «PDF escaneado» y «PDF por OCR» son la misma petición: la
+/// extensión más una marca de que se leyó por reconocimiento óptico. Esa marca
+/// no depende del nombre interno del parser, sino de si el documento necesitó
+/// OCR, que es el hecho que la distingue.
+fn format_request(question: &str, extensions: &BTreeSet<String>) -> Option<FormatRequest> {
+    let terms = normalize_exact(question)
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let names_a_format = terms
+        .iter()
+        .any(|term| term.starts_with("format") || term.starts_with("extensi"));
+    if !names_a_format {
+        return None;
+    }
+    let extension = terms.iter().find(|term| extensions.contains(*term))?.clone();
+    let scanned_only = terms
+        .iter()
+        .any(|term| term.starts_with("escane") || term == "scan" || term == "ocr");
+    let label = if scanned_only {
+        format!("{}_SCAN", extension.to_uppercase())
+    } else {
+        extension.to_uppercase()
+    };
+    Some(FormatRequest {
+        label,
+        extension,
+        scanned_only,
+    })
+}
+
 fn explicit_currency(
     question: &str,
     available: &std::collections::BTreeSet<String>,
@@ -260,7 +877,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     calc::{Operation, RowOperation},
     conversation::{
-        ConversationState, DocumentSet, PendingChoice, PendingKind, Reference, reference_in,
+        ConversationState, DocumentSet, OrdinalPosition, PendingChoice, PendingKind, Reference,
+        ordinal_position_in, reference_in,
     },
     dates::{self, Clock, DateRange},
     model::{Clarification, DateConstraint},
@@ -278,10 +896,11 @@ pub enum Command {
         operation: Operation,
         descending: bool,
     },
-    /// Dos valores del mismo campo, calculados por separado y comparados.
+    /// Dos grupos calculados por separado y comparados. La dimensión dice
+    /// qué los separa: dos valores del mismo campo, o dos carpetas.
     CompareGroups {
         operation: Operation,
-        concept: String,
+        dimension: ComparisonDimension,
         left: String,
         right: String,
     },
@@ -292,6 +911,11 @@ pub enum Command {
     },
     /// Documentos que respaldan el último cálculo de la conversación.
     EvidenceForLast,
+    /// Un documento concreto que la conversación ya tiene delante: el que
+    /// ocupa una posición del conjunto anterior («¿cuál es el Responsable del
+    /// primero?») o aquel del que habló la respuesta anterior («¿y cuál es la
+    /// Moneda de ese documento?»).
+    DocumentInContext(DocumentSelection),
     /// Petición de relación sobre un texto que no produce clave estable.
     RelationWithoutKey,
     /// Contradicciones entre documentos vinculados. Cuando la pregunta nombra
@@ -300,6 +924,10 @@ pub enum Command {
     Contradictions {
         key: Option<String>,
         compared: Option<String>,
+        /// Identificador concreto que la pregunta nombra («…del folio
+        /// OC-2024-00001»). Cuando está, la búsqueda se hace sobre ese
+        /// expediente y no sobre un barrido global con tope.
+        identifier: Option<String>,
     },
     /// Ficha extractiva de un identificador y sus documentos vinculados.
     Dossier { canonical: String },
@@ -309,6 +937,21 @@ pub enum Command {
     ComputeMany {
         operation: Operation,
         concepts: Vec<String>,
+    },
+    /// Suma (o promedio, máximo, mínimo) sobre una CATEGORÍA de valor cuando
+    /// el campo que la pregunta nombró no tiene ningún valor en el alcance.
+    ///
+    /// No sustituye un campo por otro parecido: sólo participa el documento
+    /// que tiene exactamente un valor de esa categoría —ahí «el campo
+    /// monetario del documento» lo determina el documento, no el motor—, y la
+    /// respuesta declara siempre cuántos documentos del alcance cubrió y por
+    /// qué motivo quedaron fuera los demás.
+    ComputeCategory {
+        operation: Operation,
+        /// Campo que la pregunta nombró y que el alcance no tiene.
+        requested: String,
+        /// Categoría de valor sobre la que se calcula («money», «number», …).
+        value_type: String,
     },
     /// Operación entre dos campos numéricos del mismo documento («Cantidad ×
     /// Precio unitario»). El resultado, si se agrega, es la suma de los
@@ -327,6 +970,83 @@ pub enum Command {
     /// La pregunta es resoluble, pero el acervo no tiene lo que pide. Se
     /// responde explicando qué falta, nunca con algo parecido.
     NoEvidence { message: String },
+    /// ¿Coinciden los valores de un mismo campo en dos documentos que la
+    /// pregunta señala por su clave?
+    ///
+    /// Comparar dos valores citados es una operación mecánica: no exige
+    /// entender de qué hablan, sólo leerlos de sus dos documentos y ponerlos
+    /// uno al lado del otro. Lo que NO se hace aquí es dar por bueno que dos
+    /// campos con nombres distintos son «el mismo campo» porque los dos sean
+    /// monetarios: si el segundo documento no registra el campo nombrado, se
+    /// dice, y se ofrece el suyo como opción en vez de sustituirlo en silencio.
+    CompareFieldBetweenDocuments { field: String },
+    /// Operación entre dos campos de UN documento que la pregunta señala por su
+    /// clave («para el documento D02376, ¿el importe entre la cantidad?»).
+    ///
+    /// Se separa de `ComputeRow` —que opera sobre un conjunto y agrega— por
+    /// dos motivos que no son de estilo: el alcance es un documento concreto,
+    /// no un predicado, y los operandos pueden venir nombrados de forma
+    /// genérica («el importe»), que sobre un conjunto sería ambiguo y sobre un
+    /// documento con un solo valor monetario no lo es. El resultado por
+    /// documento nunca se presenta como un total del acervo.
+    ComputeRowInDocument {
+        operation: RowOperation,
+        left: RowOperandSpec,
+        right: RowOperandSpec,
+    },
+    /// Censo del acervo: cuántos ARCHIVOS hay, por carpeta y por tipo. Es la
+    /// única ruta que puede dar un total completo, porque cuenta también los
+    /// archivos que el indexador no logró leer y declara la partición.
+    Census(CensusRequest),
+    /// Relación byte a byte entre documentos ya identificados por su clave
+    /// interna («¿existe un documento con el mismo SHA-256 que D#####?»,
+    /// «¿D##### es un duplicado exacto de D#####?»). El SHA-256 lo calcula el
+    /// indexador sobre los bytes crudos del archivo, así que compararlo es un
+    /// hecho mecánico del propio índice, no una inferencia sobre contenido.
+    DuplicateComparison(DuplicateComparisonKind),
+}
+
+/// Cómo señala la pregunta al documento del que quiere hablar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentSelection {
+    /// Posición dentro del conjunto que el turno anterior dejó delante. El
+    /// conjunto se reevalúa como cualquier otro alcance heredado y la posición
+    /// se aplica sobre el orden estable del índice, que es el mismo con el que
+    /// se enumeró antes.
+    Position(OrdinalPosition),
+    /// El documento del que habló la respuesta anterior, por su ruta.
+    LastCited(String),
+}
+
+/// Qué separa los dos grupos de una comparación.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComparisonDimension {
+    /// Dos valores del mismo campo del acervo. Cada lado se resuelve añadiendo
+    /// un filtro «campo = valor» al alcance.
+    Concept(String),
+    /// Dos carpetas de origen. La carpeta no es un campo extraído de ningún
+    /// documento sino metadato del índice, así que cada lado se resuelve
+    /// acotando el origen, no añadiendo un filtro de valor: pedir
+    /// «carpeta de origen = calidad» como filtro no encontraría nada.
+    Origin,
+}
+
+impl ComparisonDimension {
+    /// Nombre con el que la respuesta puede citar la dimensión comparada.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Concept(name) => name,
+            Self::Origin => "carpeta de origen",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DuplicateComparisonKind {
+    /// Busca, en todo el acervo, otro documento con el mismo SHA-256.
+    FindByteIdentical,
+    /// Compara el SHA-256 de dos documentos ya nombrados por la pregunta.
+    CompareExact,
 }
 
 /// Alcance ya resuelto contra el índice.
@@ -582,6 +1302,15 @@ pub fn plan_structured(
     state: &ConversationState,
     clock: &Clock,
 ) -> Result<StructuredPlan> {
+    // Un nombre ordinal de carpeta es una referencia de alcance, no palabras
+    // sueltas que puedan degradarse a una coincidencia parecida. Se corta
+    // antes de leer el contexto para que tampoco pueda heredarse un origen
+    // anterior cuando el usuario escribió otro inexistente.
+    if tools.explicit_origin_is_missing(question)? {
+        return Ok(StructuredPlan::without_evidence(
+            "No encontré evidencia local para la carpeta u origen solicitado; no voy a sustituirlo por otro parecido.",
+        ));
+    }
     if let Some(pending) = &state.pending {
         if let Some(choice) = pending.chosen(question) {
             let field = choice
@@ -668,6 +1397,21 @@ fn reask(pending: &PendingChoice, question: &str) -> StructuredPlan {
     StructuredPlan::clarify(reason, message, pending.options.clone()).with_pending(pending.clone())
 }
 
+/// Reconoce las dos formas fijas en que el banco pregunta por una relación
+/// byte a byte entre documentos. Deliberadamente literal, igual que
+/// `reference_in`: dos señales textuales características de cada plantilla,
+/// no una interpretación de la intención.
+fn duplicate_relationship_kind(question: &str) -> Option<DuplicateComparisonKind> {
+    let normalized = normalize_exact(question);
+    if normalized.contains("byte identico") && normalized.contains("sha 256") {
+        return Some(DuplicateComparisonKind::FindByteIdentical);
+    }
+    if normalized.contains("duplicado exacto") {
+        return Some(DuplicateComparisonKind::CompareExact);
+    }
+    None
+}
+
 fn plan_inner(
     tools: &ToolEngine,
     question: &str,
@@ -675,10 +1419,103 @@ fn plan_inner(
     clock: &Clock,
     forced: &Forced,
 ) -> Result<StructuredPlan> {
+    // Estas dos preguntas nombran su propio documento por completo y nunca
+    // dependen del turno anterior, pero «(mismo SHA-256)» activa el deíctico
+    // «mismo» del detector de referencias conversacionales de más abajo. Se
+    // cortan antes de leer esa ni ninguna otra señal conversacional para que
+    // ese falso positivo no las mande a pedir un contexto que no hace falta.
+    if let Some(kind) = duplicate_relationship_kind(question) {
+        return Ok(StructuredPlan {
+            command: Command::DuplicateComparison(kind),
+            scope: PlannedScope::default(),
+            pending: None,
+        });
+    }
+
+    // Comparación de un campo entre dos documentos nombrados por su clave. Va
+    // aquí arriba por el mismo motivo que la anterior: la pregunta entrecomilla
+    // el nombre del campo, así que el corte por cita literal la mandaba a
+    // buscar ese texto en el acervo y acababa en «no encontré evidencia», con
+    // los dos documentos localizables y el campo pedido delante.
+    if let Some((field, documents, paths)) =
+        field_comparison_between_documents(tools, question)?
+    {
+        return Ok(StructuredPlan {
+            command: Command::CompareFieldBetweenDocuments { field },
+            scope: PlannedScope {
+                documents,
+                paths,
+                ..PlannedScope::default()
+            },
+            pending: None,
+        });
+    }
+
+    // Operación entre dos campos de un documento concreto. Va antes del corte
+    // por cita entrecomillada y antes de `numeric_field_pair` porque ninguna
+    // de las dos la alcanzaba: la primera manda a búsqueda literal cualquier
+    // pregunta con comillas, y la segunda exige que los DOS operandos sean
+    // campos nombrados del acervo, cosa que «el importe» no es.
+    let marks = signals(question);
+    if let Some((operation, left, right, document, path)) =
+        document_row_operation(tools, question, &marks)?
+    {
+        return Ok(StructuredPlan {
+            command: Command::ComputeRowInDocument {
+                operation,
+                left,
+                right,
+            },
+            scope: PlannedScope {
+                documents: vec![document],
+                paths: vec![path],
+                ..PlannedScope::default()
+            },
+            pending: None,
+        });
+    }
+
+    // Censo del acervo: cuántos ARCHIVOS hay. Va aquí arriba, antes del corte
+    // por cita entrecomillada y antes de la ficha de expediente, porque las
+    // dos rutas se quedaban con preguntas que eran recuentos:
+    //
+    //  * «¿Cuántos documentos de tipo "factura" hay en el área "Finanzas…"?»
+    //    lleva comillas, así que el corte literal la mandaba a buscar ese
+    //    texto dentro de los documentos y devolvía una muestra con tope.
+    //  * «Resume la composición documental del área X: ¿cuántos documentos de
+    //    cada tipo existen?» lleva «resume» y nombra un continente, así que
+    //    acababa contestando que ese texto no produce una clave estable.
+    //
+    // `census_request` es estrecho a propósito —exige contar documentos y no
+    // otra cosa— así que adelantarlo no le quita ninguna pregunta a las rutas
+    // que ya funcionaban; se comprueba con las regresiones de esta ronda.
+    if let Some(request) = census_request(tools, question, &marks)? {
+        return Ok(StructuredPlan {
+            command: Command::Census(request),
+            scope: PlannedScope::default(),
+            pending: None,
+        });
+    }
+
     // Una cita entrecomillada es una búsqueda literal del acervo. Interceptarla
     // convertiría en cálculo o en informe de contradicciones una pregunta que
-    // sólo quería encontrar un texto.
-    if ToolEngine::query_has_quoted_literal(question) {
+    // sólo quería encontrar un texto. Se exceptúan dos casos:
+    //
+    //  - Lo único entrecomillado es el nombre de una carpeta: ahí las comillas
+    //    delimitan el alcance, no un texto que buscar dentro de los documentos.
+    //  - La pregunta alude explícitamente al turno anterior y la conversación
+    //    tiene contexto: «de esos, ¿cuántos son del área "…"?» no pide buscar
+    //    ese texto en el acervo, pide recortar el conjunto que ya está
+    //    delante. Sin esta excepción el corte se aplicaba ANTES de leer el
+    //    contexto, así que la continuación perdía el conjunto heredado y la
+    //    respuesta caía en la muestra con tope: decía «20 valores» cuando
+    //    veinte era el tope y no un total.
+    let continues_the_previous_turn =
+        reference_in(question) == Reference::Explicit && state.has_context();
+    if ToolEngine::query_has_quoted_literal(question)
+        && !ToolEngine::quoted_literal_is_only_an_origin(question)
+        && !continues_the_previous_turn
+    {
         return Ok(StructuredPlan::retrieval());
     }
 
@@ -709,20 +1546,31 @@ fn plan_inner(
         });
     }
 
-    let marks = signals(question);
     let reference = reference_in(question);
 
     // «¿Hay documentos contradictorios?» es una consulta global; «¿hay folios
     // con estados diferentes?» nombra la clave y el campo comparado, y se
     // resuelve sobre esos dos campos concretos. Listar los folios existentes no
     // responde ninguna de las dos.
-    let named = named_concepts_in_order(tools, question)?;
+    // Los campos que la pregunta nombra se leen SIN sus identificadores: «¿hay
+    // contradicciones en OC-2024-00001?» nombra un expediente, no el campo
+    // «OC». Sin quitarlo, «OC» entraba como el campo comparado y la búsqueda
+    // se restringía justo al campo que no puede contradecirse consigo mismo,
+    // de modo que un expediente con ocho campos discrepantes se contestaba
+    // «no encontré contradicciones».
+    let named = named_concepts_in_order(tools, &question_without_identifiers(question))?;
     if marks.contradictions || (marks.differing && !named.is_empty()) {
         let mut named = named.into_iter();
+        // Un identificador escrito en la pregunta acota el expediente. Sólo
+        // se usa cuando resuelve a uno solo: con varios candidatos, elegir
+        // sería adivinar de cuál habla el usuario.
+        let candidates = relations::identifier_candidates(tools, question)?;
+        let identifier = (candidates.len() == 1).then(|| candidates[0].clone());
         return Ok(StructuredPlan {
             command: Command::Contradictions {
                 key: named.next(),
                 compared: named.next(),
+                identifier,
             },
             scope: PlannedScope::default(),
             pending: None,
@@ -803,6 +1651,82 @@ fn plan_inner(
         });
     }
 
+    // Referencia ordinal al conjunto del turno anterior: «¿cuál es el
+    // Responsable del primero?».
+    //
+    // Sólo actúa con contexto. Sin él, la pregunta sigue exactamente el camino
+    // que seguía antes —una búsqueda— porque «el primero» no señala nada y
+    // adivinar un documento sería peor que no responder.
+    if state.has_context() {
+        if let Some(position) = ordinal_position_in(question) {
+            let mut scope = resolve_scope(
+                tools,
+                question,
+                state,
+                clock,
+                Reference::Explicit,
+                &marks,
+                false,
+                forced,
+            )?;
+            resolve_documents(tools, &mut scope)?;
+            return Ok(StructuredPlan {
+                command: Command::DocumentInContext(DocumentSelection::Position(position)),
+                scope,
+                pending: None,
+            });
+        }
+    }
+
+    // Continuación deíctica sobre el documento del que habló la respuesta
+    // anterior: «¿y cuál es la Moneda de ese documento?».
+    //
+    // Las condiciones son estrechas: la pregunta alude explícitamente al turno
+    // anterior, habla de un documento, nombra el campo que quiere, y la
+    // respuesta anterior habló de un solo documento —si habló de varios no hay
+    // ninguno al que «ese» pueda señalar y no se adivina—. Se excluyen las
+    // continuaciones que ya tienen su propia ruta (evidencia, contradicciones,
+    // comparación, agrupación) para no robárselas.
+    if reference == Reference::Explicit
+        && marks.container
+        && !marks.evidence
+        && !marks.contradictions
+        && !marks.differing
+        && !marks.compare
+        && !marks.compare_verb
+        && !marks.group
+        && !marks.superlative
+        && !marks.summary
+        && !marks.related
+        && requested_operation(&marks).is_none()
+    {
+        if let Some(path) = &state.document {
+            if question_names_a_concept(tools, question)? {
+                return Ok(StructuredPlan {
+                    command: Command::DocumentInContext(DocumentSelection::LastCited(
+                        path.clone(),
+                    )),
+                    scope: PlannedScope::default(),
+                    pending: None,
+                });
+            }
+        }
+    }
+
+    // Cambio elíptico de alcance: «suma X en la carpeta calidad» → «¿y en la
+    // carpeta operaciones?».
+    //
+    // La pregunta no nombra ninguna operación ni ningún campo: los dos vienen
+    // del turno anterior. Lo único que aporta es un alcance nuevo, y ese
+    // alcance SUSTITUYE a la parte equivalente del anterior —la carpeta a la
+    // carpeta, el filtro de un campo al filtro de ese mismo campo— en lugar de
+    // sumarse a él, que es lo que hace una continuación deíctica («de esos,
+    // …»). Sin esta rama la pregunta se resolvía como una búsqueda de texto y
+    // contestaba que la carpeta existía, no cuánto sumaba.
+    if let Some(plan) = elliptical_scope_change(tools, question, state, &marks)? {
+        return Ok(plan);
+    }
+
     if marks.evidence && (reference == Reference::Explicit || state.last_result.is_some()) {
         if state.last_result.is_none() {
             return Ok(StructuredPlan::clarify(
@@ -849,7 +1773,13 @@ fn plan_inner(
         operation,
         Some(Operation::Average | Operation::Maximum | Operation::Minimum)
     );
+    let simple_sum_with_named_field = operation == Some(Operation::Sum)
+        && question_names_a_concept(tools, question)?;
     let candidate = novel_operation
+        // La suma simple usa el mismo motor decimal y de alcance que las
+        // demás operaciones: la ruta histórica filtraba los valores inválidos
+        // antes de saber cuántos documentos dejaba fuera.
+        || simple_sum_with_named_field
         || marks.compare
         || marks.difference
         || marks.percent
@@ -923,12 +1853,22 @@ fn plan_inner(
             // casualidad con uno de los grupos comparados.
             let compared = [normalize_exact(&left), normalize_exact(&right)];
             let explicit = scope.explicit_filters.clone();
+            let dimension_key = match &dimension {
+                ComparisonDimension::Concept(name) => Some(canonical_key(name)),
+                ComparisonDimension::Origin => None,
+            };
             scope.filters.retain(|filter| {
                 let key = (canonical_key(&filter.concept), normalize_exact(&filter.equals));
                 explicit.contains(&key)
-                    || (canonical_key(&filter.concept) != canonical_key(&dimension)
+                    || (dimension_key.as_deref() != Some(canonical_key(&filter.concept).as_str())
                         && !compared.contains(&normalize_exact(&filter.equals)))
             });
+            // Comparar dos carpetas quita la carpeta del alcance común: cada
+            // lado pone la suya. Dejar la que `resolve_scope` eligió —una de
+            // las dos, la que ganara— recortaría los dos lados a la misma.
+            if matches!(dimension, ComparisonDimension::Origin) {
+                scope.origin = None;
+            }
             let documents = resolve_documents(tools, &mut scope)?;
             let concept =
                 match resolve_computation_concept(
@@ -939,17 +1879,20 @@ fn plan_inner(
                     operation,
                     false,
                     forced,
-                    Some(&dimension),
+                    match &dimension {
+                        ComparisonDimension::Concept(name) => Some(name.as_str()),
+                        ComparisonDimension::Origin => None,
+                    },
                 )? {
                     Resolved::Concept(name) => name,
                     other => return Ok(unresolved_plan(other, question, &scope)),
                 };
             scope.concept = Some(concept);
-            scope.group_by = Some(dimension.clone());
+            scope.group_by = Some(dimension.label().to_owned());
             return Ok(StructuredPlan {
                 command: Command::CompareGroups {
                     operation,
-                    concept: dimension,
+                    dimension,
                     left,
                     right,
                 },
@@ -993,13 +1936,13 @@ fn plan_inner(
         });
     }
 
-    // Segunda puerta, ya con el alcance resuelto: una operación simple sólo se
-    // queda aquí si trae contexto heredado, un periodo anclado, una comparación,
-    // una agrupación o una operación que la ruta clásica no implementa. Si no,
-    // vuelve a esa ruta intacta, con su comportamiento ya verificado.
+    // Segunda puerta, ya con el alcance resuelto. La suma simple es la
+    // excepción deliberada: debe conservar el alcance completo y calcular con
+    // decimales exactos, garantías que la ruta clásica no ofrece.
     let ranking_intent = (marks.superlative || marks.group)
         && grouping_concept(tools, question, &[], scope.concept.as_deref())?.is_named();
     if !novel_operation
+        && operation != Some(Operation::Sum)
         && !scope.inherited
         && scope.date.is_none()
         && !wants_period_comparison
@@ -1065,6 +2008,31 @@ fn plan_inner(
     if marks.superlative || marks.group {
         match grouping_concept(tools, question, &documents, scope.concept.as_deref())? {
             Grouping::One(group) => {
+                // «Agrupa la suma ... por X» pide todos los grupos, no el
+                // primero del ranking. Lo resuelve el mismo cálculo decimal
+                // de alcance completo y sólo cambia cómo se organizan cubos.
+                if marks.group && !marks.superlative && operation == Some(Operation::Sum) {
+                    let concept = match resolve_computation_concept(
+                        tools,
+                        question,
+                        state,
+                        &documents,
+                        Operation::Sum,
+                        false,
+                        forced,
+                        Some(&group),
+                    )? {
+                        Resolved::Concept(name) => name,
+                        other => return Ok(unresolved_plan(other, question, &scope)),
+                    };
+                    scope.concept = Some(concept);
+                    scope.group_by = Some(group);
+                    return Ok(StructuredPlan {
+                        command: Command::Compute(Operation::Sum),
+                        scope,
+                        pending: None,
+                    });
+                }
                 // En un ranking, «más» y «menos» indican la dirección del orden,
                 // no la operación: «cuál cliente debe más» pregunta por el total
                 // de cada cliente. Sólo un extremo nombrado explícitamente («el
@@ -1110,7 +2078,20 @@ fn plan_inner(
                     options,
                 ));
             }
-            Grouping::None => {}
+            Grouping::None => {
+                // La pregunta pide agrupar («agrupa la suma de X por Y»), pero
+                // ninguna dimensión de texto o estado la satisface. Agrupar por
+                // un campo numérico es legítimo y sólo lo resuelve la ruta de
+                // agregación, que delega en la misma política decimal segura.
+                //
+                // Seguir aquí sería peor que no responder: al resolver el campo
+                // de valor sin excluir el agrupador, la respuesta acababa
+                // sumando «Y» —el campo por el que se pedía agrupar— y
+                // presentándolo como la suma pedida.
+                if marks.group && !marks.superlative {
+                    return Ok(StructuredPlan::retrieval());
+                }
+            }
         }
     }
 
@@ -1150,6 +2131,28 @@ fn plan_inner(
         None,
     )? {
         Resolved::Concept(name) => name,
+        // El campo nombrado existe en el acervo pero no tiene ni un valor en
+        // este alcance. Antes se contestaba sólo «no encontré valores», sin
+        // decir si el alcance tenía algo comparable. Si cada documento del
+        // alcance determina por sí mismo un único valor de la misma categoría
+        // —la que el campo pedido tiene—, se calcula sobre ésos y se declara
+        // la cobertura. Nunca se sustituye el campo en silencio: la respuesta
+        // dice, en su primera línea, que el campo pedido no está.
+        Resolved::Absent(name) => {
+            if let Some(value_type) = category_fallback(tools, &name, &documents, operation)? {
+                scope.concept = None;
+                return Ok(StructuredPlan {
+                    command: Command::ComputeCategory {
+                        operation,
+                        requested: name,
+                        value_type,
+                    },
+                    scope,
+                    pending: None,
+                });
+            }
+            return Ok(unresolved_plan(Resolved::Absent(name), question, &scope));
+        }
         other => return Ok(unresolved_plan(other, question, &scope)),
     };
     scope.concept = Some(concept);
@@ -1158,6 +2161,33 @@ fn plan_inner(
         scope,
         pending: None,
     })
+}
+
+/// ¿Puede el alcance responder por categoría lo que el campo nombrado no
+/// puede responder por sí mismo?
+///
+/// Devuelve la categoría de valor sólo cuando (a) la operación necesita
+/// números —no se agrupa texto por categoría—, (b) el campo pedido pertenece a
+/// una categoría numérica, y (c) **algún** documento del alcance determina un
+/// único valor de esa categoría. Si ninguno lo hace, no hay nada que declarar
+/// y la negativa original sigue siendo la respuesta correcta.
+fn category_fallback(
+    tools: &ToolEngine,
+    requested: &str,
+    documents: &[i64],
+    operation: Operation,
+) -> Result<Option<String>> {
+    if !operation.needs_numbers() || documents.is_empty() {
+        return Ok(None);
+    }
+    let Some(concept) = tools.concept_by_name(requested)? else {
+        return Ok(None);
+    };
+    if !matches!(concept.value_type.as_str(), "money" | "number" | "percentage") {
+        return Ok(None);
+    }
+    let collected = tools.collect_category_operands(&concept.value_type, documents)?;
+    Ok((!collected.operands.is_empty()).then_some(concept.value_type))
 }
 
 /// Traduce a un plan lo que no se pudo resolver. Ninguna de estas ramas
@@ -1351,6 +2381,125 @@ fn question_names_a_concept(tools: &ToolEngine, question: &str) -> Result<bool> 
         || field_after_keyword(question).is_some())
 }
 
+/// Continuación que sólo cambia el alcance: «¿y en la carpeta operaciones?».
+///
+/// Es la imagen simétrica de la continuación elíptica que ya resolvía
+/// `resolve_scope` («¿y la suma?», una operación sin alcance que hereda el
+/// conjunto). Aquí la pregunta trae el alcance y le falta todo lo demás: la
+/// operación y el campo salen del cálculo del turno anterior.
+///
+/// Las condiciones son estrechas a propósito, y todas comprobables:
+///
+///  1. El turno anterior fue un **cálculo** —hay operación y campo que
+///     heredar—; sin él no hay nada que repetir.
+///  2. La pregunta **no nombra** ninguna operación ni ningún campo: si nombra
+///     alguno, manda lo que el usuario escribió y esta rama no es la suya.
+///  3. La pregunta empieza por la conjunción de continuación («¿**y** en …?»).
+///     Es la misma clase de marca literal que usa `reference_in`: una
+///     pregunta que se sostiene sola nunca empieza así.
+///  4. La pregunta acota algo por su cuenta —una carpeta o un filtro—, que es
+///     lo único que aporta.
+///
+/// El alcance nuevo **sustituye** la parte equivalente del anterior en vez de
+/// sumarse a ella: quien pregunta «¿y en operaciones?» después de una suma en
+/// calidad quiere la otra carpeta, no la intersección de las dos, que además
+/// sería siempre vacía.
+fn elliptical_scope_change(
+    tools: &ToolEngine,
+    question: &str,
+    state: &ConversationState,
+    marks: &Signals,
+) -> Result<Option<StructuredPlan>> {
+    let Some(previous) = &state.last_result else {
+        return Ok(None);
+    };
+    let Some(operation) = Operation::from_label(&previous.operation) else {
+        return Ok(None);
+    };
+    if requested_operation(marks).is_some()
+        || marks.compare
+        || marks.compare_verb
+        || marks.compare_preposition
+        || marks.difference
+        || marks.percent
+        || marks.superlative
+        || marks.group
+        || marks.evidence
+        || marks.contradictions
+        || marks.differing
+        || marks.summary
+        || marks.related
+        || marks.calendar
+        || reference_in(question) == Reference::Explicit
+    {
+        return Ok(None);
+    }
+    let normalized = normalize_exact(question);
+    if !matches!(normalized.split_whitespace().next(), Some("y") | Some("e")) {
+        return Ok(None);
+    }
+    let origin = tools.match_origin(question)?;
+    let own_filters = tools.resolved_filters(question, origin.as_deref(), true)?;
+    if origin.is_none() && own_filters.is_empty() {
+        return Ok(None);
+    }
+    // ¿Nombra la pregunta algún CAMPO, además del alcance? Se comprueba sobre
+    // lo que queda de ella después de quitar las palabras que ya definieron
+    // ese alcance: el nombre de una carpeta puede coincidir con el de un campo
+    // del acervo —«operaciones» es a la vez una carpeta y un concepto— y sin
+    // esta resta la pregunta parecía nombrar un campo cuando lo único que
+    // había escrito era su propia carpeta.
+    let mut scope_terms = search_terms(origin.as_deref().unwrap_or_default());
+    for filter in &own_filters {
+        scope_terms.extend(search_terms(&filter.equals));
+        scope_terms.extend(search_terms(&filter.concept));
+    }
+    let residual = question
+        .split_whitespace()
+        .filter(|word| {
+            let terms = search_terms(word);
+            terms.is_empty() || terms.iter().any(|term| !scope_terms.contains(term))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if question_names_a_concept(tools, &residual)? {
+        return Ok(None);
+    }
+    let mut scope = PlannedScope {
+        inherited: true,
+        ..PlannedScope::default()
+    };
+    if let Some(set) = &state.set {
+        scope.filters = set.filters.clone();
+        scope.origin = set.origin.clone();
+        scope.identifier = set.identifier.clone();
+        scope.date = set.date.clone();
+        scope.range = set.range.clone();
+    }
+    scope.currency = state.currency.clone();
+    // La carpeta nueva sustituye a la anterior; un filtro nuevo sustituye al
+    // filtro del MISMO campo y deja intactos los demás.
+    if origin.is_some() {
+        scope.origin = origin;
+    }
+    for filter in own_filters {
+        scope
+            .filters
+            .retain(|existing| canonical_key(&existing.concept) != canonical_key(&filter.concept));
+        scope.filters.push(filter);
+    }
+    scope.concept = state
+        .concept
+        .clone()
+        .or_else(|| Some(previous.concept.clone()));
+    resolve_documents(tools, &mut scope)?;
+    Ok(Some(StructuredPlan {
+        command: Command::Compute(operation),
+        scope,
+        pending: None,
+    }))
+}
+
 fn resolve_scope(
     tools: &ToolEngine,
     question: &str,
@@ -1414,6 +2563,16 @@ fn resolve_scope(
     }
     if scope.origin.is_none() {
         scope.origin = origin;
+    }
+
+    // Moneda escrita en la pregunta. El planificador clásico ya la leía
+    // (`explicit_currency`); el estructurado sólo la heredaba del turno
+    // anterior, así que «…, moneda=MXN» se perdía por completo y la suma
+    // salía repartida entre las tres monedas del acervo como si la pregunta
+    // no hubiera pedido ninguna. Sólo se toma si el alcance no traía ya una:
+    // lo heredado explícitamente manda sobre lo que se lee aquí.
+    if scope.currency.is_none() {
+        scope.currency = explicit_currency(question, &tools.available_currencies()?);
     }
 
     // Cuando la pregunta compara con el periodo anterior y el contexto ya trae
@@ -1570,6 +2729,18 @@ fn resolve_computation_concept(
     }
     if operation.needs_numbers() {
         if let Some(concept) = resolve_named_concept(&catalogue, &terms, exclude) {
+            // Un campo mixto puede contener importes válidos y marcadores
+            // como «N/D». Su tipo de resumen puede acabar siendo texto, pero
+            // si hay operandos numéricos reales se calcula y se declara lo
+            // que quedó inválido, en vez de degradar la petición a búsqueda.
+            let operands = tools.collect_operands(&ValueQuery {
+                concept: &concept.display_name,
+                documents: Some(documents),
+                ..ValueQuery::default()
+            })?;
+            if operands.iter().any(|operand| operand.numeric.is_some()) {
+                return Ok(Resolved::Concept(concept.display_name));
+            }
             return Ok(Resolved::NotNumeric(concept.display_name));
         }
     }
@@ -1633,12 +2804,27 @@ fn field_after_keyword(question: &str) -> Option<String> {
     (!tail.is_empty()).then_some(tail)
 }
 
-/// Dos grupos del mismo campo nombrados literalmente en la pregunta.
+/// Dos grupos nombrados literalmente en la pregunta: dos carpetas, o dos
+/// valores del mismo campo.
+///
+/// Las carpetas se prueban primero porque son la dimensión más explícita que
+/// una pregunta puede nombrar —«entre la carpeta calidad y la carpeta
+/// operaciones» no admite otra lectura— y porque no viven en ningún campo: si
+/// se dejara pasar a la búsqueda por valores, la comparación se resolvería
+/// sobre el acervo entero, que es exactamente lo que hacía antes.
 fn comparison_targets(
     tools: &ToolEngine,
     question: &str,
     scope: &PlannedScope,
-) -> Result<Option<(String, String, String)>> {
+) -> Result<Option<(ComparisonDimension, String, String)>> {
+    let origins = tools.origins_mentioned(question)?;
+    if let [left, right] = origins.as_slice() {
+        return Ok(Some((
+            ComparisonDimension::Origin,
+            left.clone(),
+            right.clone(),
+        )));
+    }
     let mentioned = tools.values_mentioned(question, scope.origin.as_deref())?;
     let mut by_concept: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (concept, value) in mentioned {
@@ -1688,7 +2874,11 @@ fn comparison_targets(
     });
     let (concept, mut values) = pairs.remove(0);
     values.sort_by_key(|value| ToolEngine::mention_position(question, value));
-    Ok(Some((concept, values[0].clone(), values[1].clone())))
+    Ok(Some((
+        ComparisonDimension::Concept(concept),
+        values[0].clone(),
+        values[1].clone(),
+    )))
 }
 
 /// Campo por el que agrupar un ranking. Nunca es numérico: agrupar por el mismo

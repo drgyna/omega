@@ -57,6 +57,28 @@ Vision puede devolver cero líneas aunque la aplicación nativa funcione; por es
 debe ejecutarse en el mismo contexto nativo en que se distribuirá Omega. No hay OCR remoto ni una
 ruta de red alternativa.
 
+## Benchmark reproducible y sobre operativo
+
+El benchmark release genera un corpus sintético local y mide por separado indexación, búsqueda
+exacta, filtros, ranking, construcción de citas, respuesta completa y máximo residente del
+proceso. No escribe corpus ni reportes dentro del repositorio:
+
+```sh
+cargo run --manifest-path src-tauri/Cargo.toml --release --bin omega-bench -- \
+  --sizes 1000,10000,50000 --report /tmp/omega-bench.json
+```
+
+Cada consulta tiene una ejecución de calentamiento y siete muestras; el reporte JSON conserva
+mejor, mediana y peor tiempo. La indexación se mide una vez por tamaño. Las cifras son una línea
+base del equipo que las ejecuta, no un SLA ni una proyección a tamaños no medidos.
+
+Como límite operativo inicial, la beta debe limitar cada fuente a **10,000 documentos** y capturar
+el reporte anterior en el hardware objetivo antes de aceptar más. Producción puede habilitar hasta
+**50,000 documentos por fuente** sólo tras reproducir el benchmark en el paquete y hardware de
+distribución, verificar espacio para al menos el tamaño del índice medido más margen operativo y
+revisar la mediana/peor caso de respuesta completa. Fuentes mayores requieren un nuevo benchmark,
+una decisión explícita de capacidad y no deben quedar cubiertas por inferencia lineal.
+
 ## Escenarios conversacionales
 
 Además de las preguntas sueltas, la fábrica encadena turnos sobre una misma

@@ -269,6 +269,8 @@ pub fn documents_for(tools: &ToolEngine, canonical: &str) -> Result<Option<Relat
                     field: Some(field),
                     match_kind: "canónica".into(),
                     reliable: true,
+                    ocr_status: None,
+                    ocr_confidence: None,
                     confidence: None,
                 },
                 },
@@ -355,6 +357,8 @@ fn field_values(tools: &ToolEngine, documents: &[i64]) -> Result<BTreeMap<String
                         field: Some(concept),
                         match_kind: "campo".into(),
                         reliable: true,
+                        ocr_status: None,
+                        ocr_confidence: None,
                         confidence: None,
                     },
                 },
@@ -423,6 +427,34 @@ pub fn contradictions_in(tools: &ToolEngine, group: &RelationGroup) -> Result<Ve
         });
     }
     Ok(contradictions)
+}
+
+/// Contradicciones **dentro de un identificador concreto** que la pregunta
+/// nombró.
+///
+/// La búsqueda global de más abajo recorre el acervo por orden alfabético de
+/// clave y se detiene a las `MAX_SCANNED_GROUPS`: si el folio por el que
+/// pregunta el usuario no cae dentro de esas primeras claves, la respuesta era
+/// «no encontré contradicciones» sobre un expediente que ni siquiera se miró.
+/// Cuando la pregunta nombra la clave, no hay nada que recorrer.
+pub fn contradictions_for(
+    tools: &ToolEngine,
+    canonical: &str,
+    compared_concept: Option<&str>,
+) -> Result<Vec<Contradiction>> {
+    let Some(group) = documents_for(tools, canonical)? else {
+        return Ok(vec![]);
+    };
+    Ok(contradictions_in(tools, &group)?
+        .into_iter()
+        .filter(|item| {
+            compared_concept.is_none_or(|concept| {
+                crate::normalize::canonical_key(&item.concept)
+                    == crate::normalize::canonical_key(concept)
+            })
+        })
+        .take(MAX_REPORTED_CONTRADICTIONS)
+        .collect())
 }
 
 /// Recorre el acervo buscando claves compartidas con valores incompatibles.
@@ -587,6 +619,8 @@ pub fn mentions_without_key(tools: &ToolEngine, text: &str) -> Result<Vec<FieldV
                     field: Some(concept),
                     match_kind: "campo".into(),
                     reliable: true,
+                    ocr_status: None,
+                    ocr_confidence: None,
                     confidence: None,
                 },
             })

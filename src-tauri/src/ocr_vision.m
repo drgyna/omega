@@ -4,6 +4,10 @@
 #import <Vision/Vision.h>
 
 static void recognize_image(NSImage *image, NSInteger page, NSMutableArray *lines) {
+  // VNRecognizeTextRequest existe desde macOS 10.15. El binario se puede
+  // distribuir con un objetivo anterior, pero nunca debe intentar invocarlo
+  // allí: main devuelve 66 y Rust lo publica como OCR no disponible.
+  if (!@available(macOS 10.15, *)) return;
   NSData *tiff = [image TIFFRepresentation];
   NSBitmapImageRep *bitmap = tiff == nil ? nil : [NSBitmapImageRep imageRepWithData:tiff];
   NSData *png = bitmap == nil ? nil : [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
@@ -33,6 +37,7 @@ static void recognize_image(NSImage *image, NSInteger page, NSMutableArray *line
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 2) return 64;
+    if (!@available(macOS 10.15, *)) return 66;
     NSURL *url = [NSURL fileURLWithFileSystemRepresentation:argv[1] isDirectory:NO relativeToURL:nil];
     NSMutableArray *lines = [NSMutableArray array];
     if ([[url.pathExtension lowercaseString] isEqualToString:@"pdf"]) {

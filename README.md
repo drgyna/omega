@@ -101,3 +101,5 @@ cargo test --test format_retrieval retrieves_ocr_fixture_when_explicitly_configu
 - `src/`: conversación, fuentes autorizadas, citas y configuración de privacidad.
 - `docs/ARCHITECTURE.md`: límites de confianza y decisiones técnicas.
 - `docs/OCR.md`: punto de extensión y plan de la siguiente implementación.
+- `docs/RECOVERY.md`: backup atómico, cuarentena y restauración segura de SQLite.
+- `docs/RELEASE_MACOS.md`: empaquetado, smoke test OCR y firma/notarización pendientes.

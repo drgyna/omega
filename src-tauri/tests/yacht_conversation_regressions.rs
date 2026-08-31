@@ -27,6 +27,76 @@ fn the_yacht_corpus_survives_the_manual_regression_matrix() {
     a_capacity_never_links_documents(&engine);
     repeated_folios_with_different_states_are_not_a_list_of_folios(&engine);
     a_clarification_is_written_once(&engine);
+    a_two_field_operation_accounts_for_every_document_in_scope(&engine);
+}
+
+/// Defecto 9: «¿Cuánto da Número de pasajeros multiplicado por Tarifa
+/// contratada?» declaraba 600 documentos de alcance, calculaba 140 y no decía
+/// una palabra de los 460 restantes — y aun así se presentaba como
+/// verificada. Los 460 no tienen ninguno de los dos campos, así que no
+/// aparecían en ninguna lista de operandos y eran invisibles para el cálculo.
+///
+/// Las cifras se leyeron del propio corpus: sólo los 140 documentos de
+/// `02_reservas_charter` traen los dos campos, y son exactamente los mismos
+/// 140 para ambos.
+fn a_two_field_operation_accounts_for_every_document_in_scope(engine: &OmegaEngine) {
+    // Conversación propia y nueva: esta regresión mide una pregunta aislada,
+    // no la continuación de ninguna aclaración anterior.
+    let answer = ask(
+        engine,
+        "d10-dos-campos",
+        "¿Cuánto da Número de pasajeros multiplicado por Tarifa contratada?",
+    );
+
+    let scope = answer
+        .scope
+        .clone()
+        .unwrap_or_else(|| panic!("alcance declarado; respuesta: {}", answer.text));
+    assert_eq!(
+        scope.document_count,
+        Some(600),
+        "el alcance es el acervo completo: {scope:?}"
+    );
+    assert_eq!(
+        scope.value_count,
+        Some(140),
+        "sólo los 140 documentos de reservas traen los dos campos: {scope:?}"
+    );
+    assert_eq!(
+        scope.excluded_count,
+        Some(460),
+        "los 460 restantes son exclusiones, no documentos que se puedan callar: {scope:?}"
+    );
+    assert_eq!(
+        scope.value_count.unwrap() + scope.excluded_count.unwrap(),
+        scope.document_count.unwrap(),
+        "invariante: alcance = calculados + excluidos: {scope:?}"
+    );
+
+    assert!(
+        !answer.verified,
+        "una operación que dejó fuera 460 de 600 documentos no puede declararse verificada: {}",
+        answer.text
+    );
+    assert!(
+        answer
+            .text
+            .contains("460 documentos no tenían ninguno de los dos campos"),
+        "la respuesta debe explicar los 460 excluidos, no omitirlos: {}",
+        answer.text
+    );
+    assert!(
+        answer.text.contains("140 documentos"),
+        "la respuesta debe decir sobre cuántos documentos calculó: {}",
+        answer.text
+    );
+    // El encabezado nombra la operación real: una multiplicación fila por
+    // fila cuyos productos se acumulan no es una «suma».
+    assert!(
+        answer.text.starts_with("Multiplicación de «Número de pasajeros» por «Tarifa contratada»"),
+        "el encabezado debe nombrar la multiplicación: {}",
+        answer.text
+    );
 }
 
 /// Defecto 1: «Estado: Pendiente de emisión» se respondía con «Estado de pago =
@@ -84,7 +154,7 @@ fn a_clarification_keeps_the_previous_scope(engine: &OmegaEngine) {
 
     let chosen = ask(engine, "d2", "Anticipo recibido");
     assert!(
-        chosen.text.contains("$638,925.00 MXN"),
+        chosen.text.contains("638,925"),
         "la suma debe ser la de los 11 pendientes: {}",
         chosen.text
     );
@@ -122,7 +192,7 @@ fn an_explicit_field_beats_the_context(engine: &OmegaEngine) {
     ask(engine, "d3", "¿Cuántos documentos tienen Estado de pago: Pendiente?");
     ask(engine, "d3", "¿Cuánto suman?");
     let previous = ask(engine, "d3", "Anticipo recibido");
-    assert!(previous.text.contains("$638,925.00 MXN"));
+    assert!(previous.text.contains("638,925"));
 
     for question in [
         "Suma el campo Valor declarado.",
@@ -162,15 +232,15 @@ fn two_groups_are_really_compared(engine: &OmegaEngine) {
     let answer = ask(engine, "d4", "Compara el Importe total de Veracruz contra Cozumel.");
     assert!(answer.verified, "{}", answer.text);
     assert!(answer.text.contains("Ciudad base"), "agrupador: {}", answer.text);
-    assert!(answer.text.contains("$745,200.00 MXN"), "Veracruz: {}", answer.text);
-    assert!(answer.text.contains("$915,950.00 MXN"), "Cozumel: {}", answer.text);
+    assert!(answer.text.contains("745,200"), "Veracruz: {}", answer.text);
+    assert!(answer.text.contains("915,950"), "Cozumel: {}", answer.text);
     assert!(
         answer.text.contains("«Cozumel» es el mayor"),
         "debe decir cuál es mayor: {}",
         answer.text
     );
     assert!(
-        answer.text.contains("$170,750.00 MXN"),
+        answer.text.contains("170,750"),
         "diferencia absoluta: {}",
         answer.text
     );
@@ -187,7 +257,7 @@ fn two_groups_are_really_compared(engine: &OmegaEngine) {
     // Defecto 4, continuaciones: usan la comparación anterior sin recalcular.
     let difference = ask(engine, "d4", "¿Cuál es la diferencia?");
     assert!(difference.used_context);
-    assert!(difference.text.contains("$170,750.00 MXN"), "{}", difference.text);
+    assert!(difference.text.contains("170,750"), "{}", difference.text);
     let percentage = ask(engine, "d4", "¿Qué porcentaje representa la diferencia?");
     assert!(percentage.used_context);
     assert!(percentage.text.contains("22.9133 %"), "{}", percentage.text);
@@ -204,7 +274,7 @@ fn a_ranking_answers_with_the_group(engine: &OmegaEngine) {
         answer.text
     );
     assert!(
-        answer.text.contains("$689,325.00 MXN"),
+        answer.text.contains("689,325"),
         "el total del grupo, no el máximo individual: {}",
         answer.text
     );

@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use crate::{
@@ -11,7 +12,8 @@ use crate::{
     error::{OmegaError, Result},
     indexer::Indexer,
     model::{Answer, AppStatus, ConceptSummary, IndexReport, SearchHit, SourceSummary},
-    parser::LocalDocumentParser,
+    ocr::{CachedOcr, SystemOcr},
+    parser::{DocumentParser, LocalDocumentParser},
     tools::ToolEngine,
 };
 
@@ -25,6 +27,12 @@ pub struct OmegaEngine {
     /// Memoria de conversación en proceso. No se persiste: cerrar la
     /// aplicación borra todo contexto.
     conversations: ConversationMemory,
+    /// Parser de documentos. Es un parámetro del motor —y no una constante
+    /// escondida— porque el proveedor OCR local es sustituible: así una
+    /// prueba puede fijar un estado OCR concreto sin depender del equipo que
+    /// la ejecuta, y otro proveedor local puede reemplazar a Vision sin tocar
+    /// el indexador.
+    parser: Arc<dyn DocumentParser>,
 }
 
 impl OmegaEngine {
@@ -34,21 +42,53 @@ impl OmegaEngine {
 
     pub fn open_with_clock(path: impl AsRef<Path>, clock: Clock) -> Result<Self> {
         let database = Database::open(path)?;
+        Self::from_database(database, clock)
+    }
+
+    /// Apertura de producción: conserva una SQLite dañada, restaura un
+    /// backup válido o crea una base limpia y publica el reporte resultante.
+    pub fn open_recovering(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_recovering_with_clock(path, Clock::System)
+    }
+
+    pub fn open_recovering_with_clock(path: impl AsRef<Path>, clock: Clock) -> Result<Self> {
+        let database = Database::open_recovering(path)?;
+        Self::from_database(database, clock)
+    }
+
+    fn from_database(database: Database, clock: Clock) -> Result<Self> {
         let tools = ToolEngine::new(database.clone());
+        // El OCR del sistema va envuelto en su caché por contenido: reindexar
+        // no debe volver a correr Vision sobre imágenes que ya se leyeron. La
+        // caché vive en la misma base que el índice, así que se borra y se
+        // respalda con él.
+        let parser = LocalDocumentParser::with_ocr(Arc::new(CachedOcr::new(
+            SystemOcr,
+            database.clone(),
+        )));
         Ok(Self {
             database,
             tools,
             clock,
             conversations: ConversationMemory::default(),
+            parser: Arc::new(parser),
         })
     }
 
+    /// Sustituye el parser local. El proveedor debe seguir siendo local: no
+    /// se admite ninguno que envíe el documento por red.
+    pub fn with_parser(mut self, parser: Arc<dyn DocumentParser>) -> Self {
+        self.parser = parser;
+        self
+    }
+
     pub fn authorize_source(&self, path: &Path) -> Result<i64> {
-        Indexer::new(&self.database, &LocalDocumentParser).authorize(path)
+        Indexer::new(&self.database, self.parser.as_ref()).authorize(path)
     }
 
     pub fn index_source(&self, source_id: i64) -> Result<IndexReport> {
-        let report = Indexer::new(&self.database, &LocalDocumentParser).index_source(source_id)?;
+        let report =
+            Indexer::new(&self.database, self.parser.as_ref()).index_source(source_id)?;
         // Reindexar reasigna los identificadores internos y regenera la
         // evidencia. El predicado de cada conversación sobrevive —se reevalúa
         // contra el índice nuevo—, pero la evidencia ya citada se descarta para
@@ -119,6 +159,10 @@ impl OmegaEngine {
 
     pub fn database_path(&self) -> PathBuf {
         self.database.path().to_path_buf()
+    }
+
+    pub fn recovery_report(&self) -> Option<&crate::RecoveryReport> {
+        self.database.recovery_report()
     }
 }
 

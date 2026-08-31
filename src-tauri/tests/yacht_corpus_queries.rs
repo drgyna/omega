@@ -127,16 +127,19 @@ fn universal_local_engine_answers_the_yacht_acceptance_matrix() {
     // no conteos de documentos ni sumas entre etiquetas monetarias distintas.
     for (question, expected) in [
         (
+            // El corpus nunca escribe un código de moneda junto al importe:
+            // «en MXN» es la intención del usuario, no un dato del acervo, así
+            // que el motor ya no puede confirmar esa moneda sin inventarla.
             "Suma el campo Total facturado de todas las facturas en MXN.",
-            ["$5,585,748.00 MXN", "45 valores"],
+            ["5,585,748.00", "45 valores"],
         ),
         (
             "Suma el campo Precio de lista de todos los expedientes de venta en MXN.",
-            ["$1,273,950,000.00 MXN", "100 valores"],
+            ["1,273,950,000.00", "100 valores"],
         ),
         (
             "Suma el campo Tarifa contratada de todas las reservas en MXN.",
-            ["$15,089,550.00 MXN", "140 valores"],
+            ["15,089,550.00", "140 valores"],
         ),
         (
             "¿Cuántos valores tiene el campo Anticipo recibido?",

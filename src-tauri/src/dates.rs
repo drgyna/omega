@@ -204,6 +204,20 @@ const MONTH_ROOTS: [(&str, u32); 13] = [
     ("diciembre", 12),
 ];
 
+/// La fecha escrita como la escribe el acervo: «11 de octubre de 2024».
+///
+/// Reutiliza la misma tabla de meses con la que se leen las fechas, para que
+/// escribir y leer no puedan discrepar. `MONTH_ROOTS` tiene dos entradas para
+/// septiembre; `find` devuelve la primera, que es la forma plena.
+pub fn spanish_long_date(date: CivilDate) -> String {
+    let month = MONTH_ROOTS
+        .iter()
+        .find(|(_, number)| *number == date.month)
+        .map(|(name, _)| *name)
+        .unwrap_or("");
+    format!("{:02} de {month} de {}", date.day, date.year)
+}
+
 /// Señales de que la pregunta habla de un periodo anterior al del contexto.
 pub fn asks_for_previous_period(question: &str) -> bool {
     let normalized = normalize_exact(question);

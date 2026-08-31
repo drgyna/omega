@@ -65,6 +65,11 @@ pub struct ComputationMemory {
     pub rendered: String,
     pub value_count: usize,
     pub evidence: Vec<Evidence>,
+    /// Alguno de los operandos del cálculo venía de OCR de baja confianza.
+    /// Es indispensable guardarlo aparte: `evidence` se recorta a
+    /// `MAX_REMEMBERED_EVIDENCE`, así que el operando débil puede no estar
+    /// entre los recordados y la señal se perdería justo en la continuación.
+    pub has_unreliable_evidence: bool,
 }
 
 impl ComputationMemory {
@@ -74,6 +79,7 @@ impl ComputationMemory {
         rendered: String,
         value_count: usize,
         evidence: Vec<Evidence>,
+        has_unreliable_evidence: bool,
     ) -> Self {
         Self {
             operation: operation.to_owned(),
@@ -81,6 +87,7 @@ impl ComputationMemory {
             rendered,
             value_count,
             evidence: evidence.into_iter().take(MAX_REMEMBERED_EVIDENCE).collect(),
+            has_unreliable_evidence,
         }
     }
 }
@@ -164,6 +171,15 @@ pub struct ConversationState {
     /// Última comparación entre dos grupos o periodos, para poder responder
     /// «¿cuál es la diferencia?» sin recalcular ni volver a preguntar.
     pub comparison: Option<ComparisonMemory>,
+    /// Documento del que habló la respuesta anterior, cuando fue exactamente
+    /// uno: lo que «ese documento» señala en la continuación siguiente.
+    ///
+    /// Se guarda por su **ruta** y no por su identificador de fila, por la
+    /// misma razón por la que el conjunto se guarda como predicado: reindexar
+    /// reasigna los rowid, y entonces el mismo número apuntaría a otro
+    /// archivo. La ruta sigue siendo el mismo archivo, y si desaparece del
+    /// índice la referencia deja de resolver — que es lo correcto.
+    pub document: Option<String>,
 }
 
 /// Comparación ya calculada, con sus dos lados y su evidencia.
@@ -176,6 +192,11 @@ pub struct ComparisonMemory {
     pub left: Option<ComparisonSide>,
     pub right: Option<ComparisonSide>,
     pub evidence: Vec<Evidence>,
+    /// Alguno de los operandos que produjeron esta comparación venía de OCR
+    /// de baja confianza. Se guarda con la comparación porque `evidence` sólo
+    /// contiene la muestra visible: una continuación («¿cuál es la
+    /// diferencia?») no puede recuperar esa señal mirando las citas.
+    pub has_unreliable_evidence: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +215,7 @@ impl ConversationState {
             || self.last_result.is_some()
             || self.identifier.is_some()
             || self.comparison.is_some()
+            || self.document.is_some()
     }
 }
 
@@ -323,6 +345,103 @@ pub fn reference_in(question: &str) -> Reference {
     }
 }
 
+/// Posición dentro del conjunto que el turno anterior dejó delante, nombrada
+/// por un ordinal («el primero», «la última», «el primer documento»).
+///
+/// No es un deíctico ni una operación: es una forma más de aludir al turno
+/// anterior, y como las demás sólo significa algo cuando la conversación ya
+/// tiene un conjunto. Sin contexto no se adivina nada — quien la consulta
+/// comprueba el contexto antes de usarla.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrdinalPosition {
+    /// Índice contado desde el principio, empezando en 0.
+    Nth(usize),
+    /// El último del conjunto, cualquiera que sea su tamaño.
+    Last,
+}
+
+/// Ordinales del español, con la posición que nombran. La lista se detiene en
+/// el quinto a propósito: más allá nadie cuenta de memoria, y el usuario
+/// escribe el dato que busca en vez de su posición.
+const ORDINAL_WORDS: &[(&str, usize)] = &[
+    ("primero", 0),
+    ("primer", 0),
+    ("primera", 0),
+    ("segundo", 1),
+    ("segunda", 1),
+    ("tercero", 2),
+    ("tercer", 2),
+    ("tercera", 2),
+    ("cuarto", 3),
+    ("cuarta", 3),
+    ("quinto", 4),
+    ("quinta", 4),
+];
+
+const LAST_WORDS: &[&str] = &["ultimo", "ultima"];
+
+/// Sustantivos genéricos de continente que un ordinal puede modificar sin
+/// dejar de señalar una posición del resultado anterior («el primer
+/// documento»). No nombran ningún giro de negocio.
+const ORDINAL_HEADS: &[&str] = &[
+    "documento",
+    "documentos",
+    "archivo",
+    "archivos",
+    "expediente",
+    "expedientes",
+    "registro",
+    "registros",
+    "resultado",
+    "resultados",
+];
+
+/// Palabras de calendario que un ordinal describe en vez de señalar una
+/// posición: «el primer trimestre» es un periodo, no el primer documento.
+const ORDINAL_CALENDAR: &[&str] = &[
+    "trimestre",
+    "semestre",
+    "mes",
+    "ano",
+    "dia",
+    "semana",
+    "bimestre",
+    "cuatrimestre",
+];
+
+/// Posición ordinal que la pregunta señala del resultado anterior.
+///
+/// Deliberadamente literal, igual que `reference_in`: sólo se reconoce el
+/// ordinal **nominalizado** —el que no modifica a ningún sustantivo, «¿cuál es
+/// el Responsable del primero?»— y el que modifica a un continente genérico
+/// («el primer documento»). Un ordinal pegado a cualquier otro sustantivo
+/// describe ese sustantivo y no se toca: «el primer trimestre» sigue siendo un
+/// periodo.
+pub fn ordinal_position_in(question: &str) -> Option<OrdinalPosition> {
+    let normalized = normalize_exact(question);
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    words.iter().enumerate().find_map(|(index, word)| {
+        let position = if LAST_WORDS.contains(word) {
+            OrdinalPosition::Last
+        } else {
+            OrdinalPosition::Nth(
+                ORDINAL_WORDS
+                    .iter()
+                    .find_map(|(name, at)| (name == word).then_some(*at))?,
+            )
+        };
+        match words.get(index + 1) {
+            // Ordinal nominalizado: no modifica a nada, así que sólo puede
+            // señalar una posición de lo que ya está delante.
+            None => Some(position),
+            Some(next) if ORDINAL_HEADS.contains(next) => Some(position),
+            Some(next) if ORDINAL_CALENDAR.contains(next) => None,
+            // Cualquier otro sustantivo: el ordinal lo describe a él.
+            Some(_) => None,
+        }
+    })
+}
+
 fn is_clitic_reference(word: &str) -> bool {
     let stem = ["los", "las", "lo", "la"]
         .iter()
@@ -396,6 +515,36 @@ mod tests {
         assert!(memory.state("c1").concept.is_none());
         // Otra conversación nunca ve el estado de la primera.
         assert!(memory.state("c2").concept.is_none());
+    }
+
+    #[test]
+    fn a_nominalized_ordinal_points_at_a_position_of_the_previous_set() {
+        assert_eq!(
+            ordinal_position_in("¿Cuál es el Responsable del primero?"),
+            Some(OrdinalPosition::Nth(0))
+        );
+        assert_eq!(
+            ordinal_position_in("¿y el segundo?"),
+            Some(OrdinalPosition::Nth(1))
+        );
+        assert_eq!(
+            ordinal_position_in("dame el último"),
+            Some(OrdinalPosition::Last)
+        );
+        // Modificando un continente genérico sigue siendo una posición.
+        assert_eq!(
+            ordinal_position_in("¿cuál es el Folio del primer documento?"),
+            Some(OrdinalPosition::Nth(0))
+        );
+    }
+
+    #[test]
+    fn an_ordinal_that_describes_another_noun_is_not_a_reference() {
+        // Calendario: nombra un periodo, no una posición.
+        assert_eq!(ordinal_position_in("¿cuánto se gastó en el primer trimestre?"), None);
+        assert_eq!(ordinal_position_in("el segundo semestre de 2024"), None);
+        // Cualquier otro sustantivo: el ordinal lo describe a él.
+        assert_eq!(ordinal_position_in("¿cuál es el primer proveedor de la lista de compras?"), None);
     }
 
     #[test]

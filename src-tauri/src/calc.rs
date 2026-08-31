@@ -37,6 +37,47 @@ impl Decimal {
         (scaled.abs() < 9.0e30).then(|| Self(scaled as i128))
     }
 
+    /// Convierte el literal extraído sin pasar por `f64`. Los operandos de
+    /// producción conservan el texto original, por lo que una suma de 0.10 y
+    /// 0.20 se representa exactamente como 0.30.
+    pub fn from_text(value: &str) -> Option<Self> {
+        let mut value = value.trim();
+        let mut negative = false;
+        if let Some(rest) = value.strip_prefix('-') {
+            negative = true;
+            value = rest.trim_start();
+        }
+        if let Some(symbol) = value.chars().next().filter(|symbol| {
+            matches!(symbol, '$' | '€' | '£' | '¥' | '₹' | '₩')
+        }) {
+            value = value.strip_prefix(symbol).expect("checked symbol").trim_start();
+        }
+        if let Some(rest) = value.strip_prefix('-') {
+            if negative {
+                return None;
+            }
+            negative = true;
+            value = rest.trim_start();
+        }
+        value = value.strip_suffix('%').unwrap_or(value).trim();
+        value = value.trim_end_matches(|character: char| {
+            character.is_ascii_alphabetic() || character.is_whitespace()
+        });
+        let value = value.replace(',', "");
+        let (whole, fraction) = value.split_once('.').unwrap_or((&value, ""));
+        if whole.is_empty()
+            || !whole.chars().all(|character| character.is_ascii_digit())
+            || !fraction.chars().all(|character| character.is_ascii_digit())
+            || fraction.len() > 4
+        {
+            return None;
+        }
+        let whole = whole.parse::<i128>().ok()?;
+        let fraction = format!("{fraction:0<4}").parse::<i128>().ok()?;
+        let raw = whole.checked_mul(SCALE)?.checked_add(fraction)?;
+        Some(Self(if negative { -raw } else { raw }))
+    }
+
     /// Representación interna, para guardar una cantidad en el contexto sin
     /// perder precisión y reconstruirla después.
     pub fn raw(self) -> i128 {
@@ -220,6 +261,10 @@ pub struct Bucket {
     pub value_count: usize,
     pub document_ids: BTreeSet<i64>,
     pub evidence: Vec<Evidence>,
+    /// Se conserva aunque la evidencia concreta quede fuera de la muestra
+    /// visible. La verificación nunca depende de que el operando débil haya
+    /// cabido entre las primeras citas.
+    pub has_unreliable_evidence: bool,
 }
 
 const MAX_BUCKET_EVIDENCE: usize = 50;
@@ -232,7 +277,22 @@ const MAX_BUCKET_EVIDENCE: usize = 50;
 pub fn compute(operation: Operation, operands: &[Operand]) -> Vec<Bucket> {
     let mut buckets: BTreeMap<(Option<String>, Option<String>), Bucket> = BTreeMap::new();
     for operand in operands {
-        let amount = match operand.numeric.and_then(Decimal::from_f64) {
+        let exact_amount = operand
+            .evidence
+            .value
+            .as_deref()
+            .and_then(Decimal::from_text);
+        // La ruta de producción siempre adjunta el literal extraído y por eso
+        // no pasa por `f64`. El respaldo sólo conserva las fixtures internas
+        // antiguas, que construyen operandos sintéticos sin texto fuente.
+        let amount = match exact_amount.or_else(|| {
+            operand
+                .evidence
+                .value
+                .is_none()
+                .then(|| operand.numeric.and_then(Decimal::from_f64))
+                .flatten()
+        }) {
             Some(value) => Some(value),
             None if operation.needs_numbers() => continue,
             None => None,
@@ -250,6 +310,7 @@ pub fn compute(operation: Operation, operands: &[Operand]) -> Vec<Bucket> {
             value_count: 0,
             document_ids: BTreeSet::new(),
             evidence: Vec::new(),
+            has_unreliable_evidence: false,
         });
         match (operation, amount) {
             (Operation::Sum | Operation::Average, Some(value)) => {
@@ -272,6 +333,7 @@ pub fn compute(operation: Operation, operands: &[Operand]) -> Vec<Bucket> {
         }
         bucket.value_count += 1;
         bucket.document_ids.insert(operand.document_id);
+        bucket.has_unreliable_evidence |= !operand.evidence.reliable;
         if bucket.evidence.len() < MAX_BUCKET_EVIDENCE {
             bucket.evidence.push(operand.evidence.clone());
         }
@@ -340,6 +402,18 @@ impl RowOperation {
         }
     }
 
+    /// Nombre de la operación con el que se encabeza el resultado. Nunca es
+    /// «Suma»: una multiplicación fila por fila cuyos productos se acumulan
+    /// sigue siendo una multiplicación, y llamarla suma describía mal lo que
+    /// el motor hizo.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Subtract => "Resta",
+            Self::Multiply => "Multiplicación",
+            Self::Divide => "División",
+        }
+    }
+
     pub fn symbol(self) -> &'static str {
         match self {
             Self::Subtract => "−",
@@ -353,6 +427,10 @@ impl RowOperation {
 /// tenían un valor numérico y unidades compatibles.
 #[derive(Clone, Debug)]
 pub struct RowOutcome {
+    // No lo lee el código de producción (agent.rs trabaja con los conteos
+    // agregados), pero las pruebas de este módulo lo usan para comprobar que
+    // el documento correcto produjo el resultado correcto.
+    #[allow(dead_code)]
     pub document_id: i64,
     pub value: Decimal,
     pub currency: Option<String>,
@@ -371,14 +449,79 @@ pub enum RowIssue {
     /// Las unidades de los dos campos no pueden combinarse con esta
     /// operación (por ejemplo, restar dos monedas distintas).
     IncompatibleUnits,
+    /// El documento tenía los dos campos, pero al menos uno de los dos no
+    /// pudo leerse como un número (por ejemplo, «N/A» en un campo que en
+    /// otros documentos sí trae una cifra). No es lo mismo que un campo
+    /// ausente: el campo está, su valor no sirve.
+    InvalidValue,
 }
 
 #[derive(Clone, Debug)]
 pub struct RowSkip {
+    #[allow(dead_code)]
     pub document_id: i64,
     pub issue: RowIssue,
     pub left_evidence: Evidence,
     pub right_evidence: Evidence,
+}
+
+/// Clasificación de **todos** los documentos del alcance en categorías
+/// mutuamente excluyentes.
+///
+/// El invariante que sostiene la respuesta es
+/// `scope_documents == calculated + excluded()`: ningún documento del alcance
+/// puede quedar sin explicación. Antes faltaba precisamente la categoría
+/// `neither_field`: un documento sin ninguno de los dos campos no aparece en
+/// `left` ni en `right`, así que era invisible para el cálculo y se esfumaba
+/// de la cuenta — el alcance decía 600, los calculados 140, y los 460
+/// restantes no se mencionaban en ninguna parte.
+///
+/// Se cuenta por documento, no por operando: un documento con dos valores del
+/// mismo campo produce dos resultados, pero sigue siendo un solo documento del
+/// alcance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowScopeBreakdown {
+    /// Documentos que el filtro de la pregunta dejó en el alcance.
+    pub scope_documents: usize,
+    /// Documentos que produjeron al menos un resultado.
+    pub calculated: usize,
+    /// Tenían los dos campos, pero al menos uno no era un número utilizable.
+    pub invalid_value: usize,
+    /// Tenían los dos campos, con unidades que no pueden combinarse.
+    pub incompatible_units: usize,
+    /// Tenían los dos campos, pero el divisor era exactamente cero.
+    pub division_by_zero: usize,
+    /// Tenían exactamente uno de los dos campos.
+    pub one_field_only: usize,
+    /// No tenían ninguno de los dos campos.
+    pub neither_field: usize,
+}
+
+impl RowScopeBreakdown {
+    /// Todos los documentos del alcance que no produjeron una cifra, por
+    /// cualquiera de las razones anteriores.
+    pub fn excluded(&self) -> usize {
+        self.invalid_value
+            + self.incompatible_units
+            + self.division_by_zero
+            + self.one_field_only
+            + self.neither_field
+    }
+
+    /// El invariante: cada documento del alcance cae en exactamente una
+    /// categoría. `compute_row` lo construye recorriendo el alcance completo,
+    /// así que se cumple por construcción; las pruebas lo comprueban para que
+    /// no deje de cumplirse si alguien cambia la clasificación.
+    pub fn is_exhaustive(&self) -> bool {
+        self.calculated + self.excluded() == self.scope_documents
+    }
+}
+
+/// A qué categoría pertenece un documento que sí tenía los dos campos.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowCategory {
+    Calculated,
+    Excluded(RowIssue),
 }
 
 /// Resultado completo de combinar dos campos documento por documento.
@@ -386,9 +529,11 @@ pub struct RowSkip {
 pub struct RowComputation {
     pub outcomes: Vec<RowOutcome>,
     pub skipped: Vec<RowSkip>,
-    /// Documentos que tenían uno de los dos campos pero no el otro: no
-    /// participan y no se sustituyen por cero.
-    pub unmatched_documents: usize,
+    /// Cómo se reparte el alcance completo entre calculados y excluidos.
+    pub breakdown: RowScopeBreakdown,
+    /// Igual que en `Bucket`, representa todos los operandos usados, no sólo
+    /// la ventana de citas que se devuelve al usuario.
+    pub has_unreliable_evidence: bool,
 }
 
 /// Decide la unidad resultante de combinar dos campos, o rechaza la
@@ -431,23 +576,45 @@ fn combined_currency(
 /// Combina dos campos documento por documento. Empareja por `document_id`:
 /// un documento que sólo tiene uno de los dos campos no participa y no se le
 /// inventa un cero para el que falta.
-pub fn compute_row(operation: RowOperation, left: &[Operand], right: &[Operand]) -> RowComputation {
+///
+/// `scope_documents` es el alcance completo de la pregunta —no sólo los
+/// documentos que traen alguno de los dos campos—, porque es la única forma
+/// de contar los que no traen ninguno: esos no aparecen en `left` ni en
+/// `right` y, sin el alcance, serían invisibles para el cálculo.
+pub fn compute_row(
+    operation: RowOperation,
+    left: &[Operand],
+    right: &[Operand],
+    scope_documents: &[i64],
+) -> RowComputation {
     let mut right_by_document: BTreeMap<i64, &Operand> = BTreeMap::new();
     for operand in right {
         right_by_document.entry(operand.document_id).or_insert(operand);
     }
     let mut outcomes = Vec::new();
     let mut skipped = Vec::new();
-    let mut paired = BTreeSet::new();
+    let mut has_unreliable_evidence = false;
     for candidate in left {
         let Some(other) = right_by_document.get(&candidate.document_id) else {
             continue;
         };
-        paired.insert(candidate.document_id);
+        has_unreliable_evidence |= !candidate.evidence.reliable || !other.evidence.reliable;
         let (Some(left_value), Some(right_value)) = (
             candidate.numeric.and_then(Decimal::from_f64),
             other.numeric.and_then(Decimal::from_f64),
         ) else {
+            // Los dos campos están presentes, pero al menos uno no es un
+            // número utilizable: se cuenta y se explica, igual que una
+            // unidad incompatible o una división entre cero. Descartarlo en
+            // silencio dejaría un documento que sí se examinó fuera de las
+            // tres cuentas (calculado, incompatible, sin un campo) que la
+            // respuesta declara.
+            skipped.push(RowSkip {
+                document_id: candidate.document_id,
+                issue: RowIssue::InvalidValue,
+                left_evidence: candidate.evidence.clone(),
+                right_evidence: other.evidence.clone(),
+            });
             continue;
         };
         match combined_currency(operation, candidate.currency.as_deref(), other.currency.as_deref()) {
@@ -486,19 +653,64 @@ pub fn compute_row(operation: RowOperation, left: &[Operand], right: &[Operand])
     }
     let left_documents = left.iter().map(|o| o.document_id).collect::<BTreeSet<_>>();
     let right_documents = right.iter().map(|o| o.document_id).collect::<BTreeSet<_>>();
-    let unmatched_documents = left_documents
-        .symmetric_difference(&right_documents)
-        .filter(|id| !paired.contains(id))
-        .count();
+
+    // Categoría de cada documento que sí tenía los dos campos. Un documento
+    // que produjo al menos un resultado cuenta como calculado aunque otro de
+    // sus valores se haya descartado: la cifra publicada sí lo incluye.
+    let mut category: BTreeMap<i64, RowCategory> = BTreeMap::new();
+    for outcome in &outcomes {
+        category.insert(outcome.document_id, RowCategory::Calculated);
+    }
+    for skip in &skipped {
+        category
+            .entry(skip.document_id)
+            .or_insert(RowCategory::Excluded(skip.issue));
+    }
+
+    // Recorre el alcance completo, no las listas de operandos: así cada
+    // documento cae en exactamente una categoría y el invariante
+    // `alcance == calculados + excluidos` se cumple por construcción.
+    let scope = scope_documents.iter().copied().collect::<BTreeSet<_>>();
+    let mut breakdown = RowScopeBreakdown {
+        scope_documents: scope.len(),
+        ..RowScopeBreakdown::default()
+    };
+    for id in &scope {
+        match category.get(id) {
+            Some(RowCategory::Calculated) => breakdown.calculated += 1,
+            Some(RowCategory::Excluded(RowIssue::DivisionByZero)) => {
+                breakdown.division_by_zero += 1
+            }
+            Some(RowCategory::Excluded(RowIssue::IncompatibleUnits)) => {
+                breakdown.incompatible_units += 1
+            }
+            Some(RowCategory::Excluded(RowIssue::InvalidValue)) => breakdown.invalid_value += 1,
+            None => {
+                if left_documents.contains(id) || right_documents.contains(id) {
+                    breakdown.one_field_only += 1;
+                } else {
+                    breakdown.neither_field += 1;
+                }
+            }
+        }
+    }
+
     RowComputation {
         outcomes,
         skipped,
-        unmatched_documents,
+        breakdown,
+        has_unreliable_evidence,
     }
 }
 
 /// Formato de una cantidad con su moneda. Sin moneda no se antepone el símbolo:
 /// un número que no es dinero no debe presentarse como si lo fuera.
+///
+/// El código siempre se muestra tal como está en el acervo: es la única
+/// etiqueta fiable. El símbolo es sólo un adorno adicional para las monedas
+/// cuyo símbolo es inequívoco (un «$» sirve para USD y para MXN a la vez, así
+/// que nunca sustituye al código); una moneda sin símbolo conocido se muestra
+/// con su código y sin inventar un signo que no le corresponde.
 pub fn render_amount(value: Decimal, currency: Option<&str>) -> String {
     match currency {
         // Una cantidad monetaria derivada se presenta siempre con sus
@@ -506,12 +718,28 @@ pub fn render_amount(value: Decimal, currency: Option<&str>) -> String {
         // forma deja claro que el cálculo llegó hasta el último decimal.
         Some(code) => {
             let rendered = value.render_money();
+            let symbol = currency_symbol(code).unwrap_or("");
             match rendered.strip_prefix('-') {
-                Some(magnitude) => format!("-${magnitude} {code}"),
-                None => format!("${rendered} {code}"),
+                Some(magnitude) => format!("-{symbol}{magnitude} {code}"),
+                None => format!("{symbol}{rendered} {code}"),
             }
         }
         None => value.render(),
+    }
+}
+
+/// Símbolo inequívoco de un código de moneda ISO conocido. `None` para
+/// cualquier código que el motor no reconozca: mostrar el código solo es
+/// preferible a adivinar un símbolo que podría ser el de otra moneda.
+fn currency_symbol(code: &str) -> Option<&'static str> {
+    match code.to_ascii_uppercase().as_str() {
+        "USD" | "MXN" | "CAD" | "AUD" | "NZD" | "HKD" | "SGD" | "ARS" | "CLP" | "COP" => Some("$"),
+        "EUR" => Some("€"),
+        "GBP" => Some("£"),
+        "JPY" | "CNY" => Some("¥"),
+        "INR" => Some("₹"),
+        "KRW" => Some("₩"),
+        _ => None,
     }
 }
 
@@ -558,6 +786,29 @@ mod tests {
             "-20"
         );
         assert_eq!(Decimal::percent_change(Decimal::ZERO, to), None);
+    }
+
+    #[test]
+    fn render_amount_shows_the_real_code_instead_of_a_fixed_dollar_sign() {
+        let value = Decimal::from_f64(1_200.0).unwrap();
+        assert_eq!(render_amount(value, Some("MXN")), "$1,200.00 MXN");
+        assert_eq!(render_amount(value, Some("USD")), "$1,200.00 USD");
+        // El euro no usa «$»: inventar el signo del dólar sería mostrar una
+        // moneda distinta de la que dice el código.
+        assert_eq!(render_amount(value, Some("EUR")), "€1,200.00 EUR");
+        // Un código sin símbolo conocido en el motor se muestra tal cual,
+        // sin inventar ningún signo.
+        assert_eq!(render_amount(value, Some("CHF")), "1,200.00 CHF");
+        // Sin moneda, el número no se presenta como si fuera dinero.
+        assert_eq!(render_amount(value, None), "1,200");
+    }
+
+    #[test]
+    fn render_amount_never_invents_mxn_for_an_unknown_currency() {
+        let value = Decimal::from_f64(50.0).unwrap();
+        let rendered = render_amount(value, None);
+        assert!(!rendered.contains("MXN"));
+        assert_eq!(rendered, "50");
     }
 
     #[test]
@@ -611,6 +862,7 @@ mod tests {
             value_count: 1,
             document_ids: BTreeSet::from([1]),
             evidence: vec![sample_evidence(1)],
+            has_unreliable_evidence: false,
         };
         // Campo A: una sola moneda, con datos.
         let campo_a = ("Campo A".to_owned(), vec![with_data("MXN", 500.0)]);
@@ -646,9 +898,12 @@ mod tests {
             .map(|(id, amount)| row_operand(id, amount, None));
         let precio = [(1, 125.0), (2, 150.0), (3, 10.0)]
             .map(|(id, amount)| row_operand(id, amount, Some("MXN")));
-        let result = compute_row(RowOperation::Multiply, &cantidad, &precio);
+        let result = compute_row(RowOperation::Multiply, &cantidad, &precio, &[1, 2, 3]);
         assert!(result.skipped.is_empty());
-        assert_eq!(result.unmatched_documents, 0);
+        assert_eq!(result.breakdown.one_field_only, 0);
+        assert_eq!(result.breakdown.neither_field, 0);
+        assert_eq!(result.breakdown.calculated, 3);
+        assert!(result.breakdown.is_exhaustive());
         assert_eq!(result.outcomes.len(), 3);
         let by_document = result
             .outcomes
@@ -672,36 +927,132 @@ mod tests {
     fn subtracting_two_fields_requires_the_same_currency() {
         let monto_a = [row_operand(1, 500.0, Some("MXN")), row_operand(2, 700.0, Some("MXN"))];
         let monto_b_same = [row_operand(1, 100.0, Some("MXN"))];
-        let ok = compute_row(RowOperation::Subtract, &monto_a, &monto_b_same);
+        let ok = compute_row(RowOperation::Subtract, &monto_a, &monto_b_same, &[1, 2]);
         assert_eq!(ok.outcomes.len(), 1);
         assert_eq!(ok.outcomes[0].value.render(), "400");
-        assert_eq!(ok.unmatched_documents, 1, "el documento 2 no tenía Monto B");
+        assert_eq!(
+            ok.breakdown.one_field_only, 1,
+            "el documento 2 no tenía Monto B"
+        );
+        assert!(ok.breakdown.is_exhaustive());
 
         let monto_b_other_currency = [row_operand(1, 100.0, Some("USD"))];
-        let incompatible = compute_row(RowOperation::Subtract, &monto_a, &monto_b_other_currency);
+        let incompatible = compute_row(
+            RowOperation::Subtract,
+            &monto_a,
+            &monto_b_other_currency,
+            &[1, 2],
+        );
         assert!(incompatible.outcomes.is_empty());
         assert_eq!(incompatible.skipped.len(), 1);
         assert_eq!(incompatible.skipped[0].issue, RowIssue::IncompatibleUnits);
+        assert_eq!(incompatible.breakdown.incompatible_units, 1);
+        assert!(incompatible.breakdown.is_exhaustive());
     }
 
     #[test]
     fn dividing_two_fields_never_produces_zero_or_infinity_on_a_zero_divisor() {
         let dividend = [row_operand(1, 100.0, None), row_operand(2, 50.0, None)];
         let divisor = [row_operand(1, 4.0, None), row_operand(2, 0.0, None)];
-        let result = compute_row(RowOperation::Divide, &dividend, &divisor);
+        let result = compute_row(RowOperation::Divide, &dividend, &divisor, &[1, 2]);
         assert_eq!(result.outcomes.len(), 1);
         assert_eq!(result.outcomes[0].document_id, 1);
         assert_eq!(result.outcomes[0].value.render(), "25");
         assert_eq!(result.skipped.len(), 1);
         assert_eq!(result.skipped[0].document_id, 2);
         assert_eq!(result.skipped[0].issue, RowIssue::DivisionByZero);
+        assert_eq!(result.breakdown.division_by_zero, 1);
+        assert!(result.breakdown.is_exhaustive());
+    }
+
+    #[test]
+    fn a_document_with_both_fields_but_a_non_numeric_value_is_tracked_not_dropped() {
+        // Documento 2 tiene los dos campos, pero «Cantidad» llegó como texto
+        // no numérico («N/A»): antes desaparecía de outcomes, skipped y
+        // unmatched_documents a la vez, y el total de documentos examinados
+        // no cuadraba con lo que la respuesta afirmaba haber revisado.
+        let invalid_left = Operand {
+            document_id: 2,
+            numeric: None,
+            currency: None,
+            group: None,
+            evidence: sample_evidence(2),
+        };
+        let cantidad = [row_operand(1, 4.0, None), invalid_left];
+        let precio = [row_operand(1, 125.0, Some("MXN")), row_operand(2, 10.0, Some("MXN"))];
+        let result = compute_row(RowOperation::Multiply, &cantidad, &precio, &[1, 2]);
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.outcomes[0].document_id, 1);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].document_id, 2);
+        assert_eq!(result.skipped[0].issue, RowIssue::InvalidValue);
+        assert_eq!(
+            result.breakdown.one_field_only, 0,
+            "el documento 2 sí tenía los dos campos: no es lo mismo que un campo ausente"
+        );
+        assert_eq!(result.breakdown.invalid_value, 1);
+        assert!(result.breakdown.is_exhaustive());
+    }
+
+    /// El caso que se escapaba: documentos del alcance que no traen NINGUNO
+    /// de los dos campos. No aparecen en `left` ni en `right`, así que antes
+    /// no se contaban en ninguna categoría y la respuesta podía declarar
+    /// 600 documentos de alcance, 140 calculados y ninguna explicación para
+    /// los 460 restantes — presentándose además como verificada.
+    #[test]
+    fn documents_with_neither_field_are_counted_instead_of_vanishing() {
+        let cantidad = [row_operand(1, 4.0, None), row_operand(2, 2.0, None)];
+        let precio = [
+            row_operand(1, 125.0, Some("MXN")),
+            row_operand(2, 150.0, Some("MXN")),
+        ];
+        // El alcance trae 6 documentos; sólo 2 tienen los dos campos, 1 tiene
+        // uno solo y 3 no tienen ninguno.
+        let with_one_field = [row_operand(3, 9.0, None)];
+        let cantidad_con_suelto = [cantidad[0].clone(), cantidad[1].clone(), with_one_field[0].clone()];
+        let result = compute_row(
+            RowOperation::Multiply,
+            &cantidad_con_suelto,
+            &precio,
+            &[1, 2, 3, 4, 5, 6],
+        );
+        assert_eq!(result.breakdown.scope_documents, 6);
+        assert_eq!(result.breakdown.calculated, 2);
+        assert_eq!(result.breakdown.one_field_only, 1, "el documento 3");
+        assert_eq!(
+            result.breakdown.neither_field, 3,
+            "los documentos 4, 5 y 6 no tienen ninguno de los dos campos"
+        );
+        assert_eq!(result.breakdown.excluded(), 4);
+        assert!(
+            result.breakdown.is_exhaustive(),
+            "6 = 2 calculados + 4 excluidos: {:?}",
+            result.breakdown
+        );
+    }
+
+    /// Un documento con dos valores del mismo campo produce dos resultados,
+    /// pero sigue siendo un solo documento del alcance: si el reparto contara
+    /// operandos en vez de documentos, el invariante se rompería.
+    #[test]
+    fn a_document_with_two_values_of_one_field_still_counts_once() {
+        let cantidad = [row_operand(1, 4.0, None), row_operand(1, 6.0, None)];
+        let precio = [row_operand(1, 10.0, Some("MXN"))];
+        let result = compute_row(RowOperation::Multiply, &cantidad, &precio, &[1, 2]);
+        assert_eq!(result.outcomes.len(), 2, "dos valores, dos productos");
+        assert_eq!(
+            result.breakdown.calculated, 1,
+            "pero un solo documento calculado"
+        );
+        assert_eq!(result.breakdown.neither_field, 1, "el documento 2");
+        assert!(result.breakdown.is_exhaustive());
     }
 
     #[test]
     fn dividing_money_by_money_of_the_same_currency_is_a_dimensionless_ratio() {
         let money = [row_operand(1, 500.0, Some("MXN"))];
         let other_money = [row_operand(1, 250.0, Some("MXN"))];
-        let result = compute_row(RowOperation::Divide, &money, &other_money);
+        let result = compute_row(RowOperation::Divide, &money, &other_money, &[1]);
         assert_eq!(result.outcomes[0].value.render(), "2");
         assert_eq!(result.outcomes[0].currency, None);
     }
@@ -720,6 +1071,8 @@ mod tests {
             field: None,
             match_kind: "campo".into(),
             reliable: true,
+            ocr_status: None,
+            ocr_confidence: None,
             confidence: None,
         }
     }

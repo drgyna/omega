@@ -11,17 +11,19 @@
 //! candado que verifica una respuesta del modelo.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::Path,
     sync::LazyLock,
 };
 
 use crate::{
+    calc::Decimal,
+    census,
     error::Result,
     extract::classify_value,
     model::{Evidence, SearchHit, TypedValue, ValueKind},
-    normalize::{normalize_exact, normalize_spanish, search_terms, stems_match},
-    tools::{DocumentValue, ToolEngine},
+    normalize::{normalize_exact, normalize_literal, normalize_spanish, search_terms, stems_match},
+    tools::{DocumentValue, SignRecord, ToolEngine},
     verifier::value_is_supported,
 };
 
@@ -129,6 +131,22 @@ pub struct Synthesis {
     /// explícitamente y la interfaz no marca la respuesta como verificada.
     pub verified: bool,
     pub citations: Vec<Evidence>,
+    /// Ruta del documento del que habla el texto, cuando habla de uno solo.
+    ///
+    /// No es lo mismo que «el documento de la primera cita»: la síntesis cita
+    /// todo lo que la búsqueda encontró —de varios archivos, casi siempre— y sólo
+    /// una de esas citas es la que sostiene la afirmación. Este campo nombra
+    /// esa, para que la conversación sepa a qué señala «ese documento» en el
+    /// turno siguiente. Vacío cuando el texto no habla de un documento
+    /// concreto: entonces no hay nada que señalar y no se adivina.
+    pub subject: Option<String>,
+}
+
+impl Synthesis {
+    fn about(mut self, path: &str) -> Self {
+        self.subject = Some(path.to_owned());
+        self
+    }
 }
 
 /// Redacta la evidencia ya encontrada. `None` significa que no hay un patrón
@@ -156,38 +174,169 @@ pub fn synthesize(
         // Una pregunta por los documentos relacionados habla del acervo, no de
         // un campo. Se responde con lo que la búsqueda ya encontró, sin leer
         // ningún documento.
-        if asks_for_related_documents(&terms) {
+        if asks_for_related_documents(question, &terms) {
             return Ok(related_documents_answer(text, hits));
         }
         if hits.len() <= MAX_PRINCIPAL_CANDIDATES {
             let documents = load_documents(tools, hits)?;
             if asks_for_summary(&terms) {
-                return Ok(summary_answer(&documents, canonical, text, hits));
+                return Ok(summary_answer(question, &documents, canonical, text, hits));
             }
             // El orden importa: cuando la pregunta pide un campo que la
             // evidencia encontrada no contiene, la síntesis directa
             // respondería con el identificador —el único campo que esos
             // documentos comparten— en lugar del dato pedido.
-            if let Some(synthesis) =
-                identified_field_answer(&documents, &terms, &type_words, canonical, text, hits)
-            {
+            if let Some(synthesis) = identified_field_answer(
+                tools, question, &documents, &terms, &type_words, canonical, text, hits,
+            )? {
                 return Ok(Some(synthesis));
             }
         }
     }
-    shared_field_answer(tools, &terms, &type_words, hits)
+    shared_field_answer(tools, question, &terms, &type_words, hits)
 }
 
 // -------------------------------------------------------------------------
 // Tipo A: la evidencia encontrada ya es la respuesta, sólo falta redactarla.
 // -------------------------------------------------------------------------
 
+/// Qué hacer cuando la pregunta pide, entrecomillado, un campo concreto.
+enum QuotedFieldOutcome {
+    /// La pregunta no pide ningún campo entrecomillado, o la evidencia
+    /// encontrada ya es la de ese campo: la ruta de siempre sigue igual.
+    NotApplicable,
+    Answered(Synthesis),
+    /// Se pide un campo que la evidencia no es. Contestar con lo encontrado
+    /// sería devolver otro campo en su lugar, así que esta ruta se corta.
+    NotTheFoundField,
+}
+
+/// El nombre de campo que la pregunta entrecomilla.
+///
+/// Dos señales, las dos explícitas: la palabra «campo» o «columna» justo
+/// antes de la cita, o una cita que coincide con el nombre de un campo real
+/// del acervo. Sin una de las dos, un texto entrecomillado es lo que siempre
+/// fue —algo que buscar— y esta ruta no se activa.
+fn quoted_field_name(tools: &ToolEngine, question: &str) -> Result<Option<String>> {
+    let quoted = ToolEngine::quoted_literals(question);
+    if quoted.is_empty() {
+        return Ok(None);
+    }
+    let words = question.split_whitespace().collect::<Vec<_>>();
+    let after_keyword = words
+        .iter()
+        .position(|word| matches!(normalize_exact(word).as_str(), "campo" | "columna"))
+        .and_then(|at| words.get(at + 1..).map(|rest| rest.join(" ")))
+        .unwrap_or_default();
+    let after_keyword = normalize_exact(&after_keyword);
+    if let Some(named) = quoted
+        .iter()
+        .find(|literal| after_keyword.starts_with(&normalize_exact(literal)))
+    {
+        return Ok(Some(named.clone()));
+    }
+    let concepts = tools.list_concepts(None)?;
+    Ok(quoted
+        .into_iter()
+        .find(|literal| {
+            concepts
+                .iter()
+                .any(|concept| normalize_exact(&concept.display_name) == normalize_exact(literal))
+        }))
+}
+
+/// El campo que la pregunta entrecomilla, leído del documento que la búsqueda
+/// encontró, cuando la evidencia encontrada NO es ese campo.
+///
+/// Esto arregla el «eco de folio»: «En el documento con folio INC-2025-00190
+/// (…), ¿cuál es el valor del campo "Fecha"?» encontraba el documento por el
+/// folio, y como todas las coincidencias eran del campo «INC», el atajo de un
+/// solo grupo de `shared_field_answer` las daba por buenas y contestaba «El
+/// campo «INC» … es INC-2025-00190»: le devolvía al usuario, presentado como
+/// dato extraído y verificado, el mismo folio que él acababa de escribir.
+///
+/// Cuando el documento sí registra el campo pedido, se contesta con él. Cuando
+/// no lo registra —o la evidencia abarca varios documentos y elegir uno sería
+/// adivinar— no se contesta nada por esta vía: es preferible el mensaje
+/// genérico de «no encontré evidencia» a una respuesta sobre otro campo.
+fn quoted_field_in_located_document(
+    tools: &ToolEngine,
+    question: &str,
+    hits: &[SearchHit],
+) -> Result<QuotedFieldOutcome> {
+    let Some(asked) = quoted_field_name(tools, question)? else {
+        return Ok(QuotedFieldOutcome::NotApplicable);
+    };
+    let already_that_field = hits.iter().any(|hit| {
+        field_value(hit)
+            .is_some_and(|(field, _)| normalize_exact(field) == normalize_exact(&asked))
+    });
+    if already_that_field {
+        return Ok(QuotedFieldOutcome::NotApplicable);
+    }
+    let documents = hits
+        .iter()
+        .map(|hit| hit.evidence.document_id)
+        .collect::<BTreeSet<_>>();
+    let [document] = documents.into_iter().collect::<Vec<_>>()[..] else {
+        return Ok(QuotedFieldOutcome::NotTheFoundField);
+    };
+    let values = tools.document_values(document)?;
+    let matching = values
+        .iter()
+        .filter(|value| normalize_exact(&value.field) == normalize_exact(&asked))
+        .collect::<Vec<_>>();
+    let Some(first) = matching.first() else {
+        return Ok(QuotedFieldOutcome::NotTheFoundField);
+    };
+    let field = first.field.clone();
+    let mut distinct: Vec<&str> = Vec::new();
+    for value in &matching {
+        if !distinct
+            .iter()
+            .any(|seen| normalize_exact(seen) == normalize_exact(&value.value))
+        {
+            distinct.push(value.value.as_str());
+        }
+    }
+    // Las citas son las de ese campo, no las de la búsqueda: la evidencia que
+    // sostiene la respuesta tiene que ser la del dato pedido.
+    let citations = matching
+        .iter()
+        .map(|value| value.evidence.clone())
+        .collect::<Vec<_>>();
+    let synthesis = if let [value] = distinct.as_slice() {
+        reported_value_synthesis(
+            tools,
+            &field,
+            value,
+            None,
+            &first.evidence,
+            &[field.clone(), (*value).to_owned()],
+            citations,
+        )?
+        .map(|synthesis| synthesis.about(&first.evidence.path))
+    } else {
+        value_list_summary(&field, &distinct, citations)
+    };
+    Ok(match synthesis {
+        Some(synthesis) => QuotedFieldOutcome::Answered(synthesis),
+        None => QuotedFieldOutcome::NotTheFoundField,
+    })
+}
+
 fn shared_field_answer(
     tools: &ToolEngine,
+    question: &str,
     terms: &[String],
     type_words: &[String],
     hits: &[SearchHit],
 ) -> Result<Option<Synthesis>> {
+    match quoted_field_in_located_document(tools, question, hits)? {
+        QuotedFieldOutcome::Answered(synthesis) => return Ok(Some(synthesis)),
+        QuotedFieldOutcome::NotTheFoundField => return Ok(None),
+        QuotedFieldOutcome::NotApplicable => {}
+    }
     // Un solo documento con el campo escrito de otra forma —el encabezado de
     // un CSV frente al de una ficha— no puede descartar todo el lote. Se agrupa
     // por nombre de campo y se sintetiza sobre un grupo, no sobre el conjunto.
@@ -220,7 +369,10 @@ fn shared_field_answer(
             .values()
             .filter_map(|group| field_value(&hits[group[0]]).map(|(field, _)| field.to_owned()))
             .collect::<Vec<_>>();
-        let resolved = match resolve_field(&vocabulary, terms, type_words) {
+        let resolved = match explicitly_quoted_field(question, &vocabulary)
+            .map(FieldMatch::Resolved)
+            .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words))
+        {
             FieldMatch::Resolved(name) => name,
             FieldMatch::NotRequested | FieldMatch::Ambiguous => return Ok(None),
         };
@@ -278,13 +430,16 @@ fn single_value_answer(
             citations.push(identifier.evidence.clone());
         }
     }
-    let text = direct_phrase(
+    Ok(reported_value_synthesis(
+        tools,
         field,
         value,
         identifier.as_ref().map(|item| item.value.as_str()),
         &hit.evidence,
-    );
-    Ok(supported(text, &literals, citations, true))
+        &literals,
+        citations,
+    )?
+    .map(|synthesis| synthesis.about(&hit.evidence.path)))
 }
 
 fn numeric_summary(
@@ -326,12 +481,19 @@ fn numeric_summary(
         let summable = group
             .iter()
             .all(|item| matches!(item.0.kind, ValueKind::Money | ValueKind::Number));
-        let total = summable.then(|| {
+        // El total se suma en escala fija sobre el literal original, nunca en
+        // `f64`: es una cifra visible y debe ser exacta y reproducible. Si
+        // algún literal no se puede leer exactamente, no se publica un total
+        // aproximado — se muestra sólo el rango, que sí está respaldado.
+        let exact_total = summable
+            .then(|| {
+                group.iter().try_fold(Decimal::ZERO, |accumulated, item| {
+                    Decimal::from_text(item.1).map(|value| accumulated.add(value))
+                })
+            })
+            .flatten();
+        let total = exact_total.map(|sum| {
             let samples = group.iter().map(|item| item.1).collect::<Vec<_>>();
-            let sum = group
-                .iter()
-                .map(|item| item.0.numeric_value.unwrap_or_default())
-                .sum::<f64>();
             let rendered = render_total(
                 sum,
                 &samples,
@@ -396,14 +558,18 @@ fn numeric_summary(
         literals.extend(totals);
         citations.push(note);
     }
-    supported(text, &literals, citations, true)
+    supported(text, &literals, citations)
 }
 
 fn value_list_summary(field: &str, values: &[&str], citations: Vec<Evidence>) -> Option<Synthesis> {
     let mut seen = HashSet::new();
     let mut distinct = Vec::new();
     for value in values {
-        if seen.insert(normalize_exact(value)) {
+        // `normalize_exact` borra puntuación: «3.2» y «3:2», o «50» y «50%»,
+        // normalizan igual sin ser el mismo valor. `normalize_literal` sólo
+        // pliega mayúsculas y acentos, así que un valor distinto nunca
+        // desaparece del listado sólo porque comparta dígitos con otro.
+        if seen.insert(normalize_literal(value)) {
             distinct.push(*value);
         }
     }
@@ -414,7 +580,7 @@ fn value_list_summary(field: &str, values: &[&str], citations: Vec<Evidence>) ->
     if let [only] = distinct.as_slice() {
         literals.push((*only).to_owned());
         let text = format!("Encontré {count} de «{field}», todos «{only}».");
-        return supported(text, &literals, citations, true);
+        return supported(text, &literals, citations);
     }
     let shown = distinct.iter().take(MAX_LISTED_VALUES).collect::<Vec<_>>();
     literals.extend(shown.iter().map(|value| (**value).to_owned()));
@@ -432,7 +598,7 @@ fn value_list_summary(field: &str, values: &[&str], citations: Vec<Evidence>) ->
             counted(remaining, "valor distinto más", "valores distintos más")
         ));
     }
-    supported(text, &literals, citations, true)
+    supported(text, &literals, citations)
 }
 
 // -------------------------------------------------------------------------
@@ -448,18 +614,28 @@ fn asks_for_summary(terms: &[String]) -> bool {
 /// Una pregunta por documentos relacionados nombra a la vez la relación y el
 /// continente. Exigir ambas señales evita confundirla con una pregunta por un
 /// campo que casualmente se llame "algo relacionado".
-fn asks_for_related_documents(terms: &[String]) -> bool {
-    terms.iter().any(|term| term.starts_with("relacionad"))
+///
+/// Las dos señales no se leen del mismo texto: la relación sólo cuenta si se
+/// enuncia FUERA de las comillas. «En el documento con folio X, ¿cuál es el
+/// valor del campo "Proveedor relacionado"?» nombra el continente y contiene
+/// "relacionado", pero esa palabra es parte del nombre del campo pedido, no
+/// una petición de documentos emparentados; leerla como tal detenía la
+/// respuesta en la localización del documento sin llegar a extraer el campo.
+fn asks_for_related_documents(question: &str, terms: &[String]) -> bool {
+    search_terms(&ToolEngine::query_without_quoted_literals(question))
+        .iter()
+        .any(|term| term.starts_with("relacionad"))
         && terms.iter().any(|term| CONTAINER_ROOTS.contains(term))
 }
 
 fn summary_answer(
+    question: &str,
     documents: &[DocumentContext],
     identifier: &str,
     identifier_text: &str,
     hits: &[SearchHit],
 ) -> Option<Synthesis> {
-    let principal = principal_document(documents, identifier)?;
+    let principal = principal_document(documents, identifier, question)?;
     if principal.values.is_empty() {
         return None;
     }
@@ -499,7 +675,7 @@ fn summary_answer(
             counted(remaining, "campo más", "campos más")
         ));
     }
-    supported(text, &literals, citations, true)
+    supported(text, &literals, citations)
 }
 
 fn related_documents_answer(identifier_text: &str, hits: &[SearchHit]) -> Option<Synthesis> {
@@ -537,7 +713,7 @@ fn related_documents_answer(identifier_text: &str, hits: &[SearchHit]) -> Option
         .iter()
         .map(|hit| hit.evidence.clone())
         .collect::<Vec<_>>();
-    supported(text, &literals, citations, true)
+    supported(text, &literals, citations)
 }
 
 // -------------------------------------------------------------------------
@@ -570,27 +746,34 @@ fn load_documents<'a>(
 }
 
 fn identified_field_answer(
+    tools: &ToolEngine,
+    question: &str,
     documents: &[DocumentContext],
     terms: &[String],
     type_words: &[String],
     identifier: &str,
     identifier_text: &str,
     hits: &[SearchHit],
-) -> Option<Synthesis> {
+) -> Result<Option<Synthesis>> {
     // El vocabulario se limita a los documentos ya encontrados. Compararlo
     // contra el índice completo haría que una palabra suelta abriera campos de
     // otros documentos que la búsqueda nunca devolvió.
     let vocabulary = distinct_fields(documents.iter().flat_map(|context| context.values.iter()));
-    match resolve_field(&vocabulary, terms, type_words) {
-        // La pregunta no nombra ningún campo: una búsqueda simple por
-        // identificador se responde con la evidencia tal cual.
-        FieldMatch::NotRequested => return None,
+    let shared_field = match explicitly_quoted_field(question, &vocabulary)
+        .map(FieldMatch::Resolved)
+        .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words))
+    {
+        // La pregunta no nombra ningún campo del acervo. Antes de rendirse:
+        // puede que lo entrecomillado no sea un campo sino la ETIQUETA de una
+        // fila de tabla, que es como se nombra una partida, un arancel o un
+        // artículo de una lista de precios. Si lo es, se contesta con su fila.
+        FieldMatch::NotRequested => return Ok(labelled_row_answer(question, documents, hits)),
         // Un empate en el vocabulario común, antes de elegir documento
         // principal, casi siempre significa que la palabra coincidente aparece
         // por casualidad en varios nombres de campo de documentos distintos, no
         // que se pida un campo concreto. No es una duda que reportar: es una
-        // pregunta que no era de campo.
-        FieldMatch::Ambiguous => return None,
+        // pregunta que no era de campo — salvo que nombre una fila.
+        FieldMatch::Ambiguous => return Ok(labelled_row_answer(question, documents, hits)),
         FieldMatch::Resolved(name) => {
             // El campo pedido ya está entre la evidencia encontrada: no hace
             // falta ninguna consulta adicional, la síntesis directa lo responde.
@@ -600,24 +783,59 @@ fn identified_field_answer(
                     .as_deref()
                     .is_some_and(|field| normalize_exact(field) == normalize_exact(&name))
             }) {
-                return None;
+                return Ok(None);
             }
+            name
         }
-    }
+    };
 
     let citations = hits
         .iter()
         .map(|hit| hit.evidence.clone())
         .collect::<Vec<_>>();
-    let Some(principal) = principal_document(documents, identifier) else {
-        return unresolved(
+    let Some(principal) = principal_document(documents, identifier, question) else {
+        // Ningún documento se distingue, pero puede que la elección no
+        // importe: si todos coinciden en el valor del campo pedido, ese valor
+        // es la respuesta y no hace falta elegir documento.
+        if let Some(agreed) = value_agreed_by_every_document(documents, &shared_field) {
+            let literals = vec![
+                agreed.field.clone(),
+                agreed.value.clone(),
+                identifier_text.to_owned(),
+            ];
+            let mut text = format!(
+                "{} Los {} documentos que mencionan {identifier_text} coinciden en ese valor, así que no depende de cuál se tome como registro principal.",
+                direct_phrase(
+                    &agreed.field,
+                    &agreed.value,
+                    Some(identifier_text),
+                    &agreed.evidence,
+                ),
+                documents.len(),
+            );
+            let mut citations = citations;
+            citations.insert(0, agreed.evidence.clone());
+            // Que todos coincidan no vuelve bueno a un valor cuyo signo el
+            // propio campo desmiente: coincidir en un dato inválido es
+            // repetirlo, no confirmarlo.
+            let record = anomalous_negative(tools, &agreed.field, &agreed.value)?;
+            if let Some(record) = record {
+                text.push_str(&sign_warning(&agreed.field, record));
+            }
+            let synthesis = match record {
+                Some(_) => unresolved(text, &literals, citations),
+                None => supported(text, &literals, citations),
+            };
+            return Ok(synthesis.map(|synthesis| synthesis.about(&agreed.evidence.path)));
+        }
+        return Ok(unresolved(
             format!(
                 "Sin concluir: {} documentos mencionan {identifier_text}, pero ninguno se distingue como el registro principal, así que no puedo atribuirle ese dato con certeza.",
                 hits.len()
             ),
             &[identifier_text.to_owned()],
             citations,
-        );
+        ));
     };
     let file = file_name(&principal.hit.evidence);
 
@@ -625,16 +843,18 @@ fn identified_field_answer(
     // distintos. El campo se resuelve dentro del documento principal ya
     // elegido, nunca contra el vocabulario común de todos los encontrados. Aquí
     // una duda sí es real y se reporta.
-    let FieldMatch::Resolved(field) =
-        resolve_field(&distinct_fields(principal.values.iter()), terms, type_words)
+    let principal_vocabulary = distinct_fields(principal.values.iter());
+    let FieldMatch::Resolved(field) = explicitly_quoted_field(question, &principal_vocabulary)
+        .map(FieldMatch::Resolved)
+        .unwrap_or_else(|| resolve_field(&principal_vocabulary, terms, type_words))
     else {
-        return unresolved(
+        return Ok(unresolved(
             format!(
                 "Sin concluir: {file} es el registro principal de {identifier_text}, pero no puedo determinar con certeza a qué campo suyo se refiere la pregunta."
             ),
             &[identifier_text.to_owned()],
             citations,
-        );
+        ));
     };
 
     let matches = principal
@@ -642,31 +862,30 @@ fn identified_field_answer(
         .iter()
         .filter(|value| normalize_exact(&value.field) == normalize_exact(&field))
         .collect::<Vec<_>>();
+    // Igualdad literal, no `normalize_exact`: dos valores del mismo campo que
+    // sólo difieren en puntuación («3.2» frente a «3:2») son valores en
+    // conflicto, no el mismo valor escrito dos veces. Tratarlos como iguales
+    // aquí escondería el conflicto y el motor elegiría uno de los dos al
+    // azar (`[chosen]` más abajo) como si no hubiera ambigüedad.
     let distinct = matches
         .iter()
-        .map(|value| normalize_exact(&value.value))
+        .map(|value| normalize_literal(&value.value))
         .collect::<HashSet<_>>();
     // Varios valores del mismo campo en un solo documento significan varios
     // registros dentro de él (un listado): no es posible atribuir uno de ellos
     // a este identificador sin cruzar la fila, así que no se responde.
     let ([chosen], 1) = (matches.as_slice(), distinct.len()) else {
-        return unresolved(
+        return Ok(unresolved(
             format!(
                 "Sin concluir: {file} registra {} de «{field}», así que no puedo señalar cuál corresponde a {identifier_text}.",
                 counted(distinct.len(), "valor distinto", "valores distintos")
             ),
             &[identifier_text.to_owned(), field],
             citations,
-        );
+        ));
     };
 
     let mut citations = citations;
-    let text = direct_phrase(
-        &chosen.field,
-        &chosen.value,
-        Some(identifier_text),
-        &chosen.evidence,
-    );
     let literals = vec![
         chosen.field.clone(),
         chosen.value.clone(),
@@ -675,7 +894,16 @@ fn identified_field_answer(
     // La evidencia decisiva encabeza las citas; debajo se conserva intacto lo
     // que la búsqueda encontró por su cuenta.
     citations.insert(0, chosen.evidence.clone());
-    supported(text, &literals, citations, true)
+    Ok(reported_value_synthesis(
+        tools,
+        &chosen.field,
+        &chosen.value,
+        Some(identifier_text),
+        &chosen.evidence,
+        &literals,
+        citations,
+    )?
+    .map(|synthesis| synthesis.about(&chosen.evidence.path)))
 }
 
 /// El identificador consultado se lee de la propia evidencia: sólo la ruta de
@@ -715,15 +943,225 @@ fn entity_type_words(question: &str, identifier_text: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Una fila de tabla nombrada por su primera celda.
+///
+/// Una tabla con encabezado se indexa por sus encabezados, que es la lectura
+/// correcta: la fila `Tornillo hexagonal | 250 | piezas` bajo
+/// `Concepto | Cantidad | Unidad` queda como Concepto=«Tornillo hexagonal»,
+/// Cantidad=250, Unidad=piezas. Pero quien pregunta no nombra la columna:
+/// nombra la fila por su etiqueta —«¿cuál es el valor de "Tornillo
+/// hexagonal"?»—. Las dos formas señalan la misma casilla del mismo papel, y
+/// hasta ahora sólo se entendía una.
+///
+/// Nada de esto depende del giro del negocio ni de cómo se llamen las
+/// columnas: la regla se apoya sólo en el orden de extracción y en que una
+/// columna etiqueta se repite una vez por fila. Funciona igual en una tabla
+/// de partidas, en un arancel de notaría o en una lista de precios de
+/// ferretería.
+struct LabelledRow<'a> {
+    /// La celda que la pregunta nombró.
+    label: &'a DocumentValue,
+    /// El resto de las celdas de su fila, en orden.
+    cells: Vec<&'a DocumentValue>,
+}
+
+/// Localiza la fila que una etiqueta encabeza, o no devuelve nada.
+///
+/// Las tres exigencias son las que impiden adivinar, y cada una descarta un
+/// modo distinto de equivocarse:
+///
+///  1. **La etiqueta aparece una sola vez** en todo el conjunto de documentos
+///     candidatos. Si encabeza varias filas —una fecha que se repite en el
+///     turno matutino, el vespertino y el nocturno del mismo día— hay varias
+///     respuestas posibles y ninguna razón para preferir una.
+///  2. **Su columna se repite** dentro del documento. Una columna que sólo
+///     aparece una vez no es la columna etiqueta de una tabla: es un campo de
+///     una carátula, y su valor no encabeza ninguna fila.
+///  3. **La fila termina donde vuelve a aparecer esa misma columna**, que es
+///     donde empieza la fila siguiente. No hace falta leer la posición del
+///     texto —que cada formato escribe a su manera— ni conocer el ancho de la
+///     tabla.
+fn row_labelled_by<'a>(
+    documents: &'a [DocumentContext<'a>],
+    label: &str,
+) -> Option<LabelledRow<'a>> {
+    let wanted = normalize_exact(label);
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut found: Option<(&'a DocumentContext<'a>, usize)> = None;
+    for context in documents {
+        for (at, value) in context.values.iter().enumerate() {
+            if normalize_exact(&value.value) == wanted {
+                if found.is_some() {
+                    // Aparece más de una vez: hay más de una fila candidata.
+                    return None;
+                }
+                found = Some((context, at));
+            }
+        }
+    }
+    let (context, at) = found?;
+    let anchor = context.values.get(at)?;
+    let column = normalize_exact(&anchor.field);
+    let repeats = context
+        .values
+        .iter()
+        .filter(|value| normalize_exact(&value.field) == column)
+        .count();
+    if repeats < 2 {
+        return None;
+    }
+    let cells = context
+        .values
+        .get(at + 1..)?
+        .iter()
+        .take_while(|value| normalize_exact(&value.field) != column)
+        .collect::<Vec<_>>();
+    if cells.is_empty() {
+        return None;
+    }
+    // 4. La columna etiqueta tiene que ser la PRIMERA de su tabla, o la fila
+    //    que se recoge no es una fila.
+    //
+    //    Cortar «hasta la siguiente aparición de la columna» sólo delimita una
+    //    fila real si la etiqueta la encabeza. Si la columna fuera la tercera
+    //    de cinco, lo recogido serían las columnas 4 y 5 de esta fila y las 1 y
+    //    2 de la SIGUIENTE, presentadas como si fueran una sola — un error que
+    //    ninguna tabla de este acervo produce, pero que otra sí produciría.
+    //
+    //    Se detecta sin leer posiciones: si la columna etiqueta encabeza la
+    //    tabla, lo que hay justo antes de su primera aparición pertenece a otra
+    //    cosa (una carátula, otra tabla) y su nombre no puede estar entre las
+    //    celdas recogidas. Si la columna fuera interior, ahí estaría justamente
+    //    una de las columnas que la preceden en cada fila.
+    let first = context
+        .values
+        .iter()
+        .position(|value| normalize_exact(&value.field) == column)?;
+    if let Some(before) = first.checked_sub(1).and_then(|at| context.values.get(at)) {
+        let preceding = normalize_exact(&before.field);
+        if cells
+            .iter()
+            .any(|cell| normalize_exact(&cell.field) == preceding)
+        {
+            return None;
+        }
+    }
+    Some(LabelledRow {
+        label: anchor,
+        cells,
+    })
+}
+
+/// Contesta nombrando la fila entera, sin elegir columna por el usuario.
+///
+/// La pregunta pide «el valor» en singular, pero una fila puede tener varias
+/// celdas y nada en la pregunta dice cuál. Devolverlas todas, cada una con el
+/// nombre de su columna, contesta sin suponer: si la tabla es de dos columnas
+/// —el caso más común de un arancel o una lista de precios— queda una sola
+/// celda y la respuesta es exactamente el valor pedido.
+///
+/// El texto dice además que lo pedido no era un campo sino una fila. Quien
+/// pregunta tiene derecho a saber que su forma de nombrar la casilla no es la
+/// que el documento usa.
+fn labelled_row_answer(
+    question: &str,
+    documents: &[DocumentContext],
+    hits: &[SearchHit],
+) -> Option<Synthesis> {
+    let quoted = ToolEngine::quoted_literals(question);
+    let [asked] = quoted.as_slice() else {
+        return None;
+    };
+    let row = row_labelled_by(documents, asked)?;
+    let file = file_name(&row.label.evidence);
+    let shown = row.cells.iter().take(MAX_SUMMARY_FIELDS).collect::<Vec<_>>();
+    let remaining = row.cells.len().saturating_sub(shown.len());
+
+    let mut literals = vec![row.label.value.clone(), row.label.field.clone()];
+    let mut citations = hits
+        .iter()
+        .map(|hit| hit.evidence.clone())
+        .collect::<Vec<_>>();
+    citations.insert(0, row.label.evidence.clone());
+    for cell in &shown {
+        literals.push(cell.field.clone());
+        literals.push(cell.value.clone());
+        if !citations.iter().any(|item| item.id == cell.evidence.id) {
+            citations.push(cell.evidence.clone());
+        }
+    }
+    let items = shown
+        .iter()
+        .map(|cell| format!("{}: {}", cell.field, cell.value))
+        .collect::<Vec<_>>();
+    let mut text = format!(
+        "«{}» no es un campo de {file}, sino la etiqueta de una fila de su tabla (columna «{}»). Esa fila registra:\n\n{}",
+        row.label.value,
+        row.label.field,
+        bullet_list(&items)
+    );
+    if remaining > 0 {
+        text.push_str(&format!(
+            "\n\nLa fila tiene {} más.",
+            counted(remaining, "celda", "celdas")
+        ));
+    }
+    supported(text, &literals, citations)
+        .map(|synthesis| synthesis.about(&row.label.evidence.path))
+}
+
+/// La misma vía de fila etiquetada, para la ruta que localiza el documento por
+/// su **clave interna de indexación** (`D#####`) en vez de por un folio escrito
+/// en la pregunta.
+///
+/// La ronda 8 construyó esta capacidad dentro de `identified_field_answer`, que
+/// es la ruta del folio, y allí se quedó: preguntar «¿cuál es el valor de
+/// "Lubricantes - insumo #2" en el documento D05975?» no la alcanzaba, aunque
+/// es exactamente la misma pregunta sobre exactamente la misma casilla. La
+/// asimetría no la producía ninguna diferencia real entre las dos rutas —sólo
+/// que una se escribió después—.
+///
+/// Se reutiliza `row_labelled_by` sin tocarla, con sus cuatro exigencias
+/// intactas: etiqueta única, columna repetida, corte en la siguiente aparición
+/// de esa columna, y columna etiqueta primera de su tabla. Una segunda puerta
+/// con garantías propias sería una segunda forma de equivocarse.
+pub fn labelled_row_in_document(question: &str, values: &[DocumentValue]) -> Option<Synthesis> {
+    let hits = values
+        .iter()
+        .map(|value| SearchHit {
+            title: value.field.clone(),
+            score: 1.0,
+            evidence: value.evidence.clone(),
+        })
+        .collect::<Vec<_>>();
+    let [hit, ..] = hits.as_slice() else {
+        return None;
+    };
+    let documents = vec![DocumentContext {
+        hit,
+        values: values.to_vec(),
+    }];
+    labelled_row_answer(question, &documents, &hits)
+}
+
 /// Documento principal de un identificador. Se prefiere aquel donde el
 /// identificador aparece antes dentro del propio documento —un registro habla
 /// de su entidad desde sus primeros campos, mientras que una referencia cruzada
 /// aparece más abajo— y, a igualdad de posición, el que contiene menos
 /// identificadores distintos: un listado menciona muchos, una ficha individual
-/// casi ninguno. Si nada desempata, no hay documento principal.
+/// casi ninguno.
+///
+/// Cuando ni el orden de aparición ni el número de identificadores separan a
+/// los candidatos —dos carátulas que registran el mismo folio en la misma
+/// posición— queda una última señal, y sólo una: el tipo de documento que la
+/// pregunta nombra (`document_named_by_kind`). Si tampoco ésa desempata, no
+/// hay documento principal y no se contesta.
 fn principal_document<'a>(
     documents: &'a [DocumentContext<'a>],
     identifier: &str,
+    question: &str,
 ) -> Option<&'a DocumentContext<'a>> {
     let mut ranked = documents
         .iter()
@@ -746,8 +1184,101 @@ fn principal_document<'a>(
     match ranked.as_slice() {
         [(_, only)] => Some(only),
         [(best, winner), (runner_up, _), ..] if best < runner_up => Some(winner),
-        _ => None,
+        // Empate en la cabeza: se desempata sólo entre los empatados, nunca
+        // contra un candidato que el orden de aparición ya dejó atrás.
+        [(best, _), ..] => {
+            let tied = ranked
+                .iter()
+                .filter(|(rank, _)| rank == best)
+                .map(|(_, context)| *context)
+                .collect::<Vec<_>>();
+            document_named_by_kind(&tied, question)
+        }
+        [] => None,
     }
+}
+
+/// Entre documentos que el orden de aparición no separa, el que es del tipo
+/// que la pregunta nombra.
+///
+/// El tipo no sale de ninguna lista escrita en el código: se lee del nombre
+/// del propio archivo con `census::kind_of_path`, el mismo criterio con el
+/// que el censo reparte el acervo por tipo. Así la señal existe para
+/// cualquier acervo, sin conocer de antemano qué tipos contiene.
+///
+/// La exigencia es simétrica y en los dos sentidos, como en
+/// `origin_identified_by_value`: hace falta que la pregunta nombre el tipo de
+/// **exactamente uno** de los empatados. Si no nombra el de ninguno, no hay
+/// señal; si nombra el de varios, la señal no distingue. En ambos casos el
+/// empate sigue siendo un empate y la respuesta correcta es no concluir.
+fn document_named_by_kind<'a>(
+    tied: &[&'a DocumentContext<'a>],
+    question: &str,
+) -> Option<&'a DocumentContext<'a>> {
+    let asked = normalize_spanish(question);
+    let words = asked.split_whitespace().collect::<Vec<_>>();
+    let mut named = tied
+        .iter()
+        .filter(|context| question_names_kind(&words, &context.hit.evidence.path));
+    let first = *named.next()?;
+    named.next().is_none().then_some(first)
+}
+
+/// ¿Nombra la pregunta el tipo de este archivo?
+///
+/// El tipo puede ser de varias palabras («orden_mantenimiento»), así que se
+/// busca como secuencia de palabras dentro de la pregunta ya normalizada, no
+/// como subcadena: sin límites de palabra, el tipo «pago» coincidiría dentro
+/// de «pagos anticipados» o de cualquier palabra que lo contenga.
+fn question_names_kind(question_words: &[&str], path: &str) -> bool {
+    let Some(kind) = census::kind_of_path(path) else {
+        return false;
+    };
+    let normalized = normalize_spanish(&kind.replace('_', " "));
+    let length = normalized.split_whitespace().count();
+    if length == 0 || length > question_words.len() {
+        return false;
+    }
+    question_words
+        .windows(length)
+        .any(|window| census::kind_matches(&kind, &window.join(" ")))
+}
+
+/// Valor que no depende de qué documento se elija.
+///
+/// Cuando varios documentos mencionan el mismo identificador y ninguno se
+/// distingue como el principal, todavía se puede contestar sin elegir: si
+/// **todos** registran el campo pedido y **todos** registran para él el mismo
+/// valor, la respuesta es la misma se mire el documento que se mire, y elegir
+/// deja de hacer falta.
+///
+/// No es una mayoría. Una sola discrepancia —o un solo documento que no
+/// registre el campo— cancela la vía: lo que autoriza a contestar es la
+/// ausencia de desacuerdo comprobada en todos los candidatos, no que la mayor
+/// parte coincida. Un documento con varios valores del mismo campo tampoco
+/// cuenta, por la misma razón que más abajo: son varios registros dentro de
+/// él y no se puede atribuir uno al identificador sin cruzar la fila.
+fn value_agreed_by_every_document<'a>(
+    documents: &'a [DocumentContext<'a>],
+    field: &str,
+) -> Option<&'a DocumentValue> {
+    let mut agreed: Option<&DocumentValue> = None;
+    for context in documents {
+        let mut matches = context
+            .values
+            .iter()
+            .filter(|value| normalize_exact(&value.field) == normalize_exact(field));
+        let only = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        match agreed {
+            None => agreed = Some(only),
+            Some(previous) if normalize_literal(&previous.value) == normalize_literal(&only.value) => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
 }
 
 /// Resuelve qué campo pide la pregunta contra el vocabulario que se le pasa.
@@ -769,6 +1300,43 @@ fn principal_document<'a>(
 /// comparar preguntas contra el campo "Registro". Sin esto, "Estado del
 /// registro" perdía su palabra distintiva y quedaba indistinguible del campo
 /// "estado", cuando en realidad es el más específico de los dos.
+/// ¿La pregunta nombra alguno de los campos que este documento registra?
+///
+/// Localizar un documento no autoriza a contestar cualquier cosa sobre él. Si
+/// la pregunta pide un campo que el documento no tiene —el caso típico de una
+/// pregunta por un dato ausente— la respuesta correcta es «no encontré
+/// evidencia», nunca el valor de otro campo que sí estaba a mano.
+pub fn question_names_a_field(question: &str, vocabulary: &[String]) -> bool {
+    if explicitly_quoted_field(question, vocabulary).is_some() {
+        return true;
+    }
+    let terms = search_terms(question);
+    matches!(
+        resolve_field(vocabulary, &terms, &[]),
+        FieldMatch::Resolved(_)
+    )
+}
+
+/// Campo nombrado explícitamente entre comillas por la pregunta.
+///
+/// Cuando el usuario escribe «el valor del campo "Cliente relacionado"» está
+/// nombrando el campo, no describiéndolo: eso manda sobre cualquier palabra
+/// suelta del resto de la frase. Sin esta preferencia, el contexto que
+/// acompaña a la pregunta —«(orden_compra, área Compras, **proveedores**,
+/// logística)»— empataba «Cliente relacionado» con «Proveedor relacionado» y
+/// la resolución quedaba ambigua, respondiendo con un campo que nadie pidió.
+fn explicitly_quoted_field(question: &str, vocabulary: &[String]) -> Option<String> {
+    let quoted = ToolEngine::quoted_literals(question);
+    vocabulary
+        .iter()
+        .find(|name| {
+            quoted
+                .iter()
+                .any(|literal| normalize_exact(literal) == normalize_exact(name))
+        })
+        .cloned()
+}
+
 fn resolve_field(vocabulary: &[String], terms: &[String], type_words: &[String]) -> FieldMatch {
     let mut best: Option<(usize, usize, String)> = None;
     let mut tied = false;
@@ -836,8 +1404,15 @@ fn document_identifier(
         .document_values(document_id)?
         .into_iter()
         .find(|item| {
-            item.identifier_canonical.is_some()
-                && normalize_exact(&item.value) != normalize_exact(reported_value)
+            // Una fecha escrita en palabras («26 de enero de 2023») mezcla
+            // letras y dígitos, así que `canonical_identifier` la acepta como
+            // clave. No lo es: presentarla como el identificador del documento
+            // hacía leer «El campo «Moneda» de 26 de enero de 2023 es USD»
+            // como si la fecha nombrara al registro. El tipo del valor ya
+            // distingue las dos cosas y aquí basta con respetarlo.
+            item.value_type != "date"
+                && item.identifier_canonical.is_some()
+                && normalize_literal(&item.value) != normalize_literal(reported_value)
         }))
 }
 
@@ -877,6 +1452,91 @@ fn direct_phrase(
             evidence.location
         ),
     }
+}
+
+/// Mínimo de valores numéricos que un campo tiene que tener registrados en el
+/// acervo para que su historial signifique algo. Por debajo de esto no hay
+/// costumbre que contradecir: un valor negativo no sería una rareza sino uno
+/// de los primeros datos del campo, y llamarlo sospechoso sería inventar una
+/// norma que el acervo todavía no tiene.
+const MIN_SIGN_OBSERVATIONS: i64 = 20;
+
+/// Uno de cada veinte. Por encima de esa proporción los negativos no son una
+/// rareza sino una forma de usar el campo —una nota de crédito, un ajuste, una
+/// devolución, una desviación contra presupuesto— y señalarlos sería acusar de
+/// inválido a un dato correcto.
+const EXCEPTIONAL_NEGATIVE_SHARE: i64 = 20;
+
+/// ¿El signo de este valor contradice lo que el acervo tiene escrito en su
+/// propio campo?
+///
+/// Un importe negativo en una orden de compra o una factura es casi siempre un
+/// dato inválido —un signo que se coló en la captura, una exportación que
+/// invirtió la columna, un OCR que leyó un guion de más—. Pero «negativo» a
+/// secas no basta para decirlo: hay campos donde el signo es parte del oficio
+/// y un valor negativo es exactamente el dato correcto. El criterio, entonces,
+/// no puede ser el signo suelto.
+///
+/// Lo que sí se puede comprobar sin suponer nada es si ese campo, **en este
+/// acervo y en este momento**, se usa alguna vez en negativo. Si de sus
+/// cientos de valores registrados ninguno más lo es, el signo es una rareza
+/// que merece decirse; si una parte apreciable de ellos lo es, es su forma
+/// normal de uso y Omega se calla. La regla no consulta ningún vocabulario ni
+/// sabe qué es una nota de crédito: lee el índice al responder, así que
+/// funciona igual en un acervo cuyos campos nadie conozca de antemano.
+fn anomalous_negative(tools: &ToolEngine, field: &str, value: &str) -> Result<Option<SignRecord>> {
+    let typed = classify_value(field, value);
+    if !typed.numeric_value.is_some_and(|number| number < 0.0) {
+        return Ok(None);
+    }
+    let record = tools.field_sign_record(field)?;
+    let exceptional = record.numeric >= MIN_SIGN_OBSERVATIONS
+        && record.negative.saturating_mul(EXCEPTIONAL_NEGATIVE_SHARE) <= record.numeric;
+    Ok(exceptional.then_some(record))
+}
+
+/// Reporta un valor leído de un documento — y, cuando su signo contradice al
+/// propio campo, lo reporta **como sospechoso**, no como el dato.
+///
+/// La respuesta sigue mostrando el valor y su cita: ocultarlo sería peor que
+/// darlo por bueno, porque quien pregunta no podría ir a corregirlo. Lo que
+/// cambia es lo que Omega afirma sobre él —dice que no lo respalda, y por qué—
+/// y que la síntesis sale **sin marcar como verificada** (`unresolved`), que
+/// es el mismo candado que usa cualquier otra ruta cuando la evidencia no
+/// alcanza para afirmar.
+fn reported_value_synthesis(
+    tools: &ToolEngine,
+    field: &str,
+    value: &str,
+    identifier: Option<&str>,
+    evidence: &Evidence,
+    literals: &[String],
+    citations: Vec<Evidence>,
+) -> Result<Option<Synthesis>> {
+    let phrase = direct_phrase(field, value, identifier, evidence);
+    let Some(record) = anomalous_negative(tools, field, value)? else {
+        return Ok(supported(phrase, literals, citations));
+    };
+    Ok(unresolved(
+        format!("{phrase}{}", sign_warning(field, record)),
+        literals,
+        citations,
+    ))
+}
+
+/// Lo que se le dice a quien preguntó, cuando el signo del valor contradice al
+/// campo. Va detrás del valor y de su cita, nunca en su lugar: el dato tiene
+/// que quedar a la vista para que se pueda ir a corregirlo al documento.
+fn sign_warning(field: &str, record: SignRecord) -> String {
+    let rarity = if record.negative <= 1 {
+        "éste es el único negativo".to_owned()
+    } else {
+        format!("sólo {} son negativos, éste entre ellos", record.negative)
+    };
+    format!(
+        " Pero no te lo puedo dar por bueno: es un valor negativo, y de los {} valores numéricos que el acervo registra en «{field}», {rarity}. Lo señalo como dato inválido o sospechoso del documento fuente, no como el valor del campo.",
+        record.numeric
+    )
 }
 
 /// Los tres formatos que el frontend sabe interpretar: lista con viñetas,
@@ -953,13 +1613,15 @@ fn calculation_note(field: &str, totals: &[String], sample: &Evidence, count: us
         matched: None,
         field: None,
         match_kind: "campo".into(),
-        reliable: true,
-        confidence: None,
+        reliable: sample.reliable,
+        ocr_status: sample.ocr_status.clone(),
+        ocr_confidence: sample.ocr_confidence,
+        confidence: sample.ocr_confidence,
     }
 }
 
 fn unresolved(text: String, literals: &[String], citations: Vec<Evidence>) -> Option<Synthesis> {
-    supported(text, literals, citations, false)
+    synthesis_if_supported(text, literals, citations, false)
 }
 
 /// Publica una síntesis sólo si cada valor que menciona aparece literalmente en
@@ -974,33 +1636,44 @@ fn supported(
     text: String,
     literals: &[String],
     citations: Vec<Evidence>,
-    verified: bool,
+) -> Option<Synthesis> {
+    synthesis_if_supported(text, literals, citations, true)
+}
+
+/// Núcleo compartido por `supported` y `unresolved`. `resolved` distingue la
+/// síntesis que sí responde de la que declara que la evidencia no alcanza;
+/// la confiabilidad de la evidencia NO es un parámetro: se deriva siempre de
+/// las propias citas, igual que en `Answer::verified`. Así ninguna ruta de
+/// síntesis puede declararse verificada apoyándose en OCR de baja confianza.
+fn synthesis_if_supported(
+    text: String,
+    literals: &[String],
+    citations: Vec<Evidence>,
+    resolved: bool,
 ) -> Option<Synthesis> {
     let borrowed = citations.iter().collect::<Vec<_>>();
+    let reliable = citations.iter().all(|evidence| evidence.reliable);
     literals
         .iter()
         .all(|literal| value_is_supported(&borrowed, literal))
         .then_some(Synthesis {
             text,
-            verified,
+            verified: resolved && reliable,
             citations,
+            subject: None,
         })
 }
 
 /// El formato del total se deduce de los propios valores citados: si todos
 /// llevan símbolo, si usan separador de millares y si declaran decimales. No se
 /// impone una convención que el acervo no use.
-fn render_total(total: f64, samples: &[&str], currency: Option<&str>) -> String {
+fn render_total(total: Decimal, samples: &[&str], currency: Option<&str>) -> String {
     let symbol = samples
         .iter()
         .all(|value| value.trim_start().starts_with('$'));
     let grouped = samples.iter().any(|value| value.contains(','));
     let decimals = samples.iter().any(|value| has_decimals(value));
-    let mut rendered = if decimals {
-        format!("{total:.2}")
-    } else {
-        format!("{total:.0}")
-    };
+    let mut rendered = fixed_decimals(total, if decimals { 2 } else { 0 });
     if grouped {
         rendered = group_thousands(&rendered);
     }
@@ -1010,6 +1683,43 @@ fn render_total(total: f64, samples: &[&str], currency: Option<&str>) -> String 
     if let Some(currency) = currency {
         rendered.push(' ');
         rendered.push_str(currency);
+    }
+    rendered
+}
+
+/// Reemplazo exacto de `format!("{total:.N}")` sobre un `f64`: rinde una
+/// cantidad de escala fija con `decimals` decimales y sin separador de miles,
+/// que es lo que `render_total` espera antes de aplicar su propio formato.
+/// Redondea la mitad hacia arriba en magnitud, como hace la presentación
+/// monetaria del resto del motor.
+fn fixed_decimals(total: Decimal, decimals: u32) -> String {
+    // La escala interna de `Decimal` son cuatro dígitos fraccionarios.
+    const SCALE_DIGITS: u32 = 4;
+    debug_assert!(decimals <= SCALE_DIGITS);
+    let raw = total.raw();
+    let negative = raw < 0;
+    let divisor = 10u128.pow(SCALE_DIGITS - decimals);
+    let magnitude = raw.unsigned_abs();
+    let quotient = magnitude / divisor;
+    let remainder = magnitude % divisor;
+    let scaled = if remainder * 2 >= divisor {
+        quotient + 1
+    } else {
+        quotient
+    };
+    let unit = 10u128.pow(decimals);
+    let mut rendered = if decimals == 0 {
+        scaled.to_string()
+    } else {
+        format!(
+            "{}.{:0width$}",
+            scaled / unit,
+            scaled % unit,
+            width = decimals as usize
+        )
+    };
+    if negative && scaled > 0 {
+        rendered.insert(0, '-');
     }
     rendered
 }
@@ -1048,16 +1758,35 @@ mod tests {
 
     #[test]
     fn totals_copy_the_notation_of_the_values_they_summarize() {
+        let exact = |literal: &str| Decimal::from_text(literal).expect("literal exacto");
         assert_eq!(
-            render_total(87_430.0, &["$1,200 MXN", "$4,850 MXN"], Some("MXN")),
+            render_total(exact("87430"), &["$1,200 MXN", "$4,850 MXN"], Some("MXN")),
             "$87,430 MXN"
         );
         // Sin símbolo ni separador en el acervo, el total tampoco los inventa.
-        assert_eq!(render_total(9.0, &["4", "5"], None), "9");
+        assert_eq!(render_total(exact("9"), &["4", "5"], None), "9");
         assert_eq!(
-            render_total(1_234.5, &["1,000.00", "234.50"], None),
+            render_total(exact("1234.50"), &["1,000.00", "234.50"], None),
             "1,234.50"
         );
+    }
+
+    /// El total visible se suma en escala fija. En `f64`, 0.1 + 0.2 no da
+    /// exactamente 0.3 y la cifra publicada arrastraría ese error.
+    #[test]
+    fn a_visible_total_is_summed_exactly_and_never_as_a_float() {
+        let cents = ["0.10", "0.20"];
+        let total = cents
+            .iter()
+            .fold(Decimal::ZERO, |acc, literal| {
+                acc.add(Decimal::from_text(literal).unwrap())
+            });
+        assert_eq!(render_total(total, &cents, None), "0.30");
+        // Y la escala fija no pierde un céntimo en una suma larga.
+        let many = (0..1_000).fold(Decimal::ZERO, |acc, _| {
+            acc.add(Decimal::from_text("0.07").unwrap())
+        });
+        assert_eq!(render_total(many, &["0.07"], None), "70.00");
     }
 
     #[test]
@@ -1152,13 +1881,37 @@ mod tests {
             "¿Cuál es el estado de PROP-1?"
         )));
 
-        assert!(asks_for_related_documents(&search_terms(
-            "¿Cuáles son todos los documentos relacionados con PROP-1?"
-        )));
+        // El nombre del campo va entrecomillado: manda sobre las palabras
+        // sueltas del contexto que lo rodea. Sin esta preferencia, la palabra
+        // «proveedores» del nombre del área empataba con «Cliente relacionado»
+        // y la resolución elegía un campo que nadie pidió.
+        let vocabulary = vec![
+            "OC".to_owned(),
+            "Cliente relacionado".to_owned(),
+            "Proveedor relacionado".to_owned(),
+        ];
+        let ambigua = "En el documento con folio OC-2024-00114 (orden_compra, área Compras, proveedores, logística), ¿cuál es el valor del campo \"Cliente relacionado\"?";
+        assert_eq!(
+            explicitly_quoted_field(ambigua, &vocabulary).as_deref(),
+            Some("Cliente relacionado")
+        );
+        // Sin comillas no inventa una preferencia: resuelve como siempre.
+        assert!(explicitly_quoted_field("¿cuál es el cliente relacionado?", &vocabulary).is_none());
+
+        let related = "¿Cuáles son todos los documentos relacionados con PROP-1?";
+        assert!(asks_for_related_documents(related, &search_terms(related)));
         // Sin la palabra que nombra al continente es una pregunta por un campo
         // que se llama "algo relacionado", no por el acervo.
-        assert!(!asks_for_related_documents(&search_terms(
-            "¿Cuál es el inmueble relacionado de FIN-1?"
-        )));
+        let field = "¿Cuál es el inmueble relacionado de FIN-1?";
+        assert!(!asks_for_related_documents(field, &search_terms(field)));
+        // Nombra el continente y contiene "relacionado", pero esa palabra está
+        // entrecomillada porque es el nombre del campo pedido: la pregunta
+        // quiere ese valor, no la lista de documentos emparentados.
+        let quoted_field =
+            "En el documento con folio AUD-1, ¿cuál es el valor del campo \"Proveedor relacionado\"?";
+        assert!(!asks_for_related_documents(
+            quoted_field,
+            &search_terms(quoted_field)
+        ));
     }
 }

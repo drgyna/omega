@@ -137,14 +137,11 @@ pub fn verify_model_answer(raw: &str, available: &[Evidence]) -> Result<Answer> 
         statements.push(format!("{} {marks}", claim.statement.trim()));
     }
 
-    Ok(Answer {
-        text: statements.join(" "),
-        mode: "ai".into(),
-        verified: true,
-        citations: used,
-        warning: None,
-        ..Answer::default()
-    })
+    // Mismo candado de confiabilidad que el resto del motor; sólo se conserva
+    // el modo "ai" propio de esta ruta.
+    let mut answer = Answer::verified(statements.join(" "), used);
+    answer.mode = "ai".into();
+    Ok(answer)
 }
 
 #[cfg(test)]
@@ -165,6 +162,8 @@ mod tests {
             field: Some("Cliente".into()),
             match_kind: "campo".into(),
             reliable: true,
+            ocr_status: None,
+            ocr_confidence: None,
             confidence: None,
         }
     }

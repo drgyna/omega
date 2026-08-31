@@ -2,6 +2,7 @@ mod agent;
 mod answer;
 mod app;
 mod calc;
+mod census;
 mod conversation;
 mod dates;
 mod db;
@@ -9,22 +10,32 @@ mod error;
 pub mod evaluation;
 mod extract;
 mod indexer;
+#[cfg(test)]
+mod migration_tests;
 mod model;
 mod normalize;
-mod ocr;
-mod parser;
+pub mod ocr;
+pub mod parser;
 mod planner;
+mod recovery;
+#[cfg(test)]
+mod recovery_tests;
+mod release_smoke;
 mod relations;
 mod report;
 mod tools;
 mod verifier;
+pub mod workbook;
 
 pub use app::OmegaEngine;
 pub use dates::{CivilDate, Clock};
 pub use db::Database;
 pub use error::{OmegaError, Result};
 pub use model::*;
-pub use parser::OcrProvider;
+pub use ocr::{OcrEngine, OcrOutcome, RecognizedLine, SystemOcr};
+pub use parser::{DocumentParser, LocalDocumentParser, OcrProvider};
+pub use recovery::{BackupPolicy, RecoveryReport, RecoverySource};
+pub use release_smoke::{ReleaseSmokeReport, run_release_smoke};
 pub use tools::ToolEngine;
 pub use verifier::{value_is_supported, verify_model_answer};
 
@@ -104,7 +115,7 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&data_dir)?;
             let database_path: PathBuf = data_dir.join("omega.db");
-            let engine = OmegaEngine::open(database_path)
+            let engine = OmegaEngine::open_recovering(database_path)
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
             app.manage(engine);
             Ok(())

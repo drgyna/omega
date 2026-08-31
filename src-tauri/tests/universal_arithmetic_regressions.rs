@@ -12,6 +12,55 @@ use omega_core::{Clock, OmegaEngine};
 
 const TODAY: &str = "2026-08-25";
 
+/// Los importes negativos son hechos numéricos, no texto decorativo. El
+/// signo puede ir antes o después del símbolo monetario y debe conservarse
+/// hasta la suma exacta; omitirlo convertía una corrección en evidencia no
+/// calculable y podía inflar un total.
+#[test]
+fn negative_money_is_indexed_and_summed_with_its_real_sign() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    write_record(
+        root,
+        "ajuste.md",
+        &[("Folio", "NEG-01"), ("Importe", "-$1,200.50 MXN")],
+    );
+    write_record(
+        root,
+        "abono.md",
+        &[("Folio", "NEG-02"), ("Importe", "$200.25 MXN")],
+    );
+    let engine = index(root);
+
+    let answer = engine.ask_in_conversation("c1", "Suma el campo Importe.").unwrap();
+
+    assert!(answer.verified, "{}", answer.text);
+    assert!(answer.text.contains("-$1,000.25 MXN"), "{}", answer.text);
+    assert!(!answer.text.contains("$1,400.75 MXN"), "{}", answer.text);
+    let scope = answer.scope.expect("alcance declarado");
+    assert_eq!(scope.document_count, Some(2));
+    assert_eq!(scope.value_count, Some(2));
+    assert_eq!(scope.excluded_count, Some(0));
+}
+
+#[test]
+fn an_explicit_euro_symbol_is_indexed_and_rendered_as_eur() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    write_record(
+        root,
+        "euros.md",
+        &[("Folio", "EUR-01"), ("Importe", "€500.00 EUR")],
+    );
+    let engine = index(root);
+
+    let answer = engine.ask_in_conversation("c1", "Suma el campo Importe.").unwrap();
+
+    assert!(answer.verified, "{}", answer.text);
+    assert!(answer.text.contains("€500.00 EUR"), "{}", answer.text);
+    assert!(!answer.text.contains("$500.00"), "{}", answer.text);
+}
+
 /// «Cantidad × Precio unitario», documento por documento, sumando después
 /// los resultados. Nunca debe multiplicar el total global de Cantidad por el
 /// total global de Precio unitario: esa sería una cifra distinta (9 × $285 =
@@ -91,8 +140,8 @@ fn dividing_by_zero_is_excluded_and_reported_never_infinite_or_zero() {
     );
     assert!(!answer.text.contains("inf"), "{}", answer.text);
     assert!(
-        answer.text.contains("dividían entre cero") || answer.text.contains("dividia entre cero"),
-        "debe explicar por qué el segundo documento no participó: {}",
+        answer.text.contains("1 documento no se calculó porque dividía entre cero"),
+        "un solo documento excluido debe concordar en singular: {}",
         answer.text
     );
     assert!(
@@ -141,6 +190,388 @@ fn subtracting_two_fields_excludes_incompatible_currencies() {
         answer.text
     );
     assert!(!answer.verified, "{}", answer.text);
+}
+
+/// El alcance que declara una operación entre dos campos («÷», «×», «−») es
+/// el filtro original completo, no sólo los documentos que además tenían
+/// ambos campos: un documento sin `Cantidad`, o uno que dividía entre cero,
+/// seguía estando en el alcance de la pregunta. `document_count` (alcance),
+/// `value_count` (usados) y `excluded_count` (excluidos) se leen por
+/// separado, sin tener que restar unos de otros.
+#[test]
+fn a_division_scope_reports_the_full_filter_not_only_the_examined_documents() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    for (name, monto, cantidad) in [
+        ("doc-01.md", "$400.00 MXN", "4"),
+        ("doc-02.md", "$900.00 MXN", "3"),
+    ] {
+        write_record(
+            root,
+            name,
+            &[
+                ("Folio", &format!("RG-{name}")),
+                ("Monto principal", monto),
+                ("Cantidad", cantidad),
+            ],
+        );
+    }
+    write_record(
+        root,
+        "doc-missing.md",
+        &[("Folio", "RG-MISS"), ("Monto principal", "$500.00 MXN")],
+    );
+    write_record(
+        root,
+        "doc-zero.md",
+        &[
+            ("Folio", "RG-ZERO"),
+            ("Monto principal", "$300.00 MXN"),
+            ("Cantidad", "0"),
+        ],
+    );
+    let engine = index(root);
+
+    let answer = engine
+        .ask_in_conversation("c1", "¿Cuánto da Monto principal dividido entre Cantidad?")
+        .unwrap();
+
+    let scope = answer.scope.clone().expect("alcance declarado");
+    assert_eq!(
+        scope.document_count,
+        Some(4),
+        "el alcance es el filtro original completo (4 documentos), no sólo los 3 examinados: {:?}",
+        scope
+    );
+    assert_eq!(
+        scope.value_count,
+        Some(2),
+        "sólo 2 documentos produjeron una cifra: {:?}",
+        scope
+    );
+    assert_eq!(
+        scope.excluded_count,
+        Some(2),
+        "1 documento sin Cantidad + 1 dividiendo entre cero: {:?}",
+        scope
+    );
+}
+
+/// Misma separación de alcance/usados/excluidos, ahora con las tres razones
+/// de exclusión que aplican a una resta entre dos campos: campo faltante,
+/// valor no numérico y moneda incompatible.
+#[test]
+fn a_subtraction_scope_separates_missing_invalid_and_currency_exclusions() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    write_record(
+        root,
+        "doc-ok-1.md",
+        &[("Folio", "SB-OK1"), ("Monto A", "$500.00 MXN"), ("Monto B", "$100.00 MXN")],
+    );
+    write_record(
+        root,
+        "doc-ok-2.md",
+        &[("Folio", "SB-OK2"), ("Monto A", "$700.00 MXN"), ("Monto B", "$200.00 MXN")],
+    );
+    write_record(root, "doc-missing.md", &[("Folio", "SB-MISS"), ("Monto A", "$600.00 MXN")]);
+    write_record(
+        root,
+        "doc-invalid.md",
+        &[("Folio", "SB-INV"), ("Monto A", "$600.00 MXN"), ("Monto B", "N/D")],
+    );
+    write_record(
+        root,
+        "doc-currency.md",
+        &[("Folio", "SB-CUR"), ("Monto A", "$600.00 MXN"), ("Monto B", "$50.00 USD")],
+    );
+    let engine = index(root);
+
+    let answer = engine
+        .ask_in_conversation("c1", "¿Cuál es la diferencia entre Monto A y Monto B?")
+        .unwrap();
+
+    let scope = answer.scope.clone().expect("alcance declarado");
+    assert_eq!(
+        scope.document_count,
+        Some(5),
+        "el alcance es el filtro original completo (5 documentos): {:?}",
+        scope
+    );
+    assert_eq!(
+        scope.value_count,
+        Some(2),
+        "sólo 2 documentos produjeron una cifra: {:?}",
+        scope
+    );
+    assert_eq!(
+        scope.excluded_count,
+        Some(3),
+        "1 sin Monto B + 1 con valor no numérico + 1 en otra moneda: {:?}",
+        scope
+    );
+    assert!(
+        answer.text.contains("1 documento no se calculó por unidades incompatibles"),
+        "un solo documento excluido por moneda debe concordar en singular: {}",
+        answer.text
+    );
+    assert!(
+        answer.text.contains("1 documento tenía los dos campos, pero con un valor que no es un número"),
+        "un solo documento excluido por valor inválido debe concordar en singular: {}",
+        answer.text
+    );
+    assert!(
+        answer.text.contains("1 documento sólo tenía uno de los dos campos"),
+        "un solo documento excluido por campo faltante debe concordar en singular: {}",
+        answer.text
+    );
+}
+
+/// Regresión del defecto real: una operación entre dos campos declaraba un
+/// alcance de N documentos, calculaba unos pocos y no explicaba el resto,
+/// presentándose además como verificada. Los documentos que no tienen
+/// **ninguno** de los dos campos no aparecen en ninguna lista de operandos, y
+/// por eso se escapaban de todas las categorías.
+///
+/// Aquí se reproduce la misma forma que en el corpus real (la mayoría del
+/// alcance sin ninguno de los dos campos) y se exige el invariante completo:
+/// alcance = calculados + todos los excluidos.
+#[test]
+fn documents_without_either_field_are_reported_instead_of_silently_dropped() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    // 3 documentos con los dos campos: los únicos calculables.
+    for (name, cantidad, precio) in [
+        ("con-ambos-1.md", "4", "$100.00 MXN"),
+        ("con-ambos-2.md", "2", "$200.00 MXN"),
+        ("con-ambos-3.md", "3", "$300.00 MXN"),
+    ] {
+        write_record(
+            root,
+            name,
+            &[
+                ("Folio", &format!("RG-{name}")),
+                ("Cantidad", cantidad),
+                ("Precio unitario", precio),
+            ],
+        );
+    }
+    // 7 documentos que no tienen ninguno de los dos campos: son los que antes
+    // desaparecían de la respuesta sin dejar rastro.
+    for index in 0..7 {
+        write_record(
+            root,
+            &format!("sin-ninguno-{index}.md"),
+            &[
+                ("Folio", &format!("RG-OTRO-{index}")),
+                ("Estado", "Vigente"),
+                ("Ciudad", "Norte"),
+            ],
+        );
+    }
+    let engine = index(root);
+
+    let answer = engine
+        .ask_in_conversation("c1", "¿Cuánto da Cantidad multiplicada por Precio unitario?")
+        .unwrap();
+
+    let scope = answer.scope.clone().expect("alcance declarado");
+    assert_eq!(
+        scope.document_count,
+        Some(10),
+        "el alcance son los 10 documentos del acervo: {scope:?}"
+    );
+    assert_eq!(
+        scope.value_count,
+        Some(3),
+        "sólo 3 documentos tienen los dos campos: {scope:?}"
+    );
+    assert_eq!(
+        scope.excluded_count,
+        Some(7),
+        "los 7 sin ninguno de los dos campos son exclusiones: {scope:?}"
+    );
+    assert_eq!(
+        scope.value_count.unwrap() + scope.excluded_count.unwrap(),
+        scope.document_count.unwrap(),
+        "invariante: alcance = calculados + excluidos: {scope:?}"
+    );
+    assert!(
+        !answer.verified,
+        "con 7 documentos excluidos la respuesta no puede declararse verificada: {}",
+        answer.text
+    );
+    assert!(
+        answer
+            .text
+            .contains("7 documentos no tenían ninguno de los dos campos"),
+        "la respuesta debe informar el conteo de esa exclusión: {}",
+        answer.text
+    );
+}
+
+/// Un documento sin ninguno de los dos campos se cuenta y se explica, pero no
+/// se le fabrica evidencia: no existe ningún valor de «Cantidad» ni de
+/// «Precio unitario» que citar en él. Las citas sólo pueden venir de
+/// documentos que sí tenían los campos.
+#[test]
+fn documents_without_either_field_are_never_cited_with_invented_evidence() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    for (name, cantidad, precio) in [
+        ("con-ambos-1.md", "4", "$100.00 MXN"),
+        ("con-ambos-2.md", "2", "$200.00 MXN"),
+    ] {
+        write_record(
+            root,
+            name,
+            &[
+                ("Folio", &format!("RG-{name}")),
+                ("Cantidad", cantidad),
+                ("Precio unitario", precio),
+            ],
+        );
+    }
+    for index in 0..4 {
+        write_record(
+            root,
+            &format!("sin-ninguno-{index}.md"),
+            &[("Folio", &format!("RG-OTRO-{index}")), ("Estado", "Vigente")],
+        );
+    }
+    let engine = index(root);
+
+    let answer = engine
+        .ask_in_conversation("c1", "¿Cuánto da Cantidad multiplicada por Precio unitario?")
+        .unwrap();
+
+    assert_eq!(answer.scope.as_ref().unwrap().excluded_count, Some(4));
+    assert!(!answer.citations.is_empty(), "el cálculo real sí se cita");
+    for citation in &answer.citations {
+        assert!(
+            !citation.path.contains("sin-ninguno"),
+            "no puede citarse un documento que no tiene ninguno de los dos campos: {:?}",
+            citation
+        );
+        // Cada cita apunta a un valor realmente indexado, no a un hueco.
+        assert!(
+            citation.value.is_some(),
+            "una cita sin valor sería evidencia inventada: {citation:?}"
+        );
+        assert!(!citation.location.is_empty(), "{citation:?}");
+    }
+}
+
+/// Todas las categorías a la vez, cada documento del alcance en exactamente
+/// una: calculados, excluidos por dividir entre cero, excluidos por un valor
+/// que no es un número, excluidos por tener sólo uno de los dos campos, y
+/// excluidos por no tener ninguno.
+#[test]
+fn every_document_in_scope_falls_into_exactly_one_category() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    // 2 calculables.
+    write_record(root, "ok-1.md", &[("Folio", "C-1"), ("Monto principal", "$400.00 MXN"), ("Cantidad", "4")]);
+    write_record(root, "ok-2.md", &[("Folio", "C-2"), ("Monto principal", "$900.00 MXN"), ("Cantidad", "3")]);
+    // 1 dividiendo entre cero y 1 con un valor que no es un número: tienen
+    // los dos campos, pero no producen cifra.
+    write_record(root, "cero.md", &[("Folio", "C-3"), ("Monto principal", "$300.00 MXN"), ("Cantidad", "0")]);
+    write_record(root, "invalido.md", &[("Folio", "C-4"), ("Monto principal", "$600.00 MXN"), ("Cantidad", "N/D")]);
+    // 1 con sólo uno de los dos campos.
+    write_record(root, "uno-solo.md", &[("Folio", "C-5"), ("Monto principal", "$900.00 MXN")]);
+    // 2 sin ninguno de los dos campos.
+    write_record(root, "ninguno-1.md", &[("Folio", "C-6"), ("Estado", "Vigente")]);
+    write_record(root, "ninguno-2.md", &[("Folio", "C-7"), ("Estado", "Cerrado")]);
+    let engine = index(root);
+
+    let answer = engine
+        .ask_in_conversation("c1", "¿Cuánto da Monto principal dividido entre Cantidad?")
+        .unwrap();
+
+    let scope = answer.scope.clone().expect("alcance declarado");
+    assert_eq!(scope.document_count, Some(7), "{scope:?}");
+    assert_eq!(scope.value_count, Some(2), "{scope:?}");
+    assert_eq!(
+        scope.excluded_count,
+        Some(5),
+        "1 entre cero + 1 inválido + 1 con un campo + 2 sin ninguno: {scope:?}"
+    );
+    assert_eq!(
+        scope.value_count.unwrap() + scope.excluded_count.unwrap(),
+        scope.document_count.unwrap(),
+        "invariante: alcance = calculados + excluidos: {scope:?}"
+    );
+    assert!(!answer.verified, "{}", answer.text);
+
+    // Cada categoría se informa con su propio conteo y su propio motivo.
+    for expected in [
+        "1 documento no se calculó porque dividía entre cero",
+        "1 documento tenía los dos campos, pero con un valor que no es un número",
+        "1 documento sólo tenía uno de los dos campos",
+        "2 documentos no tenían ninguno de los dos campos",
+    ] {
+        assert!(
+            answer.text.contains(expected),
+            "falta «{expected}» en la respuesta: {}",
+            answer.text
+        );
+    }
+    assert!(
+        answer.text.starts_with("División de «Monto principal» entre «Cantidad»"),
+        "{}",
+        answer.text
+    );
+}
+
+/// Los tres encabezados nuevos, uno por operación: nunca «Suma de … por …».
+/// Cada operación usa su propio acervo con dos campos inequívocos, para que
+/// lo que se comprueba sea el encabezado y no la resolución de nombres.
+#[test]
+fn each_row_operation_is_named_by_its_own_verb() {
+    for (fields, question, expected_prefix) in [
+        (
+            [("Cantidad", "4"), ("Precio unitario", "$125.00 MXN")],
+            "¿Cuánto da Cantidad multiplicada por Precio unitario?",
+            "Multiplicación de «Cantidad» por «Precio unitario»",
+        ),
+        (
+            [("Monto principal", "$400.00 MXN"), ("Cantidad", "4")],
+            "¿Cuánto da Monto principal dividido entre Cantidad?",
+            "División de «Monto principal» entre «Cantidad»",
+        ),
+        (
+            [("Monto A", "$500.00 MXN"), ("Monto B", "$100.00 MXN")],
+            "¿Cuál es la diferencia entre Monto A y Monto B?",
+            "Resta de «Monto A» menos «Monto B»",
+        ),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        for index in 0..2 {
+            let mut record = vec![("Folio", format!("RG-{index}"))];
+            for (label, value) in &fields {
+                record.push((*label, (*value).to_owned()));
+            }
+            let borrowed = record
+                .iter()
+                .map(|(label, value)| (*label, value.as_str()))
+                .collect::<Vec<_>>();
+            write_record(root, &format!("doc-{index}.md"), &borrowed);
+        }
+        let engine = index(root);
+
+        let answer = engine.ask_in_conversation("c1", question).unwrap();
+        assert!(
+            answer.text.starts_with(expected_prefix),
+            "«{question}» debía empezar por «{expected_prefix}»: {}",
+            answer.text
+        );
+        assert!(
+            !answer.text.starts_with("Suma de"),
+            "ninguna operación fila por fila debe llamarse «Suma»: {}",
+            answer.text
+        );
+    }
 }
 
 /// Un filtro explícito («Zona: Norte») debe conservarse en una comparación
