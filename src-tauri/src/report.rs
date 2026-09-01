@@ -249,16 +249,24 @@ pub fn category_adjective(value_type: &str) -> &'static str {
 /// lea como si lo fuera.
 pub fn category_computation(
     operation: Operation,
-    requested: &str,
+    requested: Option<&str>,
     value_type: &str,
     buckets: &[Bucket],
     fields: &[(String, usize)],
     coverage: CategoryCoverage,
 ) -> String {
     let adjective = category_adjective(value_type);
-    let heading = format!(
-        "No encontré ningún valor de «{requested}» en este alcance. Lo que sí puedo calcular sin elegir por ti: cada documento que tiene **exactamente un** campo {adjective} determina él mismo cuál es, así que sumé ésos."
-    );
+    // Sin campo pedido no falta nada: la pregunta habló de la categoría, y ésa
+    // es exactamente la cifra que se devuelve. Decir «no encontré X» ahí sería
+    // inventarle al usuario una carencia que él nunca nombró.
+    let heading = match requested {
+        Some(requested) => format!(
+            "No encontré ningún valor de «{requested}» en este alcance. Lo que sí puedo calcular sin elegir por ti: cada documento que tiene **exactamente un** campo {adjective} determina él mismo cuál es, así que sumé ésos."
+        ),
+        None => format!(
+            "Sin elegir ningún campo por ti: cada documento que tiene **exactamente un** campo {adjective} determina él mismo cuál es, y la cifra sale de ésos."
+        ),
+    };
     let figure = if buckets.len() == 1 {
         format!(
             "{} del campo {adjective} de cada documento: {} — {}.",

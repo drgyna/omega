@@ -114,7 +114,13 @@ impl Agent {
                 operation,
                 requested,
                 value_type,
-            } => self.compute_category(operation, &requested, &value_type, &plan.scope, state)?,
+            } => self.compute_category(
+                operation,
+                requested.as_deref(),
+                &value_type,
+                &plan.scope,
+                state,
+            )?,
         };
         // La aclaración pendiente vive exactamente un turno: o el usuario elige
         // una opción, o la siguiente pregunta la sustituye.
@@ -1812,7 +1818,7 @@ impl Agent {
     fn compute_category(
         &self,
         operation: Operation,
-        requested: &str,
+        requested: Option<&str>,
         value_type: &str,
         scope: &PlannedScope,
         state: &mut ConversationState,
@@ -1854,11 +1860,18 @@ impl Agent {
             // numérico): la negativa vuelve a ser la respuesta correcta, pero
             // ahora acompañada del recuento de por qué.
             let mut answer = Answer::unverified(with_scope(
-                format!(
-                    "No encontré ningún valor de «{requested}» en este alcance, y tampoco pude calcular sobre el campo {} de cada documento.\n\n{}",
-                    report::category_adjective(value_type),
-                    report::coverage_note(coverage)
-                ),
+                match requested {
+                    Some(requested) => format!(
+                        "No encontré ningún valor de «{requested}» en este alcance, y tampoco pude calcular sobre el campo {} de cada documento.\n\n{}",
+                        report::category_adjective(value_type),
+                        report::coverage_note(coverage)
+                    ),
+                    None => format!(
+                        "No pude calcular sobre el campo {} de ningún documento de este alcance.\n\n{}",
+                        report::category_adjective(value_type),
+                        report::coverage_note(coverage)
+                    ),
+                },
                 scope,
             ));
             answer.warning =
@@ -1885,26 +1898,44 @@ impl Agent {
         let citations = calculation_citations(operation.label(), &label, &buckets);
         let has_unreliable_ocr = buckets.iter().any(|bucket| bucket.has_unreliable_evidence);
         self.remember_scope(scope, state);
+        // Sustituir el campo pedido por su categoría nunca se da por bueno en
+        // silencio. Cuando la categoría ES lo que se pidió no hay sustitución
+        // que declarar, y la cifra vale lo que valga su cobertura: completa y
+        // con evidencia fiable, se verifica como cualquier otro cálculo.
+        let substituted = requested.is_some();
+        let complete = coverage.excluded() == 0;
+        let warning = match (requested, has_unreliable_ocr) {
+            (Some(requested), true) => Some(format!(
+                "Resultado no verificado: «{requested}» no tiene valores en este alcance, la cifra es del campo {} de cada documento y cubre {} de {} documentos; además, al menos un operando procede de OCR de baja confianza.",
+                report::category_adjective(value_type),
+                coverage.used_documents,
+                coverage.scope_documents
+            )),
+            (Some(requested), false) => Some(format!(
+                "Resultado no verificado: «{requested}» no tiene valores en este alcance. La cifra es del campo {} de cada documento y cubre {} de {} documentos del alcance.",
+                report::category_adjective(value_type),
+                coverage.used_documents,
+                coverage.scope_documents
+            )),
+            (None, true) => Some(
+                "Resultado no verificado: al menos un operando procede de OCR de baja confianza."
+                    .to_owned(),
+            ),
+            (None, false) => (!complete).then(|| {
+                format!(
+                    "Resultado parcial: la cifra cubre {} de {} documentos del alcance; el resto no aportó un valor {} único.",
+                    coverage.used_documents,
+                    coverage.scope_documents,
+                    report::category_adjective(value_type)
+                )
+            }),
+        };
         let answer = Answer {
             text,
             mode: "local".into(),
-            verified: false,
+            verified: !substituted && !has_unreliable_ocr && complete,
             citations,
-            warning: Some(if has_unreliable_ocr {
-                format!(
-                    "Resultado no verificado: «{requested}» no tiene valores en este alcance, la cifra es del campo {} de cada documento y cubre {} de {} documentos; además, al menos un operando procede de OCR de baja confianza.",
-                    report::category_adjective(value_type),
-                    coverage.used_documents,
-                    coverage.scope_documents
-                )
-            } else {
-                format!(
-                    "Resultado no verificado: «{requested}» no tiene valores en este alcance. La cifra es del campo {} de cada documento y cubre {} de {} documentos del alcance.",
-                    report::category_adjective(value_type),
-                    coverage.used_documents,
-                    coverage.scope_documents
-                )
-            }),
+            warning,
             ..Answer::default()
         };
         let mut answer_scope = answer_scope(scope, Some(total_values(&buckets)));

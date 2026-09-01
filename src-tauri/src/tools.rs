@@ -4862,9 +4862,36 @@ fn written_pairs(question: &str) -> Vec<(String, String)> {
         if field.is_empty() || value.is_empty() {
             continue;
         }
+        // Unos dos puntos que siguen a un identificador son puntuación de la
+        // frase, no el separador de un par «Campo: valor». «Revisa el pedido
+        // ABC-2023-00116: ¿cuál es su importe?» no declara ningún filtro: el
+        // identificador ya nombra al documento y lo que sigue es la pregunta.
+        // Sin esta distinción el resto de la frase se tomaba como el valor
+        // buscado —y la respuesta era una negativa sobre un valor que nadie
+        // escribió— antes siquiera de intentar localizar el documento.
+        if ends_with_identifier(field) {
+            continue;
+        }
         pairs.push((field.to_owned(), value.to_owned()));
     }
     pairs
+}
+
+/// ¿Termina este texto en algo que ya es un identificador por sí mismo?
+///
+/// Se mira sólo la última palabra —la que quedaría pegada a los dos puntos— y
+/// se le quitan los adornos con que se suele citar («`ABC-1`», "ABC-1"). El
+/// criterio es el mismo `canonical_identifier` que usa la recuperación, así que
+/// exige letras **y** dígitos: un campo con número suelto («Turno 2») o un
+/// nombre normal («Moneda») nunca se confunden con un identificador.
+fn ends_with_identifier(field: &str) -> bool {
+    field
+        .split_whitespace()
+        .next_back()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .and_then(canonical_identifier)
+        .is_some()
 }
 
 /// ¿Es este colon parte de una hora u otro valor «dígito:dígito», como

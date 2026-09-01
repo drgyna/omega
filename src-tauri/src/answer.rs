@@ -22,7 +22,10 @@ use crate::{
     error::Result,
     extract::classify_value,
     model::{Evidence, SearchHit, TypedValue, ValueKind},
-    normalize::{normalize_exact, normalize_literal, normalize_spanish, search_terms, stems_match},
+    normalize::{
+        canonical_identifier, normalize_exact, normalize_literal, normalize_spanish, search_terms,
+        stems_match,
+    },
     tools::{DocumentValue, SignRecord, ToolEngine},
     verifier::value_is_supported,
 };
@@ -169,6 +172,17 @@ pub fn synthesize(
         Some((_, text)) => entity_type_words(question, text),
         None => Vec::new(),
     };
+    // Las palabras del propio identificador que el usuario escribió para
+    // localizar el documento no pueden nombrar el campo que pregunta. Un folio
+    // como «ABC-2024-00063» aporta la palabra «abc», que coincide entera con el
+    // campo «ABC» —el que guarda ese mismo folio— y le ganaba por puntuación al
+    // campo realmente pedido, cuyo nombre suele traer alguna palabra más que la
+    // pregunta no escribe. El resultado era devolverle al usuario, como dato
+    // extraído y verificado, el mismo identificador que él acababa de teclear.
+    let identifier_words = match &identifier {
+        Some((_, text)) => search_terms(text),
+        None => Vec::new(),
+    };
 
     if let Some((canonical, text)) = &identifier {
         // Una pregunta por los documentos relacionados habla del acervo, no de
@@ -187,13 +201,21 @@ pub fn synthesize(
             // respondería con el identificador —el único campo que esos
             // documentos comparten— en lugar del dato pedido.
             if let Some(synthesis) = identified_field_answer(
-                tools, question, &documents, &terms, &type_words, canonical, text, hits,
+                tools,
+                question,
+                &documents,
+                &terms,
+                &type_words,
+                &identifier_words,
+                canonical,
+                text,
+                hits,
             )? {
                 return Ok(Some(synthesis));
             }
         }
     }
-    shared_field_answer(tools, question, &terms, &type_words, hits)
+    shared_field_answer(tools, question, &terms, &type_words, &identifier_words, hits)
 }
 
 // -------------------------------------------------------------------------
@@ -325,11 +347,79 @@ fn quoted_field_in_located_document(
     })
 }
 
+/// ¿Pide la pregunta un campo distinto del único que la evidencia trajo?
+///
+/// El atajo de un solo grupo existe para las búsquedas que no nombran ningún
+/// campo («Encuentra ABC-123»): ahí lo encontrado ES la respuesta. Pero cuando
+/// la pregunta sí nombra un campo del acervo y ese campo no es el que la
+/// evidencia trae, responder con lo encontrado le devuelve al usuario otro dato
+/// en lugar del pedido, y además verificado, porque la cita es real: prueba que
+/// el identificador existe, no lo que se preguntó.
+///
+/// El campo pedido se busca en TODO el acervo, no sólo en lo recuperado: si
+/// existe pero no está en este documento, se dice; si no existe, esta ruta no
+/// opina y el atajo sigue su curso.
+fn asked_for_another_field(
+    tools: &ToolEngine,
+    question: &str,
+    terms: &[String],
+    type_words: &[String],
+    identifier_words: &[String],
+    groups: &BTreeMap<String, Vec<usize>>,
+    hits: &[SearchHit],
+) -> Result<Option<Synthesis>> {
+    let Some(found) = groups
+        .values()
+        .next()
+        .and_then(|group| group.first())
+        .and_then(|index| field_value(&hits[*index]))
+        .map(|(field, _)| field.to_owned())
+    else {
+        return Ok(None);
+    };
+    let catalogue = tools
+        .list_concepts(None)?
+        .into_iter()
+        .map(|concept| concept.display_name)
+        .collect::<Vec<_>>();
+    let asked = match explicitly_quoted_field(question, &catalogue)
+        .map(FieldMatch::Resolved)
+        .unwrap_or_else(|| resolve_field(&catalogue, terms, type_words, identifier_words))
+    {
+        FieldMatch::Resolved(name) => name,
+        FieldMatch::NotRequested | FieldMatch::Ambiguous => return Ok(None),
+    };
+    if normalize_exact(&asked) == normalize_exact(&found) {
+        return Ok(None);
+    }
+    let citations = hits
+        .iter()
+        .map(|hit| hit.evidence.clone())
+        .collect::<Vec<_>>();
+    let file = hits
+        .first()
+        .map(|hit| file_name(&hit.evidence))
+        .unwrap_or_default();
+    // Sin literales que comprobar: esta frase no afirma ningún valor extraído
+    // —dice justamente que el dato no está—, así que el candado de literalidad
+    // no tiene nada que validar. Pasarle los nombres de los dos campos la
+    // descartaba siempre, porque el campo AUSENTE no aparece por definición en
+    // la evidencia citada, y al descartarse volvía a colarse el eco del folio.
+    Ok(unresolved(
+        format!(
+            "Sin concluir: lo que encontré de {file} es su «{found}», no «{asked}». El acervo tiene un campo «{asked}», pero este documento no lo registra, así que no puedo darte ese dato sin inventarlo."
+        ),
+        &[],
+        citations,
+    ))
+}
+
 fn shared_field_answer(
     tools: &ToolEngine,
     question: &str,
     terms: &[String],
     type_words: &[String],
+    identifier_words: &[String],
     hits: &[SearchHit],
 ) -> Result<Option<Synthesis>> {
     match quoted_field_in_located_document(tools, question, hits)? {
@@ -360,6 +450,21 @@ fn shared_field_answer(
     // categorías). Elegir por tamaño habría respondido con el campo
     // equivocado.
     let members = if groups.len() == 1 {
+        // El atajo vale mientras la pregunta no pida otra cosa. Si nombra un
+        // campo del acervo que NO es éste, contestar con el único encontrado
+        // sería responder otro campo en su lugar —y presentarlo verificado—,
+        // que es justo lo que la evidencia no sostiene.
+        if let Some(synthesis) = asked_for_another_field(
+            tools,
+            question,
+            terms,
+            type_words,
+            identifier_words,
+            &groups,
+            hits,
+        )? {
+            return Ok(Some(synthesis));
+        }
         let Some(members) = groups.into_values().next() else {
             return Ok(None);
         };
@@ -371,7 +476,7 @@ fn shared_field_answer(
             .collect::<Vec<_>>();
         let resolved = match explicitly_quoted_field(question, &vocabulary)
             .map(FieldMatch::Resolved)
-            .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words))
+            .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words, identifier_words))
         {
             FieldMatch::Resolved(name) => name,
             FieldMatch::NotRequested | FieldMatch::Ambiguous => return Ok(None),
@@ -751,6 +856,7 @@ fn identified_field_answer(
     documents: &[DocumentContext],
     terms: &[String],
     type_words: &[String],
+    identifier_words: &[String],
     identifier: &str,
     identifier_text: &str,
     hits: &[SearchHit],
@@ -761,7 +867,7 @@ fn identified_field_answer(
     let vocabulary = distinct_fields(documents.iter().flat_map(|context| context.values.iter()));
     let shared_field = match explicitly_quoted_field(question, &vocabulary)
         .map(FieldMatch::Resolved)
-        .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words))
+        .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words, identifier_words))
     {
         // La pregunta no nombra ningún campo del acervo. Antes de rendirse:
         // puede que lo entrecomillado no sea un campo sino la ETIQUETA de una
@@ -846,7 +952,9 @@ fn identified_field_answer(
     let principal_vocabulary = distinct_fields(principal.values.iter());
     let FieldMatch::Resolved(field) = explicitly_quoted_field(question, &principal_vocabulary)
         .map(FieldMatch::Resolved)
-        .unwrap_or_else(|| resolve_field(&principal_vocabulary, terms, type_words))
+        .unwrap_or_else(|| {
+            resolve_field(&principal_vocabulary, terms, type_words, identifier_words)
+        })
     else {
         return Ok(unresolved(
             format!(
@@ -1312,9 +1420,26 @@ pub fn question_names_a_field(question: &str, vocabulary: &[String]) -> bool {
     }
     let terms = search_terms(question);
     matches!(
-        resolve_field(vocabulary, &terms, &[]),
+        resolve_field(vocabulary, &terms, &[], &identifier_terms_in(question)),
         FieldMatch::Resolved(_)
     )
+}
+
+/// Las palabras que aporta un identificador escrito en la pregunta.
+///
+/// Se reconoce con el mismo criterio que la recuperación (`canonical_identifier`:
+/// letras **y** dígitos), así que una palabra normal o un número suelto nunca
+/// entran aquí. Sirven para no dejar que el folio que el usuario tuvo que
+/// teclear para localizar el documento cuente como el nombre del campo que
+/// pregunta.
+fn identifier_terms_in(question: &str) -> Vec<String> {
+    question
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .filter(|word| canonical_identifier(word).is_some())
+        .flat_map(search_terms)
+        .collect()
 }
 
 /// Campo nombrado explícitamente entre comillas por la pregunta.
@@ -1337,7 +1462,12 @@ fn explicitly_quoted_field(question: &str, vocabulary: &[String]) -> Option<Stri
         .cloned()
 }
 
-fn resolve_field(vocabulary: &[String], terms: &[String], type_words: &[String]) -> FieldMatch {
+fn resolve_field(
+    vocabulary: &[String],
+    terms: &[String],
+    type_words: &[String],
+    identifier_words: &[String],
+) -> FieldMatch {
     let mut best: Option<(usize, usize, String)> = None;
     let mut tied = false;
     for name in vocabulary {
@@ -1350,9 +1480,15 @@ fn resolve_field(vocabulary: &[String], terms: &[String], type_words: &[String])
             .iter()
             .filter(|term| terms.iter().any(|query_term| stems_match(query_term, term)))
             .count();
+        // Un campo sólo está pedido si algo que la pregunta escribió POR SU
+        // CUENTA lo nombra. Las palabras del identificador citado no cuentan,
+        // igual que no cuentan las que sólo nombran el tipo de la entidad ni
+        // las de relleno: están en la pregunta porque hacían falta para
+        // localizar el documento, no porque describan el dato que se busca.
         let has_real_match = field_terms.iter().any(|term| {
             terms.iter().any(|query_term| stems_match(query_term, term))
                 && !type_words.contains(term)
+                && !identifier_words.contains(term)
                 && !FILLER_ROOTS.contains(term)
         });
         if matched == 0 || !has_real_match {
@@ -1796,11 +1932,13 @@ mod tests {
             &vocabulary,
             &search_terms("Busca el documento ABC-123"),
             &[],
+            &[],
         );
         assert!(matches!(requested, FieldMatch::NotRequested));
         let asked = resolve_field(
             &vocabulary,
             &search_terms("¿Cuál es el estado de ABC-123?"),
+            &[],
             &[],
         );
         assert!(matches!(asked, FieldMatch::Resolved(name) if name == "Estado"));
@@ -1812,6 +1950,7 @@ mod tests {
         let requested = resolve_field(
             &vocabulary,
             &search_terms("¿Cuál es el precio de ABC-123?"),
+            &[],
             &[],
         );
         assert!(matches!(requested, FieldMatch::Ambiguous));
@@ -1827,6 +1966,7 @@ mod tests {
         let requested = resolve_field(
             &vocabulary,
             &search_terms("¿Cuál es el estado de ABC-123?"),
+            &[],
             &[],
         );
         assert!(matches!(requested, FieldMatch::Resolved(name) if name == "Estado"));
@@ -1846,6 +1986,7 @@ mod tests {
             &vocabulary,
             &search_terms("¿Cuál es el estado de la propiedad ABC-123?"),
             &type_words,
+            &[],
         );
         assert!(matches!(asked, FieldMatch::Resolved(name) if name == "Estado de la propiedad"));
 
@@ -1855,6 +1996,7 @@ mod tests {
             &vocabulary,
             &search_terms("¿Cuál es el color de la propiedad ABC-123?"),
             &type_words,
+            &[],
         );
         assert!(matches!(invented, FieldMatch::NotRequested));
     }

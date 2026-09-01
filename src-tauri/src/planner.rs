@@ -38,8 +38,14 @@ pub struct QueryPlan {
 pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
     let terms = search_terms(question);
     let has = |root: &str| terms.iter().any(|term| term.starts_with(root));
-    let asks_count = has("cuant") || has("numer") || has("conte") || has("how") || has("total");
-    let asks_sum = has("sum") || has("totaliz") || has("add");
+    // «Total» no es un conteo. Cuenta documentos sólo cuando la pregunta no
+    // dice de qué es el total («¿cuántos documentos hay en total?»); en cuanto
+    // nombra una categoría de valor —«el total de los importes»— es una suma, y
+    // contestarla con un número de documentos era responder otra pregunta.
+    let totals_a_value = has("total") && generic_value_category(question).is_some();
+    let asks_count = (has("cuant") || has("numer") || has("conte") || has("how") || has("total"))
+        && !totals_a_value;
+    let asks_sum = has("sum") || has("totaliz") || has("add") || totals_a_value;
     let asks_group = has("agrup") || has("desglos") || has("group");
     let asks_list = has("muestr")
         || has("list")
@@ -348,6 +354,67 @@ const GENERIC_MONEY_WORDS: &[&str] = &["importe", "importes", "monto", "montos"]
 
 /// Ídem para una cuenta de unidades.
 const GENERIC_QUANTITY_WORDS: &[&str] = &["cantidad", "cantidades", "unidades"];
+
+/// La categoría de valor que una pregunta nombra de forma genérica, sin
+/// nombrar ningún campo concreto: «el total de los importes», «la suma de las
+/// cantidades».
+///
+/// Existe porque un acervo real no guarda «Importe» a secas: guarda «Importe
+/// facturado», «Importe pagado», «Importe de la orden»… Exigir que la pregunta
+/// nombre uno de ellos por su nombre completo dejaba sin respuesta la pregunta
+/// más común de todas —cuánto suma el dinero de este conjunto— y la resolución
+/// caía en un conteo de documentos, que no es lo que se preguntó.
+///
+/// El vocabulario es del idioma, no de ningún acervo: las mismas palabras
+/// valen para cualquier colección de documentos.
+/// ¿Pide la pregunta un total o un acumulado?
+///
+/// Sólo la señal léxica: quién la usa decide si eso basta para llamarlo suma.
+/// Por sí sola no lo es —«¿cuántos documentos hay en total?» cuenta— y por eso
+/// nunca se consulta sin acompañarla de qué se totaliza.
+fn question_mentions_a_total(question: &str) -> bool {
+    let terms = search_terms(question);
+    terms
+        .iter()
+        .any(|term| term.starts_with("total") || term.starts_with("acumulad"))
+}
+
+/// La categoría de valor que la pregunta pide, incluido el caso en que la
+/// nombra con una moneda («el total en MXN») en vez de con la palabra
+/// «importe». La lista de monedas sale del índice, no del código, así que
+/// funciona con cualquier acervo y no conoce ninguna en particular.
+fn requested_value_category(
+    tools: &ToolEngine,
+    question: &str,
+) -> Result<Option<&'static str>> {
+    if let Some(category) = generic_value_category(question) {
+        return Ok(Some(category));
+    }
+    if question_mentions_a_total(question)
+        && explicit_currency(question, &tools.available_currencies()?).is_some()
+    {
+        return Ok(Some("money"));
+    }
+    Ok(None)
+}
+
+fn generic_value_category(question: &str) -> Option<&'static str> {
+    let terms = search_terms(question);
+    let mentions = |list: &[&str]| {
+        list.iter().any(|word| {
+            search_terms(word)
+                .first()
+                .is_some_and(|root| terms.iter().any(|term| stems_match(term, root)))
+        })
+    };
+    if mentions(GENERIC_MONEY_WORDS) {
+        return Some("money");
+    }
+    if mentions(GENERIC_QUANTITY_WORDS) {
+        return Some("number");
+    }
+    None
+}
 
 /// Los dos operandos tal y como la pregunta los escribe, a los lados del
 /// conector de la operación («dividir X entre Y»).
@@ -946,10 +1013,13 @@ pub enum Command {
     /// monetario del documento» lo determina el documento, no el motor—, y la
     /// respuesta declara siempre cuántos documentos del alcance cubrió y por
     /// qué motivo quedaron fuera los demás.
+    /// `requested` es el campo que el usuario nombró y que el alcance no tiene.
+    /// Es `None` cuando la pregunta nombró la categoría misma («los importes»),
+    /// porque entonces no falta nada que declarar.
     ComputeCategory {
         operation: Operation,
         /// Campo que la pregunta nombró y que el alcance no tiene.
-        requested: String,
+        requested: Option<String>,
         /// Categoría de valor sobre la que se calcula («money», «number», …).
         value_type: String,
     },
@@ -1252,9 +1322,18 @@ fn signals(question: &str) -> Signals {
     let any_word = |list: &[&str]| list.iter().any(|value| word(value));
     let maximum = has("maxim") || any_word(MAXIMUM_WORDS);
     let minimum = has("minim") || any_word(MINIMUM_WORDS);
+    // «Total» y «acumulado» son suma, no conteo — pero sólo cuando la pregunta
+    // dice de QUÉ: «el total de los importes» suma dinero, mientras que
+    // «¿cuántos documentos hay en total?» sigue contando documentos. La palabra
+    // sola no decide; lo que decide es que además se nombre una categoría de
+    // valor. (El caso en que el objeto lo nombra una moneda —«el total en
+    // MXN»— lo añade `plan_inner`, que sí puede consultar las monedas del
+    // acervo; aquí no hay acceso al índice.)
+    let totals_a_value =
+        (has("total") || has("acumulad")) && generic_value_category(question).is_some();
     Signals {
         count: has("cuant") || has("numer") || has("conte") || has("how"),
-        sum: has("sum") || has("totaliz"),
+        sum: has("sum") || has("totaliz") || totals_a_value,
         average: has("promedi") || word("media") || has("average"),
         maximum,
         minimum,
@@ -1456,7 +1535,20 @@ fn plan_inner(
     // de las dos la alcanzaba: la primera manda a búsqueda literal cualquier
     // pregunta con comillas, y la segunda exige que los DOS operandos sean
     // campos nombrados del acervo, cosa que «el importe» no es.
-    let marks = signals(question);
+    let mut marks = signals(question);
+    // «El total en MXN» nombra su objeto con la moneda en vez de con la palabra
+    // «importe». `signals` no puede verlo —no conoce el acervo—, así que la
+    // moneda se comprueba aquí, contra las que el índice realmente tiene: sin
+    // esto la pregunta seguía siendo un conteo de documentos.
+    if !marks.sum
+        && question_mentions_a_total(question)
+        && explicit_currency(question, &tools.available_currencies()?).is_some()
+    {
+        // `requested_operation` mira la suma antes que el conteo, así que basta
+        // con encender la suma: no hace falta apagar nada.
+        marks.sum = true;
+    }
+    let marks = marks;
     if let Some((operation, left, right, document, path)) =
         document_row_operation(tools, question, &marks)?
     {
@@ -1633,6 +1725,47 @@ fn plan_inner(
         }
     }
 
+    // Continuación deíctica sobre el documento del que habló la respuesta
+    // anterior: «¿y cuál es la Moneda de ese documento?», «¿y qué cliente está
+    // relacionado con ese mismo pedido?».
+    //
+    // Va ANTES de la ruta de relaciones sin clave. Un campo cuyo nombre lleva
+    // la palabra «relacionado» —los hay en cualquier acervo: «Cliente
+    // relacionado», «Proveedor relacionado»— encendía la señal de relación, y
+    // esa ruta se quedaba con la pregunta sin mirar siquiera el contexto: se
+    // contestaba que no hay vínculo posible cuando lo que se pedía era un campo
+    // del documento que la conversación ya tenía delante.
+    //
+    // Las condiciones son estrechas: la pregunta alude explícitamente al turno
+    // anterior, nombra un campo que el acervo tiene, no pide ninguna operación,
+    // y la respuesta anterior habló de un solo documento —si habló de varios no
+    // hay ninguno al que «ese» pueda señalar y no se adivina—. Se excluyen las
+    // continuaciones que ya tienen su propia ruta (evidencia, contradicciones,
+    // comparación, agrupación) para no robárselas.
+    if reference == Reference::Explicit
+        && !marks.evidence
+        && !marks.contradictions
+        && !marks.differing
+        && !marks.compare
+        && !marks.compare_verb
+        && !marks.group
+        && !marks.superlative
+        && !marks.summary
+        && requested_operation(&marks).is_none()
+    {
+        if let Some(path) = &state.document {
+            if question_names_a_concept(tools, question)? {
+                return Ok(StructuredPlan {
+                    command: Command::DocumentInContext(DocumentSelection::LastCited(
+                        path.clone(),
+                    )),
+                    scope: PlannedScope::default(),
+                    pending: None,
+                });
+            }
+        }
+    }
+
     // Petición de relación sobre algo que no produce una clave estable. La
     // relación por identificador la resuelve la síntesis clásica; aquí sólo se
     // atiende el caso en que no hay clave, para decirlo en vez de unir
@@ -1675,41 +1808,6 @@ fn plan_inner(
                 scope,
                 pending: None,
             });
-        }
-    }
-
-    // Continuación deíctica sobre el documento del que habló la respuesta
-    // anterior: «¿y cuál es la Moneda de ese documento?».
-    //
-    // Las condiciones son estrechas: la pregunta alude explícitamente al turno
-    // anterior, habla de un documento, nombra el campo que quiere, y la
-    // respuesta anterior habló de un solo documento —si habló de varios no hay
-    // ninguno al que «ese» pueda señalar y no se adivina—. Se excluyen las
-    // continuaciones que ya tienen su propia ruta (evidencia, contradicciones,
-    // comparación, agrupación) para no robárselas.
-    if reference == Reference::Explicit
-        && marks.container
-        && !marks.evidence
-        && !marks.contradictions
-        && !marks.differing
-        && !marks.compare
-        && !marks.compare_verb
-        && !marks.group
-        && !marks.superlative
-        && !marks.summary
-        && !marks.related
-        && requested_operation(&marks).is_none()
-    {
-        if let Some(path) = &state.document {
-            if question_names_a_concept(tools, question)? {
-                return Ok(StructuredPlan {
-                    command: Command::DocumentInContext(DocumentSelection::LastCited(
-                        path.clone(),
-                    )),
-                    scope: PlannedScope::default(),
-                    pending: None,
-                });
-            }
         }
     }
 
@@ -1773,8 +1871,13 @@ fn plan_inner(
         operation,
         Some(Operation::Average | Operation::Maximum | Operation::Minimum)
     );
+    // Nombrar la categoría es nombrar el objeto del cálculo tan claramente como
+    // nombrar un campo: «suma los importes de esta carpeta» dice exactamente
+    // qué sumar. Sin esta puerta la pregunta volvía a la recuperación clásica y
+    // salía de allí convertida en un conteo de documentos.
     let simple_sum_with_named_field = operation == Some(Operation::Sum)
-        && question_names_a_concept(tools, question)?;
+        && (question_names_a_concept(tools, question)?
+            || requested_value_category(tools, question)?.is_some());
     let candidate = novel_operation
         // La suma simple usa el mismo motor decimal y de alcance que las
         // demás operaciones: la ruta histórica filtraba los valores inválidos
@@ -2144,7 +2247,7 @@ fn plan_inner(
                 return Ok(StructuredPlan {
                     command: Command::ComputeCategory {
                         operation,
-                        requested: name,
+                        requested: Some(name),
                         value_type,
                     },
                     scope,
@@ -2152,6 +2255,20 @@ fn plan_inner(
                 });
             }
             return Ok(unresolved_plan(Resolved::Absent(name), question, &scope));
+        }
+        // La pregunta pidió la categoría entera, no un campo ausente: se
+        // calcula igual, pero la respuesta no debe decir que falte nada.
+        Resolved::Category(value_type) => {
+            scope.concept = None;
+            return Ok(StructuredPlan {
+                command: Command::ComputeCategory {
+                    operation,
+                    requested: None,
+                    value_type,
+                },
+                scope,
+                pending: None,
+            });
         }
         other => return Ok(unresolved_plan(other, question, &scope)),
     };
@@ -2195,6 +2312,10 @@ fn category_fallback(
 fn unresolved_plan(resolved: Resolved, question: &str, scope: &PlannedScope) -> StructuredPlan {
     match resolved {
         Resolved::Concept(_) => StructuredPlan::retrieval(),
+        // Una categoría sólo la sabe calcular la ruta de cálculo; cualquier
+        // otra que la reciba (ordenar, agrupar) no tiene con qué, y devolverla
+        // a la recuperación es lo mismo que hacía antes de existir.
+        Resolved::Category(_) => StructuredPlan::retrieval(),
         Resolved::Ambiguous(options) => ambiguous_field(options, question, scope),
         Resolved::Absent(name) => StructuredPlan::without_evidence(format!(
             "No encontré valores de «{name}» con evidencia en ese alcance, así que no puedo calcular nada sobre ellos."
@@ -2661,6 +2782,10 @@ fn resolve_documents(tools: &ToolEngine, scope: &mut PlannedScope) -> Result<Vec
 
 enum Resolved {
     Concept(String),
+    /// La pregunta nombró la CATEGORÍA de valor («los importes»), no un campo.
+    /// Se calcula sobre el campo de esa categoría que cada documento determina
+    /// por sí mismo, sin elegir uno por el usuario.
+    Category(String),
     Ambiguous(Vec<String>),
     /// El campo existe en el acervo, pero no en el alcance consultado.
     Absent(String),
@@ -2759,6 +2884,27 @@ fn resolve_computation_concept(
             }
         }
     }
+    // La pregunta nombra la categoría en vez de un campo: «el total de los
+    // importes de esta carpeta». No es una pregunta sin campo —dice
+    // perfectamente qué quiere sumar—, así que no puede tratarse como si no
+    // hubiera nombrado nada. Va antes de `require_named` justamente por eso:
+    // exigirle el nombre completo de un campo era lo que la mandaba de vuelta a
+    // la recuperación clásica, donde acababa contando documentos.
+    // `exclude` sólo llega desde la ruta de ordenación por grupos, que necesita
+    // un campo concreto por el que ordenar: allí una categoría no le sirve y se
+    // deja el comportamiento exactamente como estaba.
+    if exclude.is_none() {
+        if let Some(value_type) = requested_value_category(tools, question)? {
+            if usable(value_type)
+                && in_scope
+                    .iter()
+                    .any(|concept| concept.value_type == value_type)
+            {
+                return Ok(Resolved::Category(value_type.to_owned()));
+            }
+        }
+    }
+
     let candidates = in_scope
         .iter()
         .filter(|concept| usable(&concept.value_type))
