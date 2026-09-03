@@ -85,10 +85,18 @@ export interface ReadDocument {
   reliable: boolean;
 }
 
+export interface ReadingClaim {
+  text: string;
+  evidence: Evidence;
+}
+
 /** Lectura de los documentos ya citados. Acompaña a la respuesta; no la sustituye. */
 export interface AnswerReading {
   text: string;
   documents: ReadDocument[];
+  claims: ReadingClaim[];
+  documents_matched: number;
+  documents_read: number;
   truncated: boolean;
 }
 

@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::{
     error::Result,
-    model::{Answer, AnswerReading, ReadDocument},
+    model::{Answer, AnswerReading, Evidence, ReadDocument, ReadingClaim},
     normalize::{normalize_exact, search_terms, stems_match},
     report::{category_adjective, file_name, plural},
     tools::{DocumentPassage, DocumentValue, ToolEngine},
@@ -94,7 +94,7 @@ fn compose(tools: &ToolEngine, answer: &Answer) -> Option<AnswerReading> {
         return None;
     }
     let mut truncated = cited > documents.len();
-    let text = if documents.len() == 1 {
+    let (text, claims) = if documents.len() == 1 {
         write_single(&documents[0], &mut truncated)
     } else {
         write_many(&documents, cited, &mut truncated)
@@ -115,8 +115,55 @@ fn compose(tools: &ToolEngine, answer: &Answer) -> Option<AnswerReading> {
                 reliable: document.reliable(),
             })
             .collect(),
+        claims,
+        documents_matched: answer
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.document_count)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(cited),
+        documents_read: documents.len(),
         truncated,
     })
+}
+
+/// Sumidero de hechos publicados: cada claim se registra en el mismo momento
+/// en que el bloque que lo escribe decide publicarlo, nunca reconstruido
+/// después buscando subcadenas en el texto ya compuesto. Eso evita el falso
+/// positivo de un valor corto (p. ej. «17») que aparece dentro de otro más
+/// largo («2026-04-17») sin ser el mismo hecho.
+///
+/// Se deduplica por evidencia, nunca por literal: dos documentos que escriben
+/// lo mismo siguen siendo dos respaldos distintos.
+#[derive(Default)]
+struct ClaimSink {
+    seen: HashSet<String>,
+    claims: Vec<ReadingClaim>,
+}
+
+impl ClaimSink {
+    fn record(&mut self, value: &DocumentValue) {
+        self.push(format!("{}: {}", value.field, value.value), &value.evidence);
+    }
+
+    fn push(&mut self, text: String, evidence: &Evidence) {
+        if self.seen.insert(evidence.id.clone()) {
+            self.claims.push(ReadingClaim {
+                text,
+                evidence: evidence.clone(),
+            });
+        }
+    }
+}
+
+/// Un título embebido en el texto se respalda con el pasaje íntegro del que
+/// salió, igual que exige `passage_supports` para citarlo.
+fn title_claim(document: &DocumentReading, title: &str, claims: &mut ClaimSink) {
+    if let Some(passage) = document.passages.first() {
+        let mut evidence = passage.evidence.clone();
+        evidence.excerpt = passage.content.clone();
+        claims.push(title.to_owned(), &evidence);
+    }
 }
 
 /// Recorre las citas en su orden y reúne los documentos distintos, guardando
@@ -292,11 +339,13 @@ impl DocumentReading {
 
 /// Un documento leído: identidad, la respuesta, y después lo que el documento
 /// declara, agrupado por lo único que el esquema sabe de cada valor.
-fn write_single(document: &DocumentReading, truncated: &mut bool) -> String {
+fn write_single(document: &DocumentReading, truncated: &mut bool) -> (String, Vec<ReadingClaim>) {
     let mut published = Published::default();
+    let mut claims = ClaimSink::default();
     let mut paragraphs: Vec<String> = Vec::new();
 
     if let Some(title) = document.title() {
+        title_claim(document, title, &mut claims);
         paragraphs.push(format!(
             "«{title}». Leí sus {} {}.",
             document.passages.len(),
@@ -304,8 +353,8 @@ fn write_single(document: &DocumentReading, truncated: &mut bool) -> String {
         ));
     }
 
-    let answer = answer_block(document, &mut published);
-    let siblings = siblings_block(document, &mut published, truncated);
+    let answer = answer_block(document, &mut published, &mut claims);
+    let siblings = siblings_block(document, &mut published, truncated, &mut claims);
     let middle = [answer, siblings]
         .into_iter()
         .flatten()
@@ -315,10 +364,10 @@ fn write_single(document: &DocumentReading, truncated: &mut bool) -> String {
     }
 
     let body = [
-        dates_block(document, &mut published, truncated),
-        amounts_block(document, &mut published, truncated),
-        plain_block(document, &mut published, truncated),
-        identifiers_block(document, &mut published, truncated),
+        dates_block(document, &mut published, truncated, &mut claims),
+        amounts_block(document, &mut published, truncated, &mut claims),
+        plain_block(document, &mut published, truncated, &mut claims),
+        identifiers_block(document, &mut published, truncated, &mut claims),
     ]
     .into_iter()
     .flatten()
@@ -338,7 +387,7 @@ fn write_single(document: &DocumentReading, truncated: &mut bool) -> String {
         paragraphs.push(format!("Cierra con: «{closing}»{stop}"));
     }
 
-    paragraphs.join("\n\n")
+    (paragraphs.join("\n\n"), claims.claims)
 }
 
 /// Campos ya publicados, por par campo/valor. Un mismo dato declarado dos
@@ -388,9 +437,14 @@ fn pending<'a>(
         .into_iter()
 }
 
-fn answer_block(document: &DocumentReading, published: &mut Published) -> Option<String> {
+fn answer_block(
+    document: &DocumentReading,
+    published: &mut Published,
+    claims: &mut ClaimSink,
+) -> Option<String> {
     let value = document.answering()?;
     published.insert(value);
+    claims.record(value);
     Some(format!(
         "Responde tu pregunta en {}: {}, en {}.",
         value.field, value.value, value.evidence.location
@@ -404,6 +458,7 @@ fn siblings_block(
     document: &DocumentReading,
     published: &mut Published,
     truncated: &mut bool,
+    claims: &mut ClaimSink,
 ) -> Option<String> {
     let answering = document.answering()?;
     let terms = search_terms(&answering.field);
@@ -435,6 +490,7 @@ fn siblings_block(
         .take(MAX_SIBLINGS)
         .map(|value| {
             published.insert(value);
+            claims.record(value);
             format!("{}, {}", value.field, value.value)
         })
         .collect::<Vec<_>>();
@@ -450,6 +506,7 @@ fn dates_block(
     document: &DocumentReading,
     published: &mut Published,
     truncated: &mut bool,
+    claims: &mut ClaimSink,
 ) -> Option<String> {
     let mut distinct = Vec::new();
     let mut seen = HashSet::new();
@@ -468,6 +525,7 @@ fn dates_block(
     if total == 1 {
         let value = distinct[0];
         published.insert(value);
+        claims.record(value);
         return Some(format!("El documento se fecha el {}.", value.value));
     }
     if total > MAX_DATES {
@@ -478,6 +536,7 @@ fn dates_block(
         .take(MAX_DATES)
         .map(|value| {
             published.insert(value);
+            claims.record(value);
             value.value.clone()
         })
         .collect::<Vec<_>>();
@@ -495,6 +554,7 @@ fn amounts_block(
     document: &DocumentReading,
     published: &mut Published,
     truncated: &mut bool,
+    claims: &mut ClaimSink,
 ) -> Option<String> {
     let mut sentences = Vec::new();
     for kind in ["money", "percentage", "number"] {
@@ -513,6 +573,7 @@ fn amounts_block(
             .take(MAX_AMOUNTS)
             .map(|value| {
                 published.insert(value);
+                claims.record(value);
                 format!("{}, {}", value.field, value.value)
             })
             .collect::<Vec<_>>();
@@ -547,6 +608,7 @@ fn plain_block(
     document: &DocumentReading,
     published: &mut Published,
     truncated: &mut bool,
+    claims: &mut ClaimSink,
 ) -> Option<String> {
     let rest = pending(document, published)
         .filter(|value| matches!(value.value_type.as_str(), "text" | "state"))
@@ -561,6 +623,7 @@ fn plain_block(
         .take(MAX_PLAIN_FIELDS)
         .map(|value| {
             published.insert(value);
+            claims.record(value);
             (value.field.clone(), value.value.clone())
         })
         .collect::<Vec<_>>();
@@ -594,6 +657,7 @@ fn identifiers_block(
     document: &DocumentReading,
     published: &mut Published,
     truncated: &mut bool,
+    claims: &mut ClaimSink,
 ) -> Option<String> {
     let keys = pending(document, published)
         .filter(|value| value.identifier_canonical.is_some())
@@ -610,6 +674,7 @@ fn identifiers_block(
         .take(MAX_IDENTIFIERS)
         .map(|value| {
             published.insert(value);
+            claims.record(value);
             format!("{}: {}", value.field, value.value)
         })
         .collect::<Vec<_>>();
@@ -625,16 +690,21 @@ fn identifiers_block(
 /// después cada uno en forma breve. Con muchos se recorta el detalle de cada
 /// documento antes que su número; lo que se recorte se dice en el propio
 /// texto, para que nadie lea un resumen parcial como si fuera completo.
-fn write_many(documents: &[DocumentReading], cited: usize, truncated: &mut bool) -> String {
+fn write_many(
+    documents: &[DocumentReading],
+    cited: usize,
+    truncated: &mut bool,
+) -> (String, Vec<ReadingClaim>) {
     let total = documents.len();
+    let mut claims = ClaimSink::default();
     let fields = FieldsAcross::of(documents);
     let mut heading = vec![if cited > total {
         format!("Leí {total} de los {cited} documentos citados.")
     } else {
         format!("Leí {total} documentos.")
     }];
-    heading.extend(fields.common(total));
-    heading.extend(fields.differing());
+    heading.extend(fields.common(total, &mut claims));
+    heading.extend(fields.differing(&mut claims));
 
     let detailed = total <= MAX_DETAILED_DOCUMENTS;
     if !detailed {
@@ -660,19 +730,22 @@ fn write_many(documents: &[DocumentReading], cited: usize, truncated: &mut bool)
     let lines = documents
         .iter()
         .take(listed)
-        .map(|document| format!("- {}", document_line(document, detailed)))
+        .map(|document| format!("- {}", document_line(document, detailed, &mut claims)))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("{}\n\n{lines}", heading.join(" "))
+    (format!("{}\n\n{lines}", heading.join(" ")), claims.claims)
 }
 
 /// Una línea por documento: cómo se llama, con qué números está citado y qué
 /// dice en el campo que responde la pregunta.
-fn document_line(document: &DocumentReading, detailed: bool) -> String {
+fn document_line(document: &DocumentReading, detailed: bool, claims: &mut ClaimSink) -> String {
     let name = document
         .title()
         .filter(|_| detailed)
-        .map(|title| format!("«{title}»"))
+        .map(|title| {
+            title_claim(document, title, claims);
+            format!("«{title}»")
+        })
         .unwrap_or_else(|| format!("`{}`", file_name(&document.path)));
     let numbers = document
         .citation_numbers
@@ -685,7 +758,10 @@ fn document_line(document: &DocumentReading, detailed: bool) -> String {
         join_with(&numbers, ", ", " y ")
     );
     match document.answering() {
-        Some(value) => format!("{name}, {citations}: {}, {}.", value.field, value.value),
+        Some(value) => {
+            claims.record(value);
+            format!("{name}, {citations}: {}, {}.", value.field, value.value)
+        }
         None => format!("{name}, {citations}."),
     }
 }
@@ -703,9 +779,10 @@ struct FieldAcross {
     /// ella pone primero lo que los documentos ponen primero, sin que este
     /// código tenga que saber qué campo es más importante.
     ordinal: usize,
-    /// Un valor por documento: el primero que ese documento declara. Los
-    /// valores ya pasaron el candado al abrirse su documento.
-    per_document: Vec<String>,
+    /// Un valor por documento: el primero que ese documento declara, con la
+    /// evidencia exacta de la que salió. Los valores ya pasaron el candado al
+    /// abrirse su documento.
+    per_document: Vec<(String, Evidence)>,
 }
 
 impl FieldsAcross {
@@ -727,7 +804,9 @@ impl FieldsAcross {
                     per_document: Vec::new(),
                 });
                 entry.ordinal = entry.ordinal.min(value.ordinal);
-                entry.per_document.push(value.value.clone());
+                entry
+                    .per_document
+                    .push((value.value.clone(), value.evidence.clone()));
             }
         }
         let mut entries = index.into_values().collect::<Vec<_>>();
@@ -736,62 +815,77 @@ impl FieldsAcross {
     }
 
     /// Campos en los que los documentos leídos declaran todos el mismo valor.
-    fn common(&self, total: usize) -> Option<String> {
-        let shared = self
-            .entries
-            .iter()
-            .filter(|field| field.per_document.len() == total)
-            .filter_map(|field| {
-                let first = field.per_document.first()?;
-                let same = field
-                    .per_document
-                    .iter()
-                    .all(|value| normalize_exact(value) == normalize_exact(first));
-                same.then(|| format!("{}: {first}", field.display))
-            })
-            .take(MAX_COMMON_FIELDS)
-            .collect::<Vec<_>>();
+    fn common(&self, total: usize, claims: &mut ClaimSink) -> Option<String> {
+        let mut shared = Vec::new();
+        for field in &self.entries {
+            if field.per_document.len() != total {
+                continue;
+            }
+            let Some((first, _)) = field.per_document.first() else {
+                continue;
+            };
+            let same = field
+                .per_document
+                .iter()
+                .all(|(value, _)| normalize_exact(value) == normalize_exact(first));
+            if !same {
+                continue;
+            }
+            shared.push(format!("{}: {first}", field.display));
+            for (value, evidence) in &field.per_document {
+                claims.push(format!("{}: {value}", field.display), evidence);
+            }
+            if shared.len() >= MAX_COMMON_FIELDS {
+                break;
+            }
+        }
         (!shared.is_empty())
             .then(|| format!("Los {total} coinciden en {}.", join_with(&shared, "; ", "; y ")))
     }
 
     /// Campos en los que no coinciden, con cuántos documentos sostienen cada
     /// valor.
-    fn differing(&self) -> Option<String> {
-        let split = self
-            .entries
-            .iter()
-            .filter(|field| field.per_document.len() >= 2)
-            .filter_map(|field| {
-                let mut counted: BTreeMap<String, (String, usize)> = BTreeMap::new();
-                for value in &field.per_document {
-                    let entry = counted
-                        .entry(normalize_exact(value))
-                        .or_insert_with(|| (value.clone(), 0));
-                    entry.1 += 1;
-                }
-                if counted.len() < 2 {
-                    return None;
-                }
-                // Cuando los valores son demasiados para enumerarlos se dice
-                // cuántos hay: es el mismo dato, y cabe.
-                if counted.len() > MAX_DISTINCT_VALUES {
-                    return Some(format!(
-                        "{}: {} valores distintos",
-                        field.display,
-                        counted.len()
-                    ));
-                }
+    fn differing(&self, claims: &mut ClaimSink) -> Option<String> {
+        let mut split = Vec::new();
+        for field in &self.entries {
+            if field.per_document.len() < 2 {
+                continue;
+            }
+            let mut counted: BTreeMap<String, (String, usize)> = BTreeMap::new();
+            for (value, _) in &field.per_document {
+                let entry = counted
+                    .entry(normalize_exact(value))
+                    .or_insert_with(|| (value.clone(), 0));
+                entry.1 += 1;
+            }
+            if counted.len() < 2 {
+                continue;
+            }
+            // Cuando los valores son demasiados para enumerarlos se dice
+            // cuántos hay: es el mismo dato, y cabe. Sin una cifra concreta
+            // publicada, no hay nada que respaldar con un claim.
+            if counted.len() > MAX_DISTINCT_VALUES {
+                split.push(format!(
+                    "{}: {} valores distintos",
+                    field.display,
+                    counted.len()
+                ));
+            } else {
                 let mut values = counted.into_values().collect::<Vec<_>>();
                 values.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                 let list = values
                     .into_iter()
                     .map(|(value, count)| format!("{value} ({count})"))
                     .collect::<Vec<_>>();
-                Some(format!("{}: {}", field.display, join_with(&list, ", ", ", ")))
-            })
-            .take(MAX_DIFFERING_FIELDS)
-            .collect::<Vec<_>>();
+                split.push(format!("{}: {}", field.display, join_with(&list, ", ", ", ")));
+                for (value, evidence) in &field.per_document {
+                    claims.push(format!("{}: {value}", field.display), evidence);
+                }
+            }
+            if split.len() >= MAX_DIFFERING_FIELDS {
+                break;
+            }
+        }
         (!split.is_empty())
             .then(|| format!("Se diferencian en {}.", join_with(&split, "; ", "; y ")))
     }

@@ -21,8 +21,7 @@ use crate::{
     relations,
     report,
     tools::{
-        self, DocumentQueryResult, LocatedDocument, OriginSummary, TextQueryResult, ToolEngine,
-        ValueQuery,
+        self, DocumentQueryResult, LocatedDocument, OriginSummary, ToolEngine, ValueQuery,
     },
 };
 
@@ -903,20 +902,78 @@ impl Agent {
                     plan.origin.as_deref(),
                     sample_limit,
                 )?;
+                if result.document_count == 0 && plan.filters.len() > 1 {
+                    let coherence = self.tools.coherent_search(
+                        question,
+                        plan.origin.as_deref(),
+                        sample_limit,
+                    )?;
+                    if coherence.class == tools::CoherenceClass::IncompatibleCriteria {
+                        return Ok((incompatible_criteria_answer(&coherence), None));
+                    }
+                }
                 Ok((
                     document_answer(result, &plan.filters, plan.origin.as_deref()),
                     None,
                 ))
             }
             QueryIntent::FreeText => {
-                let result =
-                    self.tools
-                        .search_text(question, plan.origin.as_deref(), MAX_TEXT_CITATIONS)?;
-                Ok((text_answer(question, result), None))
+                self.free_text_answer(question, plan.origin.as_deref(), MAX_TEXT_CITATIONS)
             }
-            QueryIntent::BoundedSearch => self.legacy_answer(question, 20),
-            QueryIntent::LegacySearch => self.legacy_answer(question, usize::MAX),
+            QueryIntent::BoundedSearch => {
+                self.coherent_answer(question, plan.origin.as_deref(), 20, true)
+            }
+            QueryIntent::LegacySearch => {
+                self.coherent_answer(question, plan.origin.as_deref(), usize::MAX, true)
+            }
         }
+    }
+
+    fn coherent_answer(
+        &self,
+        question: &str,
+        origin: Option<&str>,
+        limit: usize,
+        allow_synthesis: bool,
+    ) -> Result<(Answer, Option<String>)> {
+        let result = self.tools.coherent_search(question, origin, limit)?;
+        if result.class == tools::CoherenceClass::IncompatibleCriteria {
+            return Ok((incompatible_criteria_answer(&result), None));
+        }
+        if result.hits.is_empty() {
+            return Ok((no_evidence_answer(), None));
+        }
+        let document_count = result.document_count.map(|count| count as i64);
+        let filters = result.filters;
+        let (mut answer, subject) =
+            self.answer_from_hits(question, result.hits, limit, allow_synthesis)?;
+        answer.scope = Some(AnswerScope {
+            filters,
+            origin: origin.map(str::to_owned),
+            document_count,
+            ..AnswerScope::default()
+        });
+        apply_legal_guidance_note(question, &mut answer);
+        Ok((answer, subject))
+    }
+
+    /// Texto libre: la pregunta no acota ningún campo, así que se busca
+    /// directamente en el contenido de los documentos (FTS), como esta ruta
+    /// siempre lo hizo. No pasa por `coherent_search`: esa capa exige que
+    /// varios criterios estructurados convivan en el mismo documento, y una
+    /// pregunta de prosa («¿qué impide…?») no trae ninguno que coordinar —
+    /// forzarla por la búsqueda genérica de metadatos hacía que una coincidencia
+    /// de nombre de carpeta le ganara el lugar a la evidencia real.
+    fn free_text_answer(
+        &self,
+        question: &str,
+        origin: Option<&str>,
+        limit: usize,
+    ) -> Result<(Answer, Option<String>)> {
+        let result = self.tools.search_text(question, origin, limit.saturating_add(1))?;
+        let (mut answer, subject) = self.answer_from_hits(question, result.hits, limit, false)?;
+        apply_legal_guidance_note(question, &mut answer);
+        Ok((answer, subject))
     }
 
     fn legacy_answer(&self, question: &str, limit: usize) -> Result<(Answer, Option<String>)> {
@@ -924,7 +981,17 @@ impl Agent {
         // completa de una recortada. Sin esa señal, un listado que llega justo
         // al tope se presenta igual que uno que agotó el acervo, y las cifras
         // que aparecen en su texto ("20 valores") se leen como un total.
-        let mut hits = self.tools.search(question, &[], limit.saturating_add(1))?;
+        let hits = self.tools.search(question, &[], limit.saturating_add(1))?;
+        self.answer_from_hits(question, hits, limit, true)
+    }
+
+    fn answer_from_hits(
+        &self,
+        question: &str,
+        mut hits: Vec<SearchHit>,
+        limit: usize,
+        allow_synthesis: bool,
+    ) -> Result<(Answer, Option<String>)> {
         let truncated = hits.len() > limit;
         hits.truncate(limit);
         if hits.is_empty() {
@@ -954,24 +1021,30 @@ impl Agent {
                 None,
             ));
         }
-        let (mut answer, subject) =
-            if let Some(synthesis) = answer::synthesize(&self.tools, question, &hits)? {
-                // `Answer::verified` es el candado de confiabilidad: deriva
-                // `verified` de las citas y adjunta la advertencia de OCR
-                // débil. La síntesis sólo puede bajar ese valor (caso
-                // `unresolved`), nunca subirlo.
-                let mut answer = Answer::verified(synthesis.text, synthesis.citations);
-                answer.verified &= synthesis.verified;
-                (answer, synthesis.subject)
-            } else {
-                (
-                    Answer::verified(
-                        format!("{} resultados con evidencia específica.", hits.len()),
-                        hits.into_iter().map(|hit| hit.evidence).collect(),
-                    ),
-                    None,
-                )
-            };
+        let synthesis = if allow_synthesis {
+            answer::synthesize(&self.tools, question, &hits)?
+        } else {
+            None
+        };
+        let (mut answer, subject) = if let Some(synthesis) = synthesis {
+            // `Answer::verified` es el candado de confiabilidad: deriva
+            // `verified` de las citas y adjunta la advertencia de OCR
+            // débil. La síntesis sólo puede bajar ese valor (caso
+            // `unresolved`), nunca subirlo.
+            let mut answer = Answer::verified(synthesis.text, synthesis.citations);
+            answer.verified &= synthesis.verified;
+            (answer, synthesis.subject)
+        } else if allow_synthesis {
+            (
+                Answer::verified(
+                    format!("{} resultados con evidencia específica.", hits.len()),
+                    hits.into_iter().map(|hit| hit.evidence).collect(),
+                ),
+                None,
+            )
+        } else {
+            (text_excerpt_answer(hits), None)
+        };
         if truncated {
             note_truncated_sample(&mut answer, limit);
         }
@@ -1243,42 +1316,6 @@ fn aggregate_answer(
     }
 }
 
-fn text_answer(question: &str, result: TextQueryResult) -> Answer {
-    if result.hits.is_empty() {
-        return no_evidence_answer();
-    }
-    let excerpts = result
-        .hits
-        .iter()
-        .take(3)
-        .map(|hit| format!("- {}", hit.evidence.excerpt.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let legal = asks_for_legal_guidance(question);
-    let mut answer = Answer::verified(
-        format!(
-            "Encontré evidencia pertinente en {} documentos. Extractos del acervo:\n\n{}{}",
-            result.document_count,
-            excerpts,
-            if legal {
-                "\n\nEsta respuesta se limita al material indexado y no sustituye asesoría legal ni una fuente oficial."
-            } else {
-                ""
-            }
-        ),
-        result.hits.into_iter().map(|hit| hit.evidence).collect(),
-    );
-    if legal {
-        const LEGAL: &str = "Contenido extractivo del acervo local; no constituye asesoría legal.";
-        // La nota legal se suma a la advertencia de OCR, no la reemplaza.
-        answer.warning = Some(match answer.warning {
-            Some(ocr) => format!("{ocr} {LEGAL}"),
-            None => LEGAL.to_owned(),
-        });
-    }
-    answer
-}
-
 /// Un listado que llega justo al tope interno no puede presentarse como si
 /// hubiera agotado el acervo: las cifras de su texto cuentan lo que se muestra,
 /// no lo que existe. La respuesta lo declara —en el texto y en la advertencia—
@@ -1303,6 +1340,83 @@ fn note_truncated_sample(answer: &mut Answer, limit: usize) {
         Some(existing) => format!("{existing} {note}"),
         None => note,
     });
+}
+
+/// El motor sólo cita lo que el acervo dice; nunca sustituye una fuente
+/// oficial ni asesoría profesional, así que una pregunta legal lleva una nota
+/// adicional, sumada a la advertencia de OCR si ya había una.
+fn apply_legal_guidance_note(question: &str, answer: &mut Answer) {
+    if !asks_for_legal_guidance(question) {
+        return;
+    }
+    const LEGAL: &str = "Contenido extractivo del acervo local; no constituye asesoría legal.";
+    answer.warning = Some(match answer.warning.take() {
+        Some(ocr) => format!("{ocr} {LEGAL}"),
+        None => LEGAL.to_owned(),
+    });
+    if !answer.text.contains("no sustituye asesoría legal") {
+        answer.text.push_str(
+            "\n\nEsta respuesta se limita al material indexado y no sustituye asesoría legal ni una fuente oficial.",
+        );
+    }
+}
+
+/// Aclaración única para cuando `coherent_search` encuentra que cada criterio
+/// de la pregunta existe por separado en el índice, pero nunca juntos en el
+/// mismo documento. Un solo texto, para que las dos rutas que pueden toparse
+/// con esto —recuento/listado clásico y búsqueda coherente— digan lo mismo.
+fn incompatible_criteria_answer(result: &tools::CoherentSearchResult) -> Answer {
+    clarify(Clarification {
+        question: "Los criterios existen en el índice, pero no juntos en un mismo documento. No los combinaré como una respuesta verificada. ¿Qué criterio quieres conservar?".into(),
+        options: result.alternatives.clone(),
+        reason: "criterios_incompatibles".into(),
+    })
+}
+
+/// ¿La pregunta pide orientación legal? El motor sólo puede citar lo que el
+/// acervo dice; nunca sustituye una fuente oficial ni asesoría profesional,
+/// así que estas respuestas llevan una nota adicional.
+fn asks_for_legal_guidance(question: &str) -> bool {
+    let normalized = normalize_exact(question);
+    [
+        "legal",
+        "ley",
+        "leyes",
+        "norma",
+        "normativa",
+        "regulacion",
+        "obligacion",
+        "obligaciones",
+        "asesoria",
+    ]
+    .iter()
+    .any(|term| normalized.split_whitespace().any(|word| word == *term))
+}
+
+/// Respuesta de texto libre sin síntesis de campo: extractos legibles del
+/// acervo, tal como esta ruta respondía antes de que `coherent_search`
+/// mejorara qué documentos se citan. Una pregunta de prosa («¿qué impide…?»)
+/// no localiza un campo concreto que extraer; citar el fragmento donde
+/// aparece la respuesta es más honesto que forzar una síntesis que no aplica.
+fn text_excerpt_answer(hits: Vec<SearchHit>) -> Answer {
+    let document_count = hits
+        .iter()
+        .map(|hit| hit.evidence.document_id)
+        .collect::<HashSet<_>>()
+        .len();
+    let excerpts = hits
+        .iter()
+        .take(3)
+        .map(|hit| format!("- {}", hit.evidence.excerpt.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Answer::verified(
+        format!(
+            "Encontré evidencia pertinente en {document_count} {}. Extractos del acervo:\n\n{excerpts}",
+            if document_count == 1 { "documento" } else { "documentos" }
+        ),
+        hits.into_iter().map(|hit| hit.evidence).collect(),
+    )
 }
 
 fn no_evidence_answer() -> Answer {
@@ -1649,23 +1763,6 @@ fn asks_what_can_be_extracted(question: &str) -> bool {
         .iter()
         .any(|word| word.starts_with("archiv") || word.starts_with("fichero"));
     verb && about_a_file
-}
-
-fn asks_for_legal_guidance(question: &str) -> bool {
-    let normalized = normalize_exact(question);
-    [
-        "legal",
-        "ley",
-        "leyes",
-        "norma",
-        "normativa",
-        "regulacion",
-        "obligacion",
-        "obligaciones",
-        "asesoria",
-    ]
-    .iter()
-    .any(|term| normalized.split_whitespace().any(|word| word == *term))
 }
 
 // ---------------------------------------------------------------------------

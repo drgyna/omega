@@ -236,7 +236,7 @@ pub struct IndexPhases {
     pub documents_by_parser: Vec<(String, usize)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Evidence {
     pub id: String,
     pub document_id: i64,
@@ -454,13 +454,29 @@ pub struct ReadDocument {
     pub reliable: bool,
 }
 
+/// Un hecho publicado por la lectura, unido a la evidencia exacta de la que
+/// salió. No se reutilizan las citas generales de la respuesta: el resumen
+/// puede mencionar otros campos del documento y cada uno necesita su propio
+/// rastro navegable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReadingClaim {
+    pub text: String,
+    pub evidence: Evidence,
+}
+
 /// Lectura de los documentos ya citados, redactada con reglas. Vive aparte de
 /// `Answer::text` a propósito: la respuesta verificada no cambia porque su
 /// resumen se pueda componer o no.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnswerReading {
     pub text: String,
     pub documents: Vec<ReadDocument>,
+    /// Hechos atómicos que aparecen en el resumen, cada uno con su evidencia.
+    #[serde(default)]
+    pub claims: Vec<ReadingClaim>,
+    /// Cobertura declarada, separada de la lista potencialmente recortada.
+    pub documents_matched: usize,
+    pub documents_read: usize,
     /// El detalle por documento se recortó. Nunca se recorta la cantidad de
     /// documentos leídos; sólo cuánto se cuenta de cada uno.
     pub truncated: bool,

@@ -103,6 +103,25 @@ pub struct TextQueryResult {
     pub hits: Vec<SearchHit>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoherenceClass {
+    OneDocument,
+    SeveralCoherent,
+    IncompatibleCriteria,
+    InsufficientEvidence,
+}
+
+#[derive(Clone, Debug)]
+pub struct CoherentSearchResult {
+    pub class: CoherenceClass,
+    pub filters: Vec<ToolFilter>,
+    pub hits: Vec<SearchHit>,
+    pub document_count: Option<usize>,
+    /// Opciones visibles del índice para explicar una incompatibilidad. Cada
+    /// texto es un criterio y cuántos documentos lo satisfacen por separado.
+    pub alternatives: Vec<String>,
+}
+
 #[derive(Clone, Copy)]
 enum IdentifierMode {
     Exact,
@@ -474,6 +493,118 @@ impl ToolEngine {
         });
         hits.truncate(limit);
         Ok(hits)
+    }
+
+    /// Recuperación para lenguaje humano: descubre criterios en el índice y
+    /// exige que todos vivan en el mismo documento. La búsqueda normal sigue
+    /// aportando candidatos (incluido FTS), pero el conjunto autorizado por
+    /// filtros/origen es un cierre duro, no una señal de ranking.
+    pub fn coherent_search(
+        &self,
+        query: &str,
+        origin: Option<&str>,
+        limit: usize,
+    ) -> Result<CoherentSearchResult> {
+        let filters = self.resolved_filters(query, origin, true)?;
+        let allowed = if filters.is_empty() && origin.is_none() {
+            None
+        } else {
+            Some(
+                self.documents_matching(&filters, origin, None)?
+                    .into_iter()
+                    .map(|document| document.id)
+                    .collect::<HashSet<_>>(),
+            )
+        };
+        // Se pide uno adicional sólo para conservar la señal de recorte en el
+        // llamador; el filtro final nunca reintroduce candidatos parciales.
+        let mut hits = self.search(query, &filters, limit.saturating_add(1))?;
+        let mut document_count = allowed.as_ref().map(HashSet::len);
+        if let Some(allowed) = &allowed {
+            hits.retain(|hit| allowed.contains(&hit.evidence.document_id));
+        }
+        // Una pregunta puramente textual conserva la recuperación FTS por
+        // cobertura. Cuando sí hay criterios estructurados, éstos mismos
+        // aportan la evidencia del candidato conjunto aunque las palabras de
+        // cortesía de la pregunta no formen un fragmento FTS exacto.
+        if hits.is_empty() {
+            if filters.is_empty() && !self.query_names_field_with_value(query)? {
+                let textual = self.search_text(query, origin, limit.saturating_add(1))?;
+                document_count = Some(textual.document_count);
+                hits = textual.hits;
+            } else if allowed.as_ref().is_some_and(|documents| !documents.is_empty()) {
+                let result = self.query_documents(&filters, origin, limit.saturating_add(1))?;
+                let mut seen = HashSet::new();
+                for evidence in result.evidence {
+                    if !seen.insert(evidence.document_id) {
+                        continue;
+                    }
+                    let title = self
+                        .document_by_id(evidence.document_id)?
+                        .and_then(|document| {
+                            document
+                                .path
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| evidence.path.clone());
+                    hits.push(SearchHit {
+                        title,
+                        score: 125.0,
+                        evidence,
+                    });
+                }
+            }
+        }
+
+        // La clase se decide por documentos distintos, no por coincidencias:
+        // un mismo documento con dos evidencias (dos campos que coinciden, dos
+        // pasajes de texto libre) no es «varios documentos coherentes».
+        let distinct_documents = hits
+            .iter()
+            .map(|hit| hit.evidence.document_id)
+            .collect::<HashSet<_>>()
+            .len();
+        let mut alternatives = Vec::new();
+        let class = if distinct_documents == 1 {
+            CoherenceClass::OneDocument
+        } else if distinct_documents > 1 {
+            CoherenceClass::SeveralCoherent
+        } else if filters.len() > 1 {
+            // Distingue ausencia total de la combinación imposible en la que
+            // cada criterio sí existe, pero en documentos diferentes.
+            let mut all_exist_separately = true;
+            for filter in &filters {
+                let count = self
+                    .documents_matching(std::slice::from_ref(filter), origin, None)?
+                    .len();
+                all_exist_separately &= count > 0;
+                alternatives.push(format!(
+                    "{}: {} — {} {}",
+                    filter.concept,
+                    filter.equals,
+                    count,
+                    if count == 1 { "documento" } else { "documentos" }
+                ));
+            }
+            if all_exist_separately {
+                CoherenceClass::IncompatibleCriteria
+            } else {
+                CoherenceClass::InsufficientEvidence
+            }
+        } else {
+            CoherenceClass::InsufficientEvidence
+        };
+        let document_count = document_count
+            .or_else(|| (hits.len() <= limit).then_some(distinct_documents));
+        Ok(CoherentSearchResult {
+            class,
+            filters,
+            hits,
+            document_count,
+            alternatives,
+        })
     }
 
     pub fn exact_lookup(&self, value: &str, limit: usize) -> Result<Vec<SearchHit>> {
@@ -1924,19 +2055,24 @@ impl ToolEngine {
         let mut implicit: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (field, value, value_type) in rows {
             let field_terms = search_terms(&field);
-            let value_terms = search_terms(&value);
-            if value_terms.is_empty() || value_terms.len() > 8 {
-                continue;
-            }
             let field_named = terms_contain_all(&query_terms, &field_terms);
-            let value_named = if value.chars().any(char::is_numeric) {
-                whole_phrase_in(&exact_query, &normalize_exact(&value))
-            } else {
-                terms_contain_all(&query_terms, &value_terms)
-            };
-            if !value_named {
+            // Un valor compuesto por un nombre legible y un código de máquina
+            // —entre paréntesis, o al otro lado de un guion largo— no lo
+            // escribe nadie completo en una pregunta: el código es un dato
+            // interno, no algo que una persona recuerde o pronuncie. Se
+            // prueba primero el valor tal cual y, si no encaja, cada
+            // segmento legible por separado (`value_segments`). El filtro
+            // que termina aplicándose siempre usa el valor COMPLETO y real
+            // del acervo —nunca el segmento que hizo coincidir—, así que
+            // esto nunca acorta lo que se cita ni lo que se verifica: sólo
+            // decide qué documento es candidato.
+            let Some(matched_segment) = value_segments(&value)
+                .into_iter()
+                .find(|segment| segment_matches(segment, &query_terms, &exact_query))
+            else {
                 continue;
-            }
+            };
+            let value_terms = search_terms(&matched_segment);
             // La pregunta usa esa palabra como NOMBRE de campo, no como
             // valor: la escribió pegada a un separador «campo: valor» o
             // «campo=valor». Un acervo cuya carátula de dos columnas dejó los
@@ -1962,7 +2098,7 @@ impl ToolEngine {
                 });
             } else if allow_implicit_values
                 && (value_terms.len() >= 2 || value_type == "state")
-                && terms_contain_all(&unquoted_terms, &value_terms)
+                && segment_matches(&matched_segment, &unquoted_terms, &exact_query)
             {
                 implicit
                     .entry(normalize_spanish(&value))
@@ -5052,4 +5188,36 @@ fn concept_named_in(concepts: &[ConceptSummary], text: &str) -> Option<ConceptSu
         }
     }
     best
+}
+
+#[cfg(test)]
+mod temp_diag {
+    use super::*;
+    use crate::db::Database;
+
+    #[test]
+    fn diag_roble_grupo() {
+        let path = "/private/tmp/claude-501/-Users-davidramirez-omega/6a5015e3-c9fe-4bdc-af5e-4576fd2ab2cc/scratchpad/manual50/omega-manual50.sqlite3";
+        let tools = ToolEngine::new(Database::open(path).unwrap());
+        let question = "Estoy buscando una minuta de ventas relacionada con Roble Grupo y la planta de Tijuana. ¿Cuándo se registró?";
+
+        let written = tools.written_filters(question).unwrap();
+        eprintln!("written.filters = {:?}", written.filters);
+        eprintln!("written.unresolved = {:?}", written.unresolved);
+
+        let inferred = tools.filters_from_query(question, None, true).unwrap();
+        eprintln!("filters_from_query = {:?}", inferred);
+
+        let resolved = tools.resolved_filters(question, None, true).unwrap();
+        eprintln!("resolved_filters = {:?}", resolved);
+
+        let result = tools.coherent_search(question, None, 20).unwrap();
+        eprintln!("coherent_search.class = {:?}", result.class);
+        eprintln!("coherent_search.filters = {:?}", result.filters);
+        eprintln!("coherent_search.document_count = {:?}", result.document_count);
+        eprintln!("coherent_search.hits = {}", result.hits.len());
+        for hit in result.hits.iter().take(10) {
+            eprintln!("  {} | {} | {:?}", hit.evidence.path, hit.evidence.location, hit.evidence.field);
+        }
+    }
 }

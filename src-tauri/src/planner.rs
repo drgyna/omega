@@ -10,7 +10,7 @@ use crate::{
     normalize::{
         canonical_key, normalize_exact, normalize_spanish, search_terms, stems_match,
     },
-    tools::{FormatRequest, ToolEngine, ValueQuery},
+    tools::{FormatRequest, ToolEngine, ValueQuery, WrittenFilters},
 };
 
 #[derive(Clone, Debug)]
@@ -42,7 +42,17 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
     // dice de qué es el total («¿cuántos documentos hay en total?»); en cuanto
     // nombra una categoría de valor —«el total de los importes»— es una suma, y
     // contestarla con un número de documentos era responder otra pregunta.
-    let totals_a_value = has("total") && generic_value_category(question).is_some();
+    //
+    // Esa lectura sólo vale para prosa: un campo que el usuario ya escribió
+    // como «Campo: valor» (p. ej. «Importe total: Pendiente») no está pidiendo
+    // sumar nada, aunque su propio nombre contenga «total» o una palabra de
+    // categoría monetaria. Se excluyen esas palabras antes de decidir.
+    let written = tools.written_filters(question)?;
+    let prose = remove_written_filter_words(question, &written.filters);
+    let totals_a_value = search_terms(&prose)
+        .iter()
+        .any(|term| term.starts_with("total"))
+        && generic_value_category(&prose).is_some();
     let asks_count = (has("cuant") || has("numer") || has("conte") || has("how") || has("total"))
         && !totals_a_value;
     let asks_sum = has("sum") || has("totaliz") || has("add") || totals_a_value;
@@ -1311,7 +1321,36 @@ const MAXIMUM_WORDS: &[&str] = &["mas", "mayor", "mayores", "alto", "alta", "alt
 const MINIMUM_WORDS: &[&str] = &["menos", "menor", "menores", "bajo", "baja", "bajos", "bajas"];
 const DIFFERENCE_WORDS: &[&str] = &["diferencia", "diferencias", "resta", "restar", "difference"];
 
-fn signals(question: &str) -> Signals {
+/// Quita de la pregunta las palabras que un «Campo: valor» escrito por el
+/// usuario ya reclamó, para no volver a leerlas como intención en prosa.
+/// Compara por palabra completa, nunca por subcadena: así un campo llamado
+/// «Importe» no se lleva por delante «Importes» ni ninguna otra palabra que
+/// sólo lo contenga.
+fn remove_written_filter_words(question: &str, filters: &[ToolFilter]) -> String {
+    let mut words = question.split_whitespace().collect::<Vec<_>>();
+    for filter in filters {
+        for phrase in [filter.concept.as_str(), filter.equals.as_str()] {
+            let phrase_words = phrase
+                .split_whitespace()
+                .map(normalize_exact)
+                .collect::<Vec<_>>();
+            if phrase_words.is_empty() || phrase_words.len() > words.len() {
+                continue;
+            }
+            if let Some(start) = words.windows(phrase_words.len()).position(|window| {
+                window
+                    .iter()
+                    .map(|word| normalize_exact(word))
+                    .eq(phrase_words.iter().cloned())
+            }) {
+                words.drain(start..start + phrase_words.len());
+            }
+        }
+    }
+    words.join(" ")
+}
+
+fn signals(written: &WrittenFilters, question: &str) -> Signals {
     let terms = search_terms(question);
     let words = normalize_exact(question)
         .split_whitespace()
@@ -1329,8 +1368,16 @@ fn signals(question: &str) -> Signals {
     // valor. (El caso en que el objeto lo nombra una moneda —«el total en
     // MXN»— lo añade `plan_inner`, que sí puede consultar las monedas del
     // acervo; aquí no hay acceso al índice.)
+    //
+    // Un campo escrito por el usuario como «Campo: valor» no es prosa: sus
+    // palabras nombran un filtro, no una intención. Sin excluirlas, un campo
+    // llamado «Importe total» encendía la suma sólo por las palabras de su
+    // propio nombre, aunque la pregunta sólo contara documentos.
+    let prose = remove_written_filter_words(question, &written.filters);
+    let prose_terms = search_terms(&prose);
+    let has_prose = |root: &str| prose_terms.iter().any(|term| term.starts_with(root));
     let totals_a_value =
-        (has("total") || has("acumulad")) && generic_value_category(question).is_some();
+        (has_prose("total") || has_prose("acumulad")) && generic_value_category(&prose).is_some();
     Signals {
         count: has("cuant") || has("numer") || has("conte") || has("how"),
         sum: has("sum") || has("totaliz") || totals_a_value,
@@ -1427,7 +1474,8 @@ pub fn plan_structured(
 /// misma operación de la pregunta original para cada campo ofrecido, en vez
 /// de obligar a elegir uno solo.
 fn compute_all_options(tools: &ToolEngine, pending: &PendingChoice) -> Result<StructuredPlan> {
-    let marks = signals(&pending.question);
+    let written = tools.written_filters(&pending.question)?;
+    let marks = signals(&written, &pending.question);
     let operation = requested_operation(&marks).unwrap_or(Operation::Sum);
     let mut scope = PlannedScope {
         filters: pending.set.filters.clone(),
@@ -1530,12 +1578,18 @@ fn plan_inner(
         });
     }
 
+    // Se resuelve antes que `signals` porque las palabras de un «Campo:
+    // valor» ya escrito no deben leerse como intención en prosa (ver
+    // `remove_written_filter_words`), y también sirve más abajo para el corte
+    // por valor no resuelto.
+    let written = tools.written_filters(question)?;
+
     // Operación entre dos campos de un documento concreto. Va antes del corte
     // por cita entrecomillada y antes de `numeric_field_pair` porque ninguna
     // de las dos la alcanzaba: la primera manda a búsqueda literal cualquier
     // pregunta con comillas, y la segunda exige que los DOS operandos sean
     // campos nombrados del acervo, cosa que «el importe» no es.
-    let mut marks = signals(question);
+    let mut marks = signals(&written, question);
     // «El total en MXN» nombra su objeto con la moneda en vez de con la palabra
     // «importe». `signals` no puede verlo —no conoce el acervo—, así que la
     // moneda se comprueba aquí, contra las que el índice realmente tiene: sin
@@ -1615,7 +1669,6 @@ fn plan_inner(
     // inferencia. Si el valor no existe completo en el acervo, el motor
     // pregunta o dice que no lo encontró; jamás responde con un valor más
     // corto que se le parezca.
-    let written = tools.written_filters(question)?;
     if let Some(unresolved) = written.unresolved.first() {
         return Ok(if unresolved.near.is_empty() {
             StructuredPlan::without_evidence(format!(
@@ -2658,7 +2711,38 @@ fn resolve_scope(
         && origin.is_none()
         && !own_period
         && state.set.is_some();
-    let inherit = reference == Reference::Explicit || elliptical;
+    // Un deíctico es una señal de continuidad, no una orden. Si el turno trae
+    // un filtro, una fuente o un periodo propios, ese alcance puede resolverse
+    // sin memoria y reemplaza al anterior. Esto evita que «esa entidad nueva»
+    // quede accidentalmente intersectada con el resultado previo.
+    // «Compáralo con el periodo anterior» trae palabras de calendario, pero
+    // no un referente autónomo: necesita el periodo actual recordado para
+    // saber qué significa "anterior". No se confunde con una fecha nueva y
+    // absoluta, que sí reemplaza el alcance previo.
+    let relative_comparison = reference == Reference::Explicit
+        && dates::asks_for_previous_period(question)
+        && (marks.compare || marks.difference || marks.percent);
+    // Un criterio adicional puede ser una refinación explícita («de esos,
+    // los de Área: Norte»). En cambio, un valor nuevo para el mismo campo que
+    // definía el conjunto anterior cambia de tema: intersectarlos produciría
+    // un vacío artificial y obedecería al deíctico a ciegas.
+    let replaces_previous_filter = state.set.as_ref().is_some_and(|previous| {
+        own_filters.iter().any(|new_filter| {
+            previous.filters.iter().any(|old_filter| {
+                canonical_key(&old_filter.concept) == canonical_key(&new_filter.concept)
+                    && normalize_exact(&old_filter.equals) != normalize_exact(&new_filter.equals)
+            })
+        })
+    });
+    // Un valor textual puede contener el nombre de una carpeta (p. ej. el
+    // valor «Norte, equipo» dentro de la carpeta «Norte»). Si el índice ya lo
+    // resolvió como filtro, esa coincidencia de origen no basta para declarar
+    // un cambio de alcance.
+    let independent_origin = origin.is_some() && own_filters.is_empty();
+    let self_contained_scope = replaces_previous_filter
+        || independent_origin
+        || (own_period && !relative_comparison);
+    let inherit = (reference == Reference::Explicit && !self_contained_scope) || elliptical;
     if inherit {
         if let Some(previous) = &state.set {
             scope.filters = previous.filters.clone();

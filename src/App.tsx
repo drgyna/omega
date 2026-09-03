@@ -221,7 +221,14 @@ function Lectura({ reading }: { reading: AnswerReading }) {
   return (
     <div className="lectura">
       <h3>Lo que leí</h3>
+      <small className="lectura-note">Cobertura: {reading.documents_matched.toLocaleString("es-MX")} documentos coincidieron; {reading.documents_read.toLocaleString("es-MX")} se leyeron completos{reading.truncated ? "; el resumen fue recortado" : "; sin recorte"}.</small>
       <div className="lectura-text"><MarkdownLite text={reading.text} /></div>
+      {reading.claims.length > 0 && <ul className="lectura-documents">
+        {reading.claims.map((claim) => <li key={claim.evidence.id}>
+          <button type="button" onClick={() => void api.openDocument(claim.evidence.path)}>{claim.text}</button>
+          <small>{fileName(claim.evidence.path)} · {claim.evidence.location}{claim.evidence.field ? ` · ${claim.evidence.field}` : ""}{claim.evidence.value ? ` · Valor: ${claim.evidence.value}` : ""}{claim.evidence.confidence !== null ? ` · Confianza OCR: ${Math.round(claim.evidence.confidence * 100)}%` : " · OCR no requerido"}{!claim.evidence.reliable && " · No verificado"}</small>
+        </li>)}
+      </ul>}
       <ul className="lectura-documents">
         {reading.documents.map((document) => (
           <li key={document.path}>
