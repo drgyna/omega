@@ -10,6 +10,7 @@ mod error;
 pub mod evaluation;
 mod extract;
 mod indexer;
+mod lectura;
 #[cfg(test)]
 mod migration_tests;
 mod model;

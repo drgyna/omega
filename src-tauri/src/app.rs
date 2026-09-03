@@ -11,6 +11,7 @@ use crate::{
     db::Database,
     error::{OmegaError, Result},
     indexer::Indexer,
+    lectura,
     model::{Answer, AppStatus, ConceptSummary, IndexReport, SearchHit, SourceSummary},
     ocr::{CachedOcr, SystemOcr},
     parser::{DocumentParser, LocalDocumentParser},
@@ -119,7 +120,8 @@ impl OmegaEngine {
     /// que se descarta al terminar.
     pub fn ask(&self, question: &str) -> Result<Answer> {
         self.validate(question)?;
-        Agent::new(self.tools.clone(), self.clock).answer(question)
+        let answer = Agent::new(self.tools.clone(), self.clock).answer(question)?;
+        lectura::attach(&self.tools, answer)
     }
 
     /// Pregunta dentro de una conversación identificada. El contexto sólo se
@@ -129,7 +131,7 @@ impl OmegaEngine {
         let mut state = self.conversations.state(conversation);
         let answer = Agent::new(self.tools.clone(), self.clock).answer_in(question, &mut state)?;
         self.conversations.store(conversation, state);
-        Ok(answer)
+        lectura::attach(&self.tools, answer)
     }
 
     /// Inicia una conversación nueva: el contexto anterior desaparece.
