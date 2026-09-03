@@ -57,6 +57,22 @@ pub struct DocumentValue {
     pub evidence: Evidence,
 }
 
+/// Un fragmento del documento tal y como quedó indexado, con su ubicación
+/// citable. Es la unidad de lectura: `content` va **íntegro**, sin recortar,
+/// porque es a la vez lo que se lee y aquello contra lo que se verifica lo que
+/// se escriba. El extracto de la evidencia sí va abreviado: ése es el que
+/// termina en la interfaz.
+#[derive(Clone, Debug)]
+pub struct DocumentPassage {
+    /// Posición del fragmento dentro de su documento, en el orden en que el
+    /// parser lo leyó. El primero y el último son los únicos que la redacción
+    /// puede distinguir sin interpretar el contenido.
+    pub ordinal: usize,
+    pub location: String,
+    pub content: String,
+    pub evidence: Evidence,
+}
+
 /// Lo que el acervo tiene escrito sobre el signo de un campo numérico.
 #[derive(Clone, Copy, Debug)]
 pub struct SignRecord {
@@ -1421,6 +1437,64 @@ impl ToolEngine {
             .map(|(ordinal, mut value)| {
                 value.ordinal = ordinal;
                 value
+            })
+            .collect())
+    }
+
+    /// Texto completo de un documento, fragmento a fragmento y en el orden en
+    /// que se indexó. Es la misma consulta que ya hace la segunda pasada del
+    /// indexador sobre las carátulas (`indexer.rs`), expuesta aquí como
+    /// lectura: no escribe nada, no participa en la recuperación y no cambia
+    /// qué documentos encuentra `search` ni en qué orden.
+    pub fn document_text(&self, document_id: i64) -> Result<Vec<DocumentPassage>> {
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.location, c.content,
+                    d.path, d.origin, d.ocr_status, d.ocr_confidence
+             FROM chunks c
+             JOIN documents d ON d.id = c.document_id
+             WHERE c.document_id = ?1
+             ORDER BY c.ordinal",
+        )?;
+        let rows = statement.query_map([document_id], |row| {
+            let chunk_id: i64 = row.get(0)?;
+            let location: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let ocr_status: String = row.get(5)?;
+            let confidence: Option<f64> = row.get(6)?;
+            Ok(DocumentPassage {
+                // La posición real la asigna el recorrido, no la consulta: el
+                // ordinal guardado puede tener huecos si el parser descartó
+                // fragmentos vacíos.
+                ordinal: 0,
+                location: location.clone(),
+                content: content.clone(),
+                evidence: Evidence {
+                    id: format!("c-{chunk_id}"),
+                    document_id,
+                    path: row.get(3)?,
+                    origin: row.get(4)?,
+                    location,
+                    excerpt: brief_excerpt(&content, None),
+                    normalized_value: None,
+                    value: None,
+                    matched: None,
+                    field: None,
+                    match_kind: "texto".into(),
+                    reliable: ocr_is_reliable(&ocr_status, confidence),
+                    ocr_status: Some(ocr_status),
+                    ocr_confidence: confidence,
+                    confidence,
+                },
+            })
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, mut passage)| {
+                passage.ordinal = ordinal;
+                passage
             })
             .collect())
     }

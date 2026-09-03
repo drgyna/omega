@@ -1,5 +1,5 @@
 import { Fragment, FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
-import { Answer, AnswerScope, AppStatus, ConceptSummary, IndexReport, SourceSummary, ViewName, api, displayError } from "./api";
+import { Answer, AnswerReading, AnswerScope, AppStatus, ConceptSummary, IndexReport, SourceSummary, ViewName, api, displayError } from "./api";
 
 const EMPTY_STATUS: AppStatus = {
   sources: 0,
@@ -201,6 +201,7 @@ function Message({ item }: { item: ChatItem }) {
       {answer.scope && <ScopeChips scope={answer.scope} />}
       {answer.clarification && <div className="clarification"><strong>Necesito una aclaración</strong><p>{answer.clarification.question}</p>{answer.clarification.options.length > 0 && <ul>{answer.clarification.options.map((option) => <li key={option}>{option}</li>)}</ul>}</div>}
       {answer.warning && <div className="answer-warning">{answer.warning}</div>}
+      {answer.reading && <Lectura reading={answer.reading} />}
       {answer.citations.length > 0 && (
         <div className="citations"><h3>Documentos y evidencia</h3>{visibleCitations.map((source, index) => (
           <button key={source.id} onClick={() => void api.openDocument(source.path)}>
@@ -209,6 +210,32 @@ function Message({ item }: { item: ChatItem }) {
         ))}{visibleResults < answer.citations.length && <button className="quiet-button" onClick={() => setVisibleResults((count) => count + 20)}>Ver más evidencia ({answer.citations.length - visibleResults})</button>}</div>
       )}
     </article>
+  );
+}
+
+/** Lo que Omega leyó de los documentos que citó. Es un añadido a la
+ * respuesta —el texto y las citas no cambian por él— y por eso se muestra en
+ * su propio bloque, con la lista de documentos abiertos y los números de cita
+ * que les corresponden abajo. */
+function Lectura({ reading }: { reading: AnswerReading }) {
+  return (
+    <div className="lectura">
+      <h3>Lo que leí</h3>
+      <div className="lectura-text"><MarkdownLite text={reading.text} /></div>
+      <ul className="lectura-documents">
+        {reading.documents.map((document) => (
+          <li key={document.path}>
+            <button type="button" onClick={() => void api.openDocument(document.path)}>{fileName(document.path)}</button>
+            <small>
+              {document.citation_numbers.length > 0 && `${document.citation_numbers.length === 1 ? "Cita" : "Citas"} ${document.citation_numbers.join(", ")} · `}
+              {document.passages_read.toLocaleString("es-MX")} {document.passages_read === 1 ? "pasaje" : "pasajes"} · {document.origin}
+              {!document.reliable && " · OCR de baja confianza"}
+            </small>
+          </li>
+        ))}
+      </ul>
+      {reading.truncated && <small className="lectura-note">Resumen recortado: el texto lo declara. Las citas y su evidencia siguen completas.</small>}
+    </div>
   );
 }
 

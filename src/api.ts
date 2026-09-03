@@ -76,6 +76,22 @@ export interface Clarification {
   reason: string;
 }
 
+/** Un documento que Omega abrió y leyó completo para redactar el resumen. */
+export interface ReadDocument {
+  path: string;
+  origin: string;
+  citation_numbers: number[];
+  passages_read: number;
+  reliable: boolean;
+}
+
+/** Lectura de los documentos ya citados. Acompaña a la respuesta; no la sustituye. */
+export interface AnswerReading {
+  text: string;
+  documents: ReadDocument[];
+  truncated: boolean;
+}
+
 export interface Answer {
   text: string;
   mode: "local";
@@ -85,6 +101,7 @@ export interface Answer {
   used_context: boolean;
   scope: AnswerScope | null;
   clarification: Clarification | null;
+  reading?: AnswerReading | null;
 }
 
 export interface ConceptSummary {

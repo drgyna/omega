@@ -438,6 +438,34 @@ pub struct Clarification {
     pub reason: String,
 }
 
+/// Un documento que Omega abrió y leyó completo para redactar el resumen.
+/// No sustituye a la cita: la acompaña. `citation_numbers` son los mismos
+/// números con los que la interfaz numera la evidencia, para que el lector
+/// pueda saltar de una frase del resumen a la cita que la sostiene.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadDocument {
+    pub path: String,
+    pub origin: String,
+    pub citation_numbers: Vec<usize>,
+    pub passages_read: usize,
+    /// Falso cuando el documento llegó por OCR de baja confianza. Se publica
+    /// junto a la lectura por el mismo motivo que en la evidencia: lo que se
+    /// leyó mal no puede presentarse como si se hubiera leído bien.
+    pub reliable: bool,
+}
+
+/// Lectura de los documentos ya citados, redactada con reglas. Vive aparte de
+/// `Answer::text` a propósito: la respuesta verificada no cambia porque su
+/// resumen se pueda componer o no.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnswerReading {
+    pub text: String,
+    pub documents: Vec<ReadDocument>,
+    /// El detalle por documento se recortó. Nunca se recorta la cantidad de
+    /// documentos leídos; sólo cuánto se cuenta de cada uno.
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Answer {
     pub text: String,
@@ -452,6 +480,10 @@ pub struct Answer {
     pub scope: Option<AnswerScope>,
     #[serde(default)]
     pub clarification: Option<Clarification>,
+    /// Resumen de los documentos citados, leídos completos. Es un añadido:
+    /// `text` y `citations` son idénticos con lectura y sin ella.
+    #[serde(default)]
+    pub reading: Option<AnswerReading>,
 }
 
 impl Answer {
