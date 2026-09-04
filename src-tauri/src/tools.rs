@@ -1708,11 +1708,11 @@ impl ToolEngine {
             // pistas que cualquier otro, que es justo lo que significa que la
             // pregunta lo siga describiendo a él.
             if let Some(document_id) = inherited {
-                candidates.insert(document_id);
+                candidates.entry(document_id).or_insert(0);
             }
             let decision = match candidates.len() {
                 0 => Ok(None),
-                1 => Ok(candidates.iter().copied().next()),
+                1 => Ok(candidates.keys().copied().next()),
                 _ => self.best_covered(&candidates, &clues, inherited),
             };
             crate::trace!("f) pinned_document DECIDE: {:?}", decision.as_ref().ok());
@@ -1752,7 +1752,7 @@ impl ToolEngine {
     ///
     /// `None` significa «la pregunta no ancló nada», que no es lo mismo que
     /// «ancló y no hay documentos» (conjunto vacío).
-    fn anchored_documents(&self, query: &str) -> Result<Option<HashSet<i64>>> {
+    fn anchored_documents(&self, query: &str) -> Result<Option<HashMap<i64, u64>>> {
         let normalized_query = normalize_exact(query);
         if normalized_query.is_empty() {
             return Ok(None);
@@ -1798,6 +1798,7 @@ impl ToolEngine {
             })?
             .collect::<rusqlite::Result<HashMap<i64, String>>>()?;
         let roles = QuestionFieldRoles::new(query);
+        let field_specificity = self.field_specificity()?;
         // Las anclas se suman, no se intersecan. Una pregunta puede nombrar de
         // pasada un valor de otro documento —«una minuta de ventas» es, en
         // algún archivo, el título literal de otra minuta— y exigir que TODAS
@@ -1805,15 +1806,22 @@ impl ToolEngine {
         // ellas sí era la buena. Cumplir varias no se pierde: las palabras de
         // cada ancla son también pistas, así que el documento que las cumple
         // todas cubre más que el que sólo cumple una y gana por su cuenta.
-        let mut candidates: Option<HashSet<i64>> = None;
+        let mut candidates: Option<HashMap<i64, u64>> = None;
         for (run, per_concept) in by_run.into_iter() {
-            let Some(documents) = self.anchor_for_run(&run, &per_concept, &concept_names, &roles)
-            else {
+            let Some(documents) = self.anchor_for_run(
+                &run,
+                &per_concept,
+                &concept_names,
+                &roles,
+                &field_specificity,
+            ) else {
                 continue;
             };
-            candidates
-                .get_or_insert_with(HashSet::new)
-                .extend(documents);
+            let accumulated = candidates.get_or_insert_with(HashMap::new);
+            for (document, weight) in documents {
+                let entry = accumulated.entry(document).or_insert(0);
+                *entry = (*entry).max(weight);
+            }
         }
         // Un ancla que señala a media carpeta no es un ancla: leer cada
         // candidato para compararlos cuesta, y con tantos la pregunta no está
@@ -1850,14 +1858,21 @@ impl ToolEngine {
         per_concept: &HashMap<i64, HashSet<i64>>,
         concept_names: &HashMap<i64, String>,
         roles: &QuestionFieldRoles,
-    ) -> Option<HashSet<i64>> {
+        field_specificity: &HashMap<i64, u64>,
+    ) -> Option<HashMap<i64, u64>> {
+        // Cada documento se queda con el papel del campo por el que este tramo
+        // lo ancló, medido por lo distintivo que es ese campo. Cuando el mismo
+        // documento entra por varios campos, manda el más distintivo.
         let documents_of = |concepts: &[i64]| {
-            concepts
-                .iter()
-                .filter_map(|concept| per_concept.get(concept))
-                .flatten()
-                .copied()
-                .collect::<HashSet<i64>>()
+            let mut documents: HashMap<i64, u64> = HashMap::new();
+            for concept in concepts {
+                let weight = field_specificity.get(concept).copied().unwrap_or(0);
+                for document in per_concept.get(concept).into_iter().flatten() {
+                    let entry = documents.entry(*document).or_insert(0);
+                    *entry = (*entry).max(weight);
+                }
+            }
+            documents
         };
         if per_concept.len() == 1 {
             let documents = documents_of(&per_concept.keys().copied().collect::<Vec<_>>());
@@ -1930,22 +1945,32 @@ impl ToolEngine {
     /// previa no hay nada que desempatar y se devuelve `None`.
     fn best_covered(
         &self,
-        candidates: &HashSet<i64>,
+        candidates: &HashMap<i64, u64>,
         clues: &[String],
         inherited: Option<i64>,
     ) -> Result<Option<i64>> {
-        let mut ordered = candidates.iter().copied().collect::<Vec<_>>();
+        let mut ordered = candidates.keys().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
         let mut best = 0;
         let mut winners: Vec<i64> = Vec::new();
         for document_id in ordered {
             let covered = self.covered_clues(document_id, clues)?;
-            crate::trace!("f) best_covered: doc {document_id} cubre {covered}/{} pistas", clues.len());
-            if covered > best {
-                best = covered;
+            // Una pista cubierta vale más que cualquier papel, así que el orden
+            // por número de pistas es exactamente el de siempre. El papel sólo
+            // se suma encima, y por eso únicamente decide entre documentos que
+            // cubren las MISMAS pistas: ahí es donde la bolsa de palabras no
+            // veía diferencia y el empate dejaba la pregunta sin respuesta.
+            let role = candidates.get(&document_id).copied().unwrap_or(0);
+            let score = covered as u64 * (MAX_ROLE_BONUS + 1) + role;
+            crate::trace!(
+                "f) best_covered: doc {document_id} cubre {covered}/{} pistas (papel {role}, puntaje {score})",
+                clues.len()
+            );
+            if score > best {
+                best = score;
                 winners.clear();
             }
-            if covered == best {
+            if score == best {
                 winners.push(document_id);
             }
         }
@@ -1983,6 +2008,36 @@ impl ToolEngine {
             .iter()
             .filter(|clue| words.iter().any(|word| stems_match(word, clue)))
             .count())
+    }
+
+    /// Cuánto distingue cada campo, leído del propio acervo: un campo que casi
+    /// todos los documentos registran («Responsable interno», en los 100) no
+    /// dice nada sobre CUÁL es el documento buscado; uno que sólo registra una
+    /// minoría («Testador», en 12) lo dice casi todo.
+    ///
+    /// No hay aquí ninguna lista de campos ni vocabulario de negocio: la
+    /// especificidad es una cuenta sobre el índice, así que un acervo distinto
+    /// produce otros pesos sin tocar el motor.
+    fn field_specificity(&self) -> Result<HashMap<i64, u64>> {
+        let connection = self.database.connect()?;
+        let total: i64 =
+            connection.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
+        if total <= 0 {
+            return Ok(HashMap::new());
+        }
+        let mut statement = connection.prepare(
+            "SELECT concept_id, COUNT(DISTINCT document_id) FROM extracted_values GROUP BY concept_id",
+        )?;
+        let mut specificity = HashMap::new();
+        for row in statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        {
+            let (concept_id, documents) = row;
+            let share = documents.clamp(0, total) as u64 * MAX_ROLE_BONUS / total as u64;
+            specificity.insert(concept_id, MAX_ROLE_BONUS.saturating_sub(share));
+        }
+        Ok(specificity)
     }
 
     pub fn origin_summaries(&self) -> Result<Vec<OriginSummary>> {
@@ -4169,6 +4224,15 @@ fn longest_run_named_by(normalized_query: &str, words: &[&str]) -> Option<String
 /// encima de este número la pregunta no está señalando a un documento sino a
 /// un conjunto, y la respuesta correcta sigue siendo la lista de siempre.
 const MAX_PINNED_CANDIDATES: usize = 120;
+
+/// Lo más que puede aportar el papel con que un documento quedó anclado.
+///
+/// Lo que aporta una pista por estar escrita se calcula en `best_covered` como
+/// `MAX_ROLE_BONUS + 1` por pista, estrictamente mayor que cualquier papel. Así
+/// una pista más gana SIEMPRE al papel, y el papel sólo ordena entre documentos
+/// que cubren exactamente las mismas pistas —que es justo donde se producía el
+/// empate que este contador no sabía romper—.
+const MAX_ROLE_BONUS: u64 = 1_000;
 
 fn phrase_in(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() || needle.len() < 3 {
