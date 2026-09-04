@@ -1664,6 +1664,30 @@ fn document_identifier(
             // distingue las dos cosas y aquí basta con respetarlo.
             item.value_type != "date"
                 && item.identifier_canonical.is_some()
+                // Mismo defecto que la fecha en palabras, y por el mismo
+                // mecanismo: `canonical_identifier` acepta cualquier mezcla de
+                // letras y dígitos, así que una cantidad con unidad («318 kg»),
+                // un rango de fechas («2026-03-12 a 2027-03-12») o el nombre de
+                // un modelo («Azimut 55 Flybridge») quedan marcados como clave
+                // y podían acabar nombrando al registro: «El campo «Folio» de
+                // 318 kg es EMB-26-0001».
+                //
+                // El tipo del valor NO separa estos casos —una cantidad con
+                // unidad se clasifica `text`, igual que un folio, porque
+                // `parse_number` no acepta el sufijo— así que la condición se
+                // apoya en la forma: un identificador de negocio se escribe en
+                // una sola palabra («NOT-26-0001», «FER-01000», «LOT-RES-26-0004»)
+                // y lo que trae un espacio es prosa, no una clave. Medido sobre
+                // los seis corpus de prueba, la regla separa las dos clases sin
+                // excepciones: los 28 campos identificadores del acervo (folio,
+                // instrumento, SKU, lote, póliza, expediente…) no llevan
+                // espacios, y los 7 que sí los llevan son cantidades, rangos y
+                // nombres de modelo.
+                //
+                // Sólo filtra cómo se REDACTA la frase. La búsqueda por folio
+                // (`canonical_identifier_hits`) y los vínculos entre documentos
+                // (`relations.rs`) leen la misma columna y no se ven afectados.
+                && !item.value.trim().contains(char::is_whitespace)
                 && normalize_literal(&item.value) != normalize_literal(reported_value)
         }))
 }
