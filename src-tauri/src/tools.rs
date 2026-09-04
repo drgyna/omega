@@ -29,6 +29,156 @@ struct FieldValuePair {
     value: String,
 }
 
+/// Papel que la pregunta le da a un campo suyo que nombra.
+///
+/// Una misma pregunta puede escribir el nombre de dos campos con intenciones
+/// opuestas: «…donde el testador es Felipe Navarro Arias. ¿Quién quedó como
+/// albacea designado?» nombra «Testador» para ACOTAR y «Albacea designado»
+/// para PEDIR. Leídos igual —dos condiciones unidas por Y— construyen una
+/// condición imposible: el acervo tiene un documento con ese testador y otro
+/// distinto con ese albacea, y la intersección es vacía. Ese vacío no
+/// significa «el acervo no lo tiene»: significa «la condición estaba mal
+/// leída».
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldRole {
+    /// La pregunta escribe el campo pegado a su valor: «donde el testador es
+    /// Felipe Navarro Arias», «cuyo testador es …», «área Operaciones». Es una
+    /// condición, y es lo único que puede filtrar.
+    Restriction,
+    /// Una palabra interrogativa señala al campo y su valor NO está escrito
+    /// junto a él: «¿quién quedó como albacea designado?». Es lo que se
+    /// pregunta; nunca puede filtrar ni anclar.
+    Asked,
+    /// La pregunta lo nombra sin ninguna de las dos marcas. Se trata
+    /// exactamente como antes de esta distinción.
+    Unmarked,
+}
+
+/// Lee una pregunta y reparte los campos que nombra entre condición y
+/// pregunta. La consultan los tres sitios que hasta ahora los confundían
+/// —`filters_from_query`, `structured_pairs_in_query` y el ancla de
+/// `anchored_documents`— y también la lectura de un documento ya fijado, para
+/// que la premisa no se devuelva como si fuera la respuesta.
+///
+/// Las dos marcas se leen de la forma de la frase, nunca de un vocabulario de
+/// negocio:
+///
+/// * **Condición**: el campo y su valor están escritos juntos, separados como
+///   mucho por cópulas y artículos («testador **es** Felipe Navarro Arias»,
+///   «área Operaciones»). Que el usuario haya escrito el valor de ese campo es
+///   la prueba de que lo está usando para acotar: el dato que se pregunta es,
+///   por definición, el que no se sabe.
+/// * **Pregunta**: el campo no aparece pegado a ningún valor suyo y una
+///   palabra interrogativa lo precede, sin que entre las dos se abra una
+///   subordinada de condición («donde», «cuyo»…), que reiniciaría la lectura.
+///
+/// La condición manda sobre la pregunta: «¿Cuántos documentos del área
+/// Operaciones hay?» lleva «cuántos» delante de «área», pero el valor
+/// «Operaciones» está escrito justo detrás, así que sigue siendo un filtro.
+pub struct QuestionFieldRoles {
+    words: Vec<String>,
+}
+
+/// Palabras que pueden quedar ENTRE un campo y su valor sin romper la lectura
+/// «campo = valor»: cópulas, artículos y las preposiciones de enlace. No hay
+/// aquí ningún término de un rubro de negocio, sólo gramática.
+const PAIR_JOINERS: &[&str] = &[
+    "a", "al", "con", "de", "del", "el", "era", "eran", "es", "fue", "fueron", "igual", "la",
+    "las", "lo", "los", "sea", "sean", "son", "su", "sus", "un", "una", "unas", "unos",
+];
+
+/// Palabras que señalan al campo que la pregunta PIDE. Sólo pronombres
+/// interrogativos; se dejan fuera «qué» y «cómo», que en español son también
+/// relativos corrientes («el documento **que** tiene…», «quedó **como**
+/// albacea») y marcarían como preguntado cualquier campo mencionado de paso.
+const QUESTION_WORDS: &[&str] = &[
+    "cual", "cuales", "cuando", "cuanta", "cuantas", "cuanto", "cuantos", "quien", "quienes",
+];
+
+/// Palabras que abren una subordinada de condición. Lo que va detrás describe
+/// al documento buscado, no a lo que se pregunta, así que una interrogativa
+/// anterior deja de alcanzar al campo que venga después.
+const CONDITION_MARKERS: &[&str] = &["cuya", "cuyas", "cuyo", "cuyos", "donde"];
+
+impl QuestionFieldRoles {
+    pub fn new(query: &str) -> Self {
+        Self {
+            words: normalize_exact(query)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
+    /// Papel del par «campo = valor» dentro de esta pregunta.
+    pub fn role(&self, field: &str, value: &str) -> FieldRole {
+        if self.is_restriction(field, value) {
+            FieldRole::Restriction
+        } else if self.is_asked(field) {
+            FieldRole::Asked
+        } else {
+            FieldRole::Unmarked
+        }
+    }
+
+    /// El campo y su valor están escritos juntos: la pregunta afirma el par.
+    fn is_restriction(&self, field: &str, value: &str) -> bool {
+        let field_spans = self.spans_of(field);
+        let value_spans = self.spans_of(value);
+        field_spans.iter().any(|&(field_start, field_end)| {
+            value_spans.iter().any(|&(value_start, value_end)| {
+                let gap = if value_start >= field_end {
+                    field_end..value_start
+                } else if field_start >= value_end {
+                    value_end..field_start
+                } else {
+                    // Se solapan: el nombre del campo está dentro de su propio
+                    // valor. No es un par escrito, es la misma cadena.
+                    return false;
+                };
+                self.words[gap]
+                    .iter()
+                    .all(|word| PAIR_JOINERS.contains(&word.as_str()))
+            })
+        })
+    }
+
+    /// Una palabra interrogativa señala a este campo.
+    fn is_asked(&self, field: &str) -> bool {
+        self.spans_of(field).iter().any(|&(start, _)| {
+            let before = &self.words[..start];
+            let last_condition = before
+                .iter()
+                .rposition(|word| CONDITION_MARKERS.contains(&word.as_str()));
+            let reachable = match last_condition {
+                Some(at) => &before[at + 1..],
+                None => before,
+            };
+            reachable
+                .iter()
+                .any(|word| QUESTION_WORDS.contains(&word.as_str()))
+        })
+    }
+
+    /// Posiciones (en palabras) donde la pregunta escribe esta frase entera.
+    fn spans_of(&self, phrase: &str) -> Vec<(usize, usize)> {
+        let normalized = normalize_exact(phrase);
+        let needle = normalized.split_whitespace().collect::<Vec<_>>();
+        if needle.is_empty() || needle.len() > self.words.len() {
+            return Vec::new();
+        }
+        (0..=self.words.len() - needle.len())
+            .filter(|&start| {
+                self.words[start..start + needle.len()]
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(word, part)| word == part)
+            })
+            .map(|start| (start, start + needle.len()))
+            .collect()
+    }
+}
+
 /// Documento alcanzado por una clave de localización (ID interno de
 /// indexación o ruta). Deliberadamente no lleva `Evidence`: la clave que lo
 /// encontró no es citable, así que la respuesta debe tomar su evidencia de los
@@ -1002,6 +1152,7 @@ impl ToolEngine {
             params_from_iter(values.iter().map(|value| value.as_ref())),
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?;
+        let roles = QuestionFieldRoles::new(query);
         let mut pairs = HashMap::new();
         for row in rows {
             let (field, value) = row?;
@@ -1013,6 +1164,18 @@ impl ToolEngine {
                 && whole_phrase_in(&normalized_query, &pair.field)
                 && whole_phrase_in(&normalized_query, &pair.value)
             {
+                // Que el nombre de un campo y un valor suyo estén los dos
+                // escritos en la pregunta no los convierte en una condición.
+                // El campo que la pregunta PIDE también está escrito, y su
+                // valor puede estarlo por otro motivo —es el valor de otro
+                // campo, en otro documento—. Meterlo en el AND obligatorio
+                // exige lo contrario de lo que se preguntó.
+                if roles.role(&field, &value) == FieldRole::Asked {
+                    crate::trace!(
+                        "g)   par DESCARTADO ({field} = {value}): la pregunta nombra ese campo como LO PREGUNTADO, no como condicion"
+                    );
+                    continue;
+                }
                 pairs.entry(pair).or_insert((field, value));
             }
         }
@@ -1607,7 +1770,10 @@ impl ToolEngine {
                 row.get::<_, String>(2)?,
             ))
         })?;
-        let mut by_run: HashMap<String, (HashSet<i64>, HashSet<i64>)> = HashMap::new();
+        // Los documentos se guardan POR CAMPO, no en un solo montón: cuando un
+        // mismo tramo pertenece a varios campos, la desambiguación de abajo
+        // necesita quedarse con los de uno de ellos.
+        let mut by_run: HashMap<String, HashMap<i64, HashSet<i64>>> = HashMap::new();
         for row in rows {
             let (document_id, concept_id, text_value) = row?;
             let normalized = normalize_exact(&text_value);
@@ -1618,10 +1784,20 @@ impl ToolEngine {
             let Some(run) = longest_run_named_by(&normalized_query, &words) else {
                 continue;
             };
-            let entry = by_run.entry(run).or_default();
-            entry.0.insert(concept_id);
-            entry.1.insert(document_id);
+            by_run
+                .entry(run)
+                .or_default()
+                .entry(concept_id)
+                .or_default()
+                .insert(document_id);
         }
+        let concept_names = connection
+            .prepare("SELECT id, display_name FROM concepts")?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<HashMap<i64, String>>>()?;
+        let roles = QuestionFieldRoles::new(query);
         // Las anclas se suman, no se intersecan. Una pregunta puede nombrar de
         // pasada un valor de otro documento —«una minuta de ventas» es, en
         // algún archivo, el título literal de otra minuta— y exigir que TODAS
@@ -1630,18 +1806,11 @@ impl ToolEngine {
         // cada ancla son también pistas, así que el documento que las cumple
         // todas cubre más que el que sólo cumple una y gana por su cuenta.
         let mut candidates: Option<HashSet<i64>> = None;
-        for (run, (concepts, documents)) in by_run.into_iter() {
-            if concepts.len() != 1 {
-                crate::trace!(
-                    "f) ancla DESCARTADA por regla `concepts.len() != 1`: tramo {:?} pertenece a {} campos, en {} documentos",
-                    run, concepts.len(), documents.len()
-                );
+        for (run, per_concept) in by_run.into_iter() {
+            let Some(documents) = self.anchor_for_run(&run, &per_concept, &concept_names, &roles)
+            else {
                 continue;
-            }
-            crate::trace!(
-                "f) ancla ACEPTADA: tramo {:?} (1 campo), aporta {} documentos",
-                run, documents.len()
-            );
+            };
             candidates
                 .get_or_insert_with(HashSet::new)
                 .extend(documents);
@@ -1650,6 +1819,101 @@ impl ToolEngine {
         // candidato para compararlos cuesta, y con tantos la pregunta no está
         // señalando a ninguno en particular.
         Ok(candidates.filter(|documents| documents.len() <= MAX_PINNED_CANDIDATES))
+    }
+
+    /// Los documentos que aporta un tramo anclado, o `None` si el tramo no
+    /// ancla nada.
+    ///
+    /// La regla de siempre es que un tramo perteneciente a **varios** campos
+    /// no ancla: si el mismo texto es valor de dos campos distintos, no se
+    /// sabe cuál está nombrando la pregunta. Esa regla sigue intacta y es el
+    /// caso por defecto —«certificación de documento» pertenece a un solo
+    /// campo y ancla igual que antes—.
+    ///
+    /// Lo que se añade delante es el caso en que la pregunta **sí** dijo cuál:
+    ///
+    /// 1. Nombró exactamente uno de esos campos como CONDICIÓN («…donde el
+    ///    testador es Felipe Navarro Arias…»). Entonces el tramo ancla por ese
+    ///    campo, no por los nueve en los que ese nombre aparece.
+    /// 2. No nombró ninguno como condición, pero sí uno como LO PREGUNTADO
+    ///    («¿quién quedó como albacea designado…?»). Un valor escrito en la
+    ///    pregunta está ahí para localizar el documento, así que no puede ser,
+    ///    además, la respuesta que se pide: los documentos donde ese tramo sólo
+    ///    aparece en el campo preguntado quedan fuera, y el ancla se queda con
+    ///    los demás.
+    ///
+    /// Si la pregunta no nombra ninguno de los dos modos, no hay nada que
+    /// desambiguar y el tramo se descarta como hasta ahora.
+    fn anchor_for_run(
+        &self,
+        run: &str,
+        per_concept: &HashMap<i64, HashSet<i64>>,
+        concept_names: &HashMap<i64, String>,
+        roles: &QuestionFieldRoles,
+    ) -> Option<HashSet<i64>> {
+        let documents_of = |concepts: &[i64]| {
+            concepts
+                .iter()
+                .filter_map(|concept| per_concept.get(concept))
+                .flatten()
+                .copied()
+                .collect::<HashSet<i64>>()
+        };
+        if per_concept.len() == 1 {
+            let documents = documents_of(&per_concept.keys().copied().collect::<Vec<_>>());
+            crate::trace!(
+                "f) ancla ACEPTADA: tramo {:?} (1 campo), aporta {} documentos",
+                run,
+                documents.len()
+            );
+            return Some(documents);
+        }
+        let role_of = |concept: &i64| {
+            concept_names
+                .get(concept)
+                .map(|name| roles.role(name, run))
+                .unwrap_or(FieldRole::Unmarked)
+        };
+        let restricted = per_concept
+            .keys()
+            .copied()
+            .filter(|concept| role_of(concept) == FieldRole::Restriction)
+            .collect::<Vec<_>>();
+        if restricted.len() == 1 {
+            let documents = documents_of(&restricted);
+            crate::trace!(
+                "f) ancla DESAMBIGUADA por el campo que la pregunta pone como CONDICION: tramo {:?} ({} campos posibles) -> campo {:?}, {} documentos",
+                run,
+                per_concept.len(),
+                concept_names.get(&restricted[0]),
+                documents.len()
+            );
+            return Some(documents);
+        }
+        if restricted.is_empty() {
+            let (asked, rest): (Vec<i64>, Vec<i64>) = per_concept
+                .keys()
+                .copied()
+                .partition(|concept| role_of(concept) == FieldRole::Asked);
+            if !asked.is_empty() && !rest.is_empty() {
+                let documents = documents_of(&rest);
+                crate::trace!(
+                    "f) ancla DESAMBIGUADA apartando el campo PREGUNTADO: tramo {:?} ({} campos posibles, {} preguntado(s)) -> {} documentos",
+                    run,
+                    per_concept.len(),
+                    asked.len(),
+                    documents.len()
+                );
+                return Some(documents);
+            }
+        }
+        crate::trace!(
+            "f) ancla DESCARTADA por regla `concepts.len() != 1`: tramo {:?} pertenece a {} campos, en {} documentos",
+            run,
+            per_concept.len(),
+            documents_of(&per_concept.keys().copied().collect::<Vec<_>>()).len()
+        );
+        None
     }
 
     /// El candidato que cubre más pistas de la pregunta, si hay uno solo que
@@ -2141,6 +2405,7 @@ impl ToolEngine {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        let roles = QuestionFieldRoles::new(query);
         let mut explicit = Vec::new();
         let mut explicit_values = Vec::new();
         let mut implicit: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -2177,6 +2442,17 @@ impl ToolEngine {
                 continue;
             }
             if field_named {
+                // El campo nombrado puede ser el que la pregunta PIDE, no una
+                // condición. Un filtro construido con él exige que el dato
+                // buscado sea el valor que la pregunta escribió para otra
+                // cosa, y deja el alcance vacío o —peor— apuntando al
+                // documento equivocado.
+                if roles.role(&field, &value) == FieldRole::Asked {
+                    crate::trace!(
+                        "c)   filtro DESCARTADO ({field} = {value}): la pregunta nombra ese campo como LO PREGUNTADO, no como condicion"
+                    );
+                    continue;
+                }
                 crate::trace!("c)   filtro EXPLICITO (la pregunta nombra el campo): {field} = {value}");
                 explicit_values.push(normalize_spanish(&value));
                 explicit.push(ToolFilter {

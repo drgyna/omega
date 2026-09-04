@@ -21,8 +21,8 @@ use crate::{
     relations,
     report,
     tools::{
-        self, DocumentQueryResult, LocatedDocument, OriginSummary, TextQueryResult, ToolEngine,
-        ValueQuery,
+        self, DocumentQueryResult, FieldRole, LocatedDocument, OriginSummary, QuestionFieldRoles,
+        TextQueryResult, ToolEngine, ValueQuery,
     },
 };
 
@@ -423,6 +423,53 @@ impl Agent {
         if values.is_empty() {
             return Ok(None);
         }
+        // La pregunta pudo nombrar dos campos de este documento con
+        // intenciones opuestas: uno como PREMISA —escrito junto a su valor,
+        // «cuyo testador es Felipe Navarro Arias»— y otro como pregunta
+        // —«¿cuál es su albacea?»—. La resolución de campo se queda siempre
+        // con la premisa: está escrita entera y con su valor, así que puntúa
+        // mejor. El resultado era devolverle al usuario, sellado como dato
+        // verificado, exactamente lo que él acababa de escribir.
+        //
+        // La premisa sólo se aparta si, sin ella, la pregunta todavía nombra
+        // algún otro campo de este documento. Cuando la premisa es lo único
+        // que nombra, la pregunta SÍ trata sobre ella —una confirmación— y
+        // nada cambia.
+        let roles = QuestionFieldRoles::new(question);
+        let is_premise = |value: &tools::DocumentValue| {
+            roles.role(&value.field, &value.value) == FieldRole::Restriction
+        };
+        let values = if values.iter().any(is_premise) {
+            let asked = values
+                .iter()
+                .filter(|value| !is_premise(value))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut asked_vocabulary: Vec<String> = Vec::new();
+            for value in &asked {
+                if !asked_vocabulary
+                    .iter()
+                    .any(|name| normalize_exact(name) == normalize_exact(&value.field))
+                {
+                    asked_vocabulary.push(value.field.clone());
+                }
+            }
+            if answer::question_names_a_field(question, &asked_vocabulary) {
+                crate::trace!(
+                    "h) answer_about_document: se apartan las PREMISAS {:?}; la pregunta sigue nombrando otro campo",
+                    values
+                        .iter()
+                        .filter(|value| is_premise(value))
+                        .map(|value| value.field.clone())
+                        .collect::<Vec<_>>()
+                );
+                asked
+            } else {
+                values
+            }
+        } else {
+            values
+        };
         // Localizar el documento no autoriza a responder cualquier cosa sobre
         // él: si la pregunta pide un campo que este documento no registra, la
         // respuesta correcta sigue siendo «no encontré evidencia». Sin esta
