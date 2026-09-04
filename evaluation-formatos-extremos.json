@@ -2,8 +2,8 @@
   "version": 1,
   "expected_index": {
     "discovered": 54,
-    "indexed": 51,
-    "skipped": 3,
+    "indexed": 53,
+    "skipped": 1,
     "warnings_for": [
       "001-archivo-vacio.txt",
       "002-pdf-truncado.pdf",
@@ -19,7 +19,7 @@
       "question": "¿Cuántos documentos hay indexados y qué categorías contiene el acervo?",
       "expectation": {
         "kind": "inventory",
-        "total": 51,
+        "total": 53,
         "origins": {
           "01_pdf_texto": 12,
           "02_pdf_escaneado_ocr": 8,
@@ -27,7 +27,7 @@
           "04_excel_xlsx": 6,
           "05_csv": 6,
           "06_markdown_largo": 10,
-          "07_archivos_problematicos": 1
+          "07_archivos_problematicos": 3
         }
       }
     },
@@ -85,7 +85,7 @@
       "format": "archivos problemáticos",
       "file": "07_archivos_problematicos/*",
       "question": "¿Cuántos documentos pertenecen a la carpeta 07_archivos_problematicos?",
-      "expectation": { "kind": "documents", "count": 1, "origin": "07_archivos_problematicos" }
+      "expectation": { "kind": "documents", "count": 3, "origin": "07_archivos_problematicos" }
     },
     {
       "id": "fmt-pdf-exact",

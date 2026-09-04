@@ -1234,8 +1234,8 @@ fn run_resilience_cases(corpus_id: &str, source: &Path) -> Result<Vec<CaseResult
     });
     let reindex_ok = initial.discovered == 54
         && reindexed.discovered == 53
-        && reindexed.indexed == 50
-        && reindexed.skipped == 3
+        && reindexed.indexed == 52
+        && reindexed.skipped == 1
         && reindexed.modified == 1
         && removed_absent
         && added_present;
@@ -1246,7 +1246,7 @@ fn run_resilience_cases(corpus_id: &str, source: &Path) -> Result<Vec<CaseResult
         Some("multiformato".into()),
         Some("copia temporal mutada".into()),
         "Eliminar dos archivos, modificar uno, agregar otro y reindexar sin fantasmas.",
-        json!({"initial_discovered": 54, "reindexed_discovered": 53, "indexed": 50, "skipped": 3, "modified": 1, "removed_absent": true, "added_present": true}),
+        json!({"initial_discovered": 54, "reindexed_discovered": 53, "indexed": 52, "skipped": 1, "modified": 1, "removed_absent": true, "added_present": true}),
         json!({"initial": initial, "reindexed": reindexed, "removed_absent": removed_absent, "added_present": added_present}),
         reindex_ok,
         reindex_started.elapsed(),
@@ -1280,7 +1280,7 @@ fn run_resilience_cases(corpus_id: &str, source: &Path) -> Result<Vec<CaseResult
     let reopen_answer = reopened
         .ask("Encuentra exactamente ADD-26-0001.")
         .map_err(|error| error.to_string())?;
-    let reopen_ok = status.documents == 50 && !reopen_answer.citations.is_empty();
+    let reopen_ok = status.documents == 52 && !reopen_answer.citations.is_empty();
     results.push(direct_result(
         format!("{corpus_id}-resilience-reopen"),
         corpus_id,
@@ -1288,7 +1288,7 @@ fn run_resilience_cases(corpus_id: &str, source: &Path) -> Result<Vec<CaseResult
         Some("SQLite".into()),
         Some("resilience.db".into()),
         "Cerrar y reabrir la base conservando índice y evidencia.",
-        json!({"documents": 50, "identifier": "ADD-26-0001"}),
+        json!({"documents": 52, "identifier": "ADD-26-0001"}),
         json!({"documents": status.documents, "citations": reopen_answer.citations.len()}),
         reopen_ok,
         reopen_started.elapsed(),
