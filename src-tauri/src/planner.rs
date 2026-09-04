@@ -56,8 +56,13 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
     let mentions_documents =
         has("document") || has("archiv") || has("expedient") || has("registro");
     let mentions_index = has("indic") || has("index") || has("acerv") || has("coleccion");
+    crate::trace!(
+        "c) planner::plan senales lexicas: asks_count={asks_count} (cuant/numer/conte/how/total), asks_sum={asks_sum}, asks_group={asks_group}, asks_list={asks_list}, mentions_documents={mentions_documents}, mentions_index={mentions_index}, totals_a_value={totals_a_value}"
+    );
+    crate::trace!("c) planner::plan terminos = {terms:?}");
 
     if asks_count && mentions_documents && mentions_index {
+        crate::trace!("c) planner::plan SALE por rama: Inventory (asks_count+documents+index)");
         return Ok(QueryPlan {
             intent: QueryIntent::Inventory,
             filters: vec![],
@@ -83,6 +88,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
         }
     }
     if ToolEngine::query_has_exact_signal(question) {
+        crate::trace!("c) planner::plan SALE por rama: Exact (senal de literal entrecomillado)");
         return Ok(QueryPlan {
             intent: QueryIntent::Exact,
             filters: vec![],
@@ -163,6 +169,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
     }
 
     if asks_count && (!filters.is_empty() || origin.is_some()) {
+        crate::trace!("c) planner::plan SALE por rama: CountDocuments (asks_count Y hay filtros/carpeta)");
         return Ok(QueryPlan {
             intent: QueryIntent::CountDocuments,
             filters,
@@ -170,6 +177,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
         });
     }
     if asks_list && !filters.is_empty() {
+        crate::trace!("c) planner::plan SALE por rama: ListDocuments");
         return Ok(QueryPlan {
             intent: QueryIntent::ListDocuments,
             filters,
@@ -180,7 +188,9 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
     let question_word = ["que", "quien", "quienes", "existe", "resume"]
         .iter()
         .any(|word| natural.split_whitespace().any(|term| term == *word));
+    crate::trace!("c) planner::plan target(concepto nombrado)={:?} question_word={question_word} filtros={}", target.as_ref().map(|c| c.display_name.clone()), filters.len());
     if target.is_some() && (!filters.is_empty() || !question_word) {
+        crate::trace!("c) planner::plan SALE por rama: LegacySearch (concepto nombrado)");
         return Ok(QueryPlan {
             intent: QueryIntent::LegacySearch,
             filters: vec![],
@@ -188,6 +198,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
         });
     }
     if asks_count || (asks_list && origin.is_some()) || question_word {
+        crate::trace!("c) planner::plan SALE por rama: FreeText");
         return Ok(QueryPlan {
             intent: QueryIntent::FreeText,
             filters: vec![],
@@ -195,6 +206,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
         });
     }
     if asks_list {
+        crate::trace!("c) planner::plan SALE por rama: BoundedSearch");
         return Ok(QueryPlan {
             intent: QueryIntent::BoundedSearch,
             filters: vec![],
@@ -1245,8 +1257,64 @@ struct Signals {
 }
 
 const CONTAINER_WORDS: &[&str] = &[
-    "document", "archiv", "expedient", "registr", "caso", "carpet", "file",
+    "document", "archiv", "expedient", "caso", "carpet", "file",
 ];
+
+/// «Registro» es la única palabra de contenedor que coincide, letra por letra,
+/// con un verbo corriente: normalizada, la forma del sustantivo («el registro»)
+/// y la del verbo («se registró») son la misma cadena, y la raíz «registr-» las
+/// unía a las dos. Como cualquier documento de negocio describe con ese verbo
+/// cuándo se guardó un dato, la raíz suelta convertía en «pregunta por un
+/// expediente» a cualquier pregunta que dijera «¿cuándo se registró?».
+///
+/// Se separan por su gramática, no por su significado: un sustantivo español
+/// va precedido de un determinante o de una preposición («el registro», «del
+/// registro», «¿qué registro…?»), mientras que la forma verbal va precedida de
+/// un clítico o de un sujeto interrogativo («se registró», «quién registró»).
+/// La lista de determinantes y preposiciones es clase cerrada del idioma —no
+/// vocabulario de ningún giro— y el plural («registros») nunca es verbo, así
+/// que se acepta siempre.
+const CONTAINER_NOUN_WORDS: &[&str] = &["registro", "registros"];
+
+/// Determinantes, cuantificadores y preposiciones que en español sólo pueden
+/// preceder a un sustantivo. Clase cerrada.
+const NOUN_INTRODUCERS: &[&str] = &[
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "del", "al", "de", "en", "con", "por",
+    "para", "sobre", "desde", "hasta", "entre", "sin", "segun", "este", "esta", "estos", "estas",
+    "ese", "esa", "esos", "esas", "aquel", "aquella", "aquellos", "aquellas", "mi", "mis", "tu",
+    "tus", "su", "sus", "nuestro", "nuestra", "nuestros", "nuestras", "cada", "otro", "otra",
+    "otros", "otras", "algun", "alguna", "algunos", "algunas", "ningun", "ninguna", "que", "cual",
+    "cuales", "cuanto", "cuanta", "cuantos", "cuantas", "todo", "toda", "todos", "todas", "cuyo",
+    "cuya", "cuyos", "cuyas", "mismo", "misma", "primer", "primero", "ultimo", "ultima", "dos",
+    "tres", "varios", "varias", "muchos", "muchas", "y", "o", "u",
+];
+
+/// ¿La pregunta usa alguna palabra de contenedor **como sustantivo**?
+///
+/// Las raíces de `CONTAINER_WORDS` no chocan con ningún verbo frecuente y se
+/// comprueban como antes. «Registro» sí choca, así que además exige la
+/// gramática descrita en `CONTAINER_NOUN_WORDS`.
+fn names_a_container(terms: &[String], words: &[String]) -> bool {
+    if CONTAINER_WORDS
+        .iter()
+        .any(|root| terms.iter().any(|term| term.starts_with(root)))
+    {
+        return true;
+    }
+    words.iter().enumerate().any(|(index, word)| {
+        if !CONTAINER_NOUN_WORDS.contains(&word.as_str()) {
+            return false;
+        }
+        // El plural no tiene forma verbal homógrafa: es sustantivo siempre.
+        if word.ends_with('s') {
+            return true;
+        }
+        match index.checked_sub(1) {
+            None => true,
+            Some(previous) => NOUN_INTRODUCERS.contains(&words[previous].as_str()),
+        }
+    })
+}
 
 const CALENDAR_WORDS: &[&str] = &[
     "fecha", "fechas", "mes", "meses", "ano", "anos", "periodo", "periodos", "trimestre",
@@ -1351,9 +1419,7 @@ fn signals(question: &str) -> Signals {
         superlative: maximum || minimum,
         extreme_named: has("maxim") || has("minim"),
         descending: has("maxim") || any_word(MAXIMUM_WORDS),
-        container: CONTAINER_WORDS
-            .iter()
-            .any(|root| terms.iter().any(|term| term.starts_with(root))),
+        container: names_a_container(&terms, &words),
         calendar: CALENDAR_WORDS.iter().any(|value| word(value)),
         multiply: has("multiplic"),
         divide: has("dividi") || has("division"),
@@ -1754,7 +1820,18 @@ fn plan_inner(
         && requested_operation(&marks).is_none()
     {
         if let Some(path) = &state.document {
-            if question_names_a_concept(tools, question)? {
+            // Nombrar la CATEGORÍA del dato señala lo que se pide con la misma
+            // precisión que nombrar el campo: «¿cuándo se registró?» pide la
+            // fecha de ese documento y «¿quién…?» a quien aparece en él. Sin
+            // esto, una continuación que sí decía qué buscaba —pero con la
+            // palabra interrogativa en vez del rótulo— dejaba de hablar del
+            // documento del que hablaba el turno anterior. La garantía no
+            // cambia: quien responde sigue exigiendo que ese documento
+            // registre un valor de esa categoría, y si registra varios
+            // pregunta en vez de elegir.
+            if question_names_a_concept(tools, question)?
+                || crate::answer::question_names_a_value_category(question)
+            {
                 return Ok(StructuredPlan {
                     command: Command::DocumentInContext(DocumentSelection::LastCited(
                         path.clone(),

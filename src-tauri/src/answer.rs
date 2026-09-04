@@ -1462,6 +1462,122 @@ fn explicitly_quoted_field(question: &str, vocabulary: &[String]) -> Option<Stri
         .cloned()
 }
 
+/// Lo que la pregunta pide de un documento ya fijado, cuando lo nombra por su
+/// categoría y no por el nombre del campo.
+#[derive(Clone, Debug)]
+pub enum FieldRequest {
+    /// La pregunta no nombra ninguna categoría, o el documento no registra
+    /// ningún valor de la que nombra.
+    NotRequested,
+    Resolved(String),
+    /// Más de un campo del documento podría responderla. No se elige: quien
+    /// recibe esto pregunta.
+    Ambiguous(Vec<String>),
+}
+
+/// Categorías de valor que la palabra interrogativa de la pregunta nombra.
+///
+/// Es gramática del español —clase cerrada, sin vocabulario de ningún giro de
+/// negocio— traducida a la taxonomía que el esquema ya distingue en
+/// `concepts.value_type`. Ese puente hace falta porque «cuándo» no comparte
+/// ninguna raíz con «Fecha» ni «cuánto» con «Importe»: emparejar por raíz
+/// léxica, que es lo único que hace `resolve_field`, no puede resolverlas.
+///
+/// No hay categoría de persona ni de lugar en el esquema, así que «quién» no
+/// se traduce a ninguna: se resuelve aparte, entre los valores que la capa de
+/// entidades ya marcó como nombres.
+fn asked_value_categories(question: &str) -> Vec<&'static str> {
+    let mut categories = Vec::new();
+    if question_says(question, &["cuando"]) {
+        categories.push("date");
+    }
+    if question_says(question, &["cuanto", "cuanta", "cuantos", "cuantas"]) {
+        categories.extend(["money", "number", "percentage"]);
+    }
+    categories
+}
+
+fn asks_who(question: &str) -> bool {
+    question_says(question, &["quien", "quienes"])
+}
+
+fn question_says(question: &str, words: &[&str]) -> bool {
+    normalize_exact(question)
+        .split_whitespace()
+        .any(|word| words.contains(&word))
+}
+
+/// ¿La pregunta nombra una categoría de valor en vez de un campo?
+///
+/// Lo consulta el planificador para saber que una continuación como «y en esa
+/// minuta, ¿cuándo se registró?» sí está pidiendo un dato del documento del
+/// que se hablaba, aunque no escriba el nombre de ningún campo.
+pub fn question_names_a_value_category(question: &str) -> bool {
+    !asked_value_categories(question).is_empty() || asks_who(question)
+}
+
+/// Campo de ESTE documento que responde a la categoría que nombra la pregunta.
+///
+/// Se resuelve dentro del documento ya fijado, nunca contra el acervo: la
+/// categoría («una fecha») sólo identifica un campo si este documento registra
+/// exactamente uno de ella. Con dos o más no se elige ninguno.
+pub fn field_asked_by_category(question: &str, values: &[DocumentValue]) -> FieldRequest {
+    let categories = asked_value_categories(question);
+    let mut candidates = if !categories.is_empty() {
+        distinct_fields(
+            values
+                .iter()
+                .filter(|value| categories.contains(&value.value_type.as_str())),
+        )
+    } else if asks_who(question) {
+        // «Quién» se resuelve entre los valores que la capa de entidades ya
+        // reconoció como nombres, descartando los que otra pista de la
+        // pregunta ya reclamó: el valor que la pregunta escribe para localizar
+        // el documento no puede ser, además, el que pregunta.
+        distinct_fields(
+            values
+                .iter()
+                .filter(|value| value.is_entity && !ToolEngine::value_named_by(question, &value.value)),
+        )
+    } else {
+        Vec::new()
+    };
+    match candidates.len() {
+        0 => FieldRequest::NotRequested,
+        1 => FieldRequest::Resolved(candidates.remove(0)),
+        _ => FieldRequest::Ambiguous(candidates),
+    }
+}
+
+/// El campo que la pregunta nombra POR COMPLETO: todas las palabras
+/// significativas de su nombre están escritas en la pregunta.
+///
+/// Es la forma fuerte de `resolve_field`, que se conforma con una coincidencia
+/// parcial. La distinción importa porque una coincidencia parcial puede ser
+/// accidental —«minuta de **ventas**» toca «Meta de **ventas**» sin pedirlo— y
+/// no debe ganarle a una pregunta que dice explícitamente qué categoría busca.
+/// Con el nombre completo escrito no hay accidente posible, y manda.
+pub fn field_named_in_full(question: &str, vocabulary: &[String]) -> Option<String> {
+    let terms = search_terms(question);
+    let identifier_words = identifier_terms_in(question);
+    vocabulary
+        .iter()
+        .filter(|name| {
+            let field_terms = search_terms(name);
+            !field_terms.is_empty()
+                && field_terms.iter().any(|term| {
+                    !FILLER_ROOTS.contains(term) && !identifier_words.contains(term)
+                })
+                && field_terms.iter().all(|field_term| {
+                    terms
+                        .iter()
+                        .any(|query_term| stems_match(query_term, field_term))
+                })
+        })
+        .max_by_key(|name| search_terms(name).len())
+        .cloned()
+}
+
 fn resolve_field(
     vocabulary: &[String],
     terms: &[String],

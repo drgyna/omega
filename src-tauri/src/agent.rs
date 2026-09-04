@@ -49,13 +49,19 @@ impl Agent {
     /// conversaciones.
     pub fn answer_in(&self, question: &str, state: &mut ConversationState) -> Result<Answer> {
         let plan = planner::plan_structured(&self.tools, question, state, &self.clock)?;
+        crate::trace!("== PREGUNTA: {question}");
+        crate::trace!("b) plan_structured -> Command::{:?}", plan.command);
+        crate::trace!("b) plan_structured -> scope {:?}", plan.scope);
         // Ninguna respuesta deja un documento señalado por omisión: las rutas
         // que hablan de uno solo lo fijan ellas mismas. El plan ya leyó el
         // anterior, así que borrarlo aquí no pierde nada y evita que «ese
-        // documento» siga apuntando a un archivo del que ya nadie habló.
+        // documento» siga apuntando a un archivo del que ya nadie habló. La
+        // recuperación sí necesita saber cuál era, para poder comprobar si la
+        // pregunta lo sigue describiendo; se le pasa aparte, no por el estado.
+        let inherited = state.document.clone();
         state.document = None;
         let answer = match plan.command.clone() {
-            Command::Retrieval => self.retrieval(question, state)?,
+            Command::Retrieval => self.retrieval(question, state, inherited.as_deref())?,
             Command::Clarify(clarification) => clarify(clarification),
             Command::NoEvidence { message } => Answer::unverified(message),
             Command::Compute(operation) => self.compute(operation, &plan.scope, state)?,
@@ -213,9 +219,16 @@ impl Agent {
     /// Ruta de recuperación clásica. Además de responder, deja en el contexto
     /// el predicado del conjunto que acaba de producir, para que el siguiente
     /// turno pueda referirse a él.
-    fn retrieval(&self, question: &str, state: &mut ConversationState) -> Result<Answer> {
+    fn retrieval(
+        &self,
+        question: &str,
+        state: &mut ConversationState,
+        inherited: Option<&str>,
+    ) -> Result<Answer> {
         let plan = planner::plan(&self.tools, question)?;
-        let (answer, subject) = self.execute(question, &plan)?;
+        crate::trace!("c) planner::plan (clasico) -> intent={:?}", plan.intent);
+        crate::trace!("c) planner::plan -> origin={:?} filters={:?}", plan.origin, plan.filters);
+        let (answer, subject) = self.execute(question, &plan, inherited)?;
         self.remember_retrieval(question, &plan, state)?;
         // `remember_retrieval` reinicia el estado; el documento del que habló
         // esta respuesta se fija después, para que no se lo lleve por delante.
@@ -406,6 +419,7 @@ impl Agent {
         document: &LocatedDocument,
     ) -> Result<Option<Answer>> {
         let values = self.tools.document_values(document.id)?;
+        crate::trace!("h) answer_about_document({}) con {} valores", document.path.rsplit('/').next().unwrap_or(""), values.len());
         if values.is_empty() {
             return Ok(None);
         }
@@ -425,6 +439,47 @@ impl Agent {
                 .any(|name| normalize_exact(name) == normalize_exact(&value.field))
             {
                 vocabulary.push(value.field.clone());
+            }
+        }
+        // La palabra interrogativa puede decir QUÉ se pide sin nombrar ningún
+        // campo: «¿cuándo…?» pide la fecha de este documento y «¿quién…?» a
+        // quien aparece en él. Se resuelve aquí dentro, contra los valores que
+        // este documento sí registra, y sólo cuando la pregunta no nombró ya un
+        // campo suyo por completo —eso manda siempre—. Una coincidencia parcial
+        // no manda: «minuta de ventas» roza «Meta de ventas» sin pedirla.
+        crate::trace!("h) field_named_in_full -> {:?}", answer::field_named_in_full(question, &vocabulary));
+        if answer::field_named_in_full(question, &vocabulary).is_none() {
+            match answer::field_asked_by_category(question, &values) {
+                answer::FieldRequest::Resolved(field) => {
+                    // Se sintetiza sobre los valores de ESE campo y de este
+                    // documento, no sobre todo lo encontrado: si el documento
+                    // registra varios (una tabla con varias filas), la
+                    // redacción de siempre los enumera en vez de elegir uno.
+                    let hits = values
+                        .iter()
+                        .filter(|value| {
+                            normalize_exact(&value.field) == normalize_exact(&field)
+                        })
+                        .map(|value| SearchHit {
+                            title: value.field.clone(),
+                            score: 1.0,
+                            evidence: value.evidence.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(synthesis) = answer::synthesize(&self.tools, question, &hits)? {
+                        let mut answer = Answer::verified(synthesis.text, synthesis.citations);
+                        answer.verified &= synthesis.verified;
+                        return Ok(Some(answer));
+                    }
+                }
+                answer::FieldRequest::Ambiguous(options) => {
+                    return Ok(Some(clarify(Clarification {
+                        question: "La pregunta no nombra ningún campo de este documento y más de uno podría responderla. ¿Cuál de estos?".into(),
+                        options,
+                        reason: "campo_por_categoria_ambiguo".into(),
+                    })));
+                }
+                answer::FieldRequest::NotRequested => {}
             }
         }
         if !answer::question_names_a_field(question, &vocabulary) {
@@ -832,7 +887,12 @@ impl Agent {
     /// siguiente, y no se puede deducir de las citas —la síntesis cita todo lo
     /// que la búsqueda encontró, de varios archivos, y sólo una de esas citas
     /// sostiene la afirmación.
-    fn execute(&self, question: &str, plan: &QueryPlan) -> Result<(Answer, Option<String>)> {
+    fn execute(
+        &self,
+        question: &str,
+        plan: &QueryPlan,
+        inherited: Option<&str>,
+    ) -> Result<(Answer, Option<String>)> {
         // La cadena de fecha entre comillas ya trae el dato completo en la
         // propia pregunta: no hace falta leer el acervo para saber si tiene
         // una lectura de calendario válida, dos distintas o ninguna. Se
@@ -841,8 +901,10 @@ impl Agent {
         // escrita como si fuera una fecha ya resuelta, sin advertir el
         // problema.
         if let Some(answer) = date_calendar_clarification(question) {
+            crate::trace!("d) RUTA TEMPRANA: date_calendar_clarification DISPARA");
             return Ok((answer, None));
         }
+        crate::trace!("d) date_calendar_clarification: no dispara");
         // Preguntar por la fiabilidad de la lectura de un documento no es
         // preguntar por su contenido: se resuelve con el estado de OCR que el
         // índice ya guarda, y va antes de la ruta de localización porque ésta
@@ -850,8 +912,10 @@ impl Agent {
         // lo es— y devolvería «no encontré evidencia» sobre un dato que Omega
         // sí tiene.
         if let Some(answer) = self.reading_reliability_answer(question)? {
+            crate::trace!("d) RUTA TEMPRANA: reading_reliability_answer DISPARA");
             return Ok((answer, None));
         }
+        crate::trace!("d) reading_reliability_answer: no dispara");
         // «¿Qué información se puede extraer de este archivo?» sobre un archivo
         // cuya extensión no corresponde a su contenido. Va antes de la ruta de
         // localización porque ésa contesta con el contenido extraído y deja la
@@ -859,20 +923,61 @@ impl Agent {
         // sacar de un archivo necesita saber primero que el archivo no es lo
         // que dice ser, no enterarse al final.
         if let Some(answer) = self.disguised_file_answer(question)? {
+            crate::trace!("d) RUTA TEMPRANA: disguised_file_answer DISPARA");
             return Ok((answer, None));
         }
+        crate::trace!("d) disguised_file_answer: no dispara");
         // Una clave de localización manda sobre el plan: identifica un
         // documento concreto, así que responder sobre él es más preciso que
         // buscar por texto. Si no resuelve a exactamente un documento, la
         // pregunta sigue su curso normal.
         if let Some((answer, subject)) = self.located_answer(question)? {
+            crate::trace!("d) RUTA TEMPRANA: located_answer DISPARA -> {subject}");
             return Ok((answer, Some(subject)));
         }
-        match plan.intent.clone() {
+        crate::trace!("d) located_answer (locate_documents_by_key): no dispara");
+        // Sin clave escrita, las pistas de la pregunta todavía pueden señalar
+        // a un solo documento del acervo. Entonces la respuesta es leerlo y
+        // contestar con su valor citado, no devolver una lista de candidatos y
+        // dejarle la lectura al usuario. Va después de las rutas anteriores
+        // porque todas ellas responden algo que no es un campo del documento
+        // —el calendario de una cadena, la fiabilidad de un escaneo— y esta
+        // ruta se las robaría.
+        //
+        // Se intenta para cualquier intent, incluidos conteo/lista/agregación:
+        // una pregunta con "cuántas" puede estar pidiendo el valor de UN campo
+        // de UN documento concreto ("¿cuántas copias pidió?"), no un conteo
+        // real de documentos. `pinned_document` ya se abstiene solo cuando la
+        // pregunta no ancla nada (ver tools.rs), y `answer_about_document` más
+        // abajo sólo contesta si el documento fijado registra el campo que la
+        // pregunta nombra; si no, la rama de conteo/lista de siempre sigue
+        // intacta.
+        crate::trace!("e) GUARDA DE FIJADO: se intenta para todo intent (intent={:?})", plan.intent);
+        let pinned = match self.tools.pinned_document(question, inherited)? {
+            Some(document_id) => self.tools.document_by_id(document_id)?,
+            None => None,
+        };
+        crate::trace!("e) pinned = {:?}", pinned.as_ref().map(|d| d.path.clone()));
+        if let Some(document) = &pinned {
+            // Fijar el documento no autoriza a contestar cualquier cosa sobre
+            // él: `answer_about_document` sólo responde si la pregunta nombra
+            // un campo que ese documento registra. Si no, la pregunta sigue su
+            // camino de siempre.
+            if let Some(answer) = self.answer_about_document(question, document)? {
+                crate::trace!("h) answer_about_document RESUELVE sobre el documento fijado");
+                return Ok((answer, Some(document.path.clone())));
+            }
+            crate::trace!("h) answer_about_document devuelve None sobre el documento fijado");
+        }
+        let (answer, subject) = match plan.intent.clone() {
             QueryIntent::Inventory => {
+                crate::trace!("g) rama ejecutada: Inventory");
                 Ok((inventory_answer(self.tools.origin_summaries()?), None))
             }
-            QueryIntent::Exact => self.legacy_answer(question, 20),
+            QueryIntent::Exact => {
+                crate::trace!("g) rama ejecutada: Exact -> legacy_answer(20)");
+                self.legacy_answer(question, 20)
+            }
             QueryIntent::Aggregate(request) => {
                 let result = self.tools.aggregate(&request)?;
                 Ok((aggregate_answer(&self.tools, &request, result), None))
@@ -890,6 +995,10 @@ impl Agent {
                 ))
             }
             QueryIntent::CountDocuments | QueryIntent::ListDocuments => {
+                crate::trace!(
+                    "g) rama ejecutada: CountDocuments/ListDocuments -> query_documents(filters={:?}, origin={:?})",
+                    plan.filters, plan.origin
+                );
                 let evidence_per_document = plan.filters.len() + usize::from(plan.origin.is_some());
                 let sample_limit = if evidence_per_document == 0 {
                     MAX_DOCUMENT_SAMPLE
@@ -903,20 +1012,42 @@ impl Agent {
                     plan.origin.as_deref(),
                     sample_limit,
                 )?;
+                crate::trace!(
+                    "g) query_documents -> {} documentos; muestra: {:?}",
+                    result.document_count,
+                    result.evidence.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect::<std::collections::BTreeSet<_>>()
+                );
+                crate::trace!("h) composicion: document_answer (fallback generico de conteo)");
                 Ok((
                     document_answer(result, &plan.filters, plan.origin.as_deref()),
                     None,
                 ))
             }
             QueryIntent::FreeText => {
+                crate::trace!("g) rama ejecutada: FreeText -> search_text");
                 let result =
                     self.tools
                         .search_text(question, plan.origin.as_deref(), MAX_TEXT_CITATIONS)?;
+                crate::trace!("g) search_text -> {} documentos, {} hits", result.document_count, result.hits.len());
+                crate::trace!("h) composicion: text_answer");
                 Ok((text_answer(question, result), None))
             }
-            QueryIntent::BoundedSearch => self.legacy_answer(question, 20),
-            QueryIntent::LegacySearch => self.legacy_answer(question, usize::MAX),
-        }
+            QueryIntent::BoundedSearch => {
+                crate::trace!("g) rama ejecutada: BoundedSearch -> legacy_answer(20)");
+                self.legacy_answer(question, 20)
+            }
+            QueryIntent::LegacySearch => {
+                crate::trace!("g) rama ejecutada: LegacySearch -> legacy_answer(MAX)");
+                self.legacy_answer(question, usize::MAX)
+            }
+        }?;
+        // Si las pistas fijaron un documento aunque este turno no supiera qué
+        // campo se le pedía, ese documento es igualmente del que trata la
+        // conversación: la continuación siguiente puede preguntar por él.
+        Ok((
+            answer,
+            subject.or_else(|| pinned.map(|document| document.path)),
+        ))
     }
 
     fn legacy_answer(&self, question: &str, limit: usize) -> Result<(Answer, Option<String>)> {
@@ -927,7 +1058,16 @@ impl Agent {
         let mut hits = self.tools.search(question, &[], limit.saturating_add(1))?;
         let truncated = hits.len() > limit;
         hits.truncate(limit);
+        crate::trace!("g) search() -> {} hits", hits.len());
+        for (i, hit) in hits.iter().take(12).enumerate() {
+            crate::trace!(
+                "g)   #{} score={:.2} campo={:?} valor={:?} doc={}",
+                i + 1, hit.score, hit.evidence.field, hit.evidence.value,
+                hit.evidence.path.rsplit('/').next().unwrap_or("")
+            );
+        }
         if hits.is_empty() {
+            crate::trace!("h) legacy_answer: 0 hits -> no_evidence_answer()");
             return Ok((no_evidence_answer(), None));
         }
         // Todas las coincidencias son metadatos sin valor —el nombre del
@@ -940,6 +1080,7 @@ impl Agent {
         // El texto nombra QUÉ coincidió, no lo supone: la ruta llega aquí
         // tanto por un nombre de archivo como por una carpeta.
         if !hits.iter().any(|hit| hit.evidence.is_substantive()) {
+            crate::trace!("h) legacy_answer: ningun hit es sustantivo -> respuesta de 'solo metadato'");
             let matched = hits
                 .iter()
                 .filter_map(|hit| hit.evidence.field.clone())
@@ -956,6 +1097,7 @@ impl Agent {
         }
         let (mut answer, subject) =
             if let Some(synthesis) = answer::synthesize(&self.tools, question, &hits)? {
+                crate::trace!("h) composicion: answer::synthesize RESUELVE (subject={:?})", synthesis.subject);
                 // `Answer::verified` es el candado de confiabilidad: deriva
                 // `verified` de las citas y adjunta la advertencia de OCR
                 // débil. La síntesis sólo puede bajar ese valor (caso
@@ -964,6 +1106,7 @@ impl Agent {
                 answer.verified &= synthesis.verified;
                 (answer, synthesis.subject)
             } else {
+                crate::trace!("h) composicion: FALLBACK generico 'N resultados con evidencia especifica'");
                 (
                     Answer::verified(
                         format!("{} resultados con evidencia específica.", hits.len()),

@@ -24,6 +24,7 @@ mod release_smoke;
 mod relations;
 mod report;
 mod tools;
+mod trace;
 mod verifier;
 pub mod workbook;
 

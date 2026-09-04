@@ -54,6 +54,11 @@ pub struct DocumentValue {
     pub value: String,
     pub value_type: String,
     pub identifier_canonical: Option<String>,
+    /// La capa de entidades ya reconoció este valor como el nombre de una
+    /// entidad. Es la única marca del esquema que distingue a quién nombra un
+    /// campo de lo que ese campo mide, y la usa la resolución de «¿quién?»,
+    /// que no tiene ninguna categoría de valor a la que traducirse.
+    pub is_entity: bool,
     pub evidence: Evidence,
 }
 
@@ -355,6 +360,7 @@ impl ToolEngine {
             return Ok(vec![]);
         }
         if query_contains_filename(query) {
+            crate::trace!("g) search(): ruta strict_exact_search (la pregunta trae un nombre de archivo)");
             return self.strict_exact_search(&exact_query_tokens(query), limit);
         }
         let canonical_identifiers = canonical_identifier_candidates(query);
@@ -371,6 +377,7 @@ impl ToolEngine {
         // intención exacta domina toda la recuperación.
         let exact_tokens = exact_query_tokens(query);
         if !exact_tokens.is_empty() {
+            crate::trace!("g) search(): ruta strict_exact_search por tokens exactos {exact_tokens:?}");
             return self.strict_exact_search(&exact_tokens, limit);
         }
         // Si el acervo reconoce a la vez un campo y uno de sus valores dentro
@@ -378,8 +385,16 @@ impl ToolEngine {
         // permite completar esta respuesta con FTS, metadatos ni otro campo
         // que sólo comparta alguna palabra del nombre.
         if let Some(hits) = self.strict_structured_hits(query, filters, limit)? {
+            crate::trace!(
+                "g) search(): ruta strict_structured_hits MANDA y devuelve {} hits (corta FTS y metadatos)",
+                hits.len()
+            );
+            for hit in hits.iter().take(8) {
+                crate::trace!("g)   strict #: score={:.2} campo={:?} doc={}", hit.score, hit.evidence.field, hit.evidence.path.rsplit('/').next().unwrap_or(""));
+            }
             return Ok(hits);
         }
+        crate::trace!("g) search(): strict_structured_hits no manda; sigue por metadatos+campos+FTS");
         // "exactamente AB" expresa una intención literal pero AB no es un
         // identificador completo (ni un archivo ni una frase citada). En vez
         // de ampliar a prefijos, se devuelve cero evidencia.
@@ -393,10 +408,26 @@ impl ToolEngine {
             ));
         }
         let mut by_document = self.metadata_hits(query, false)?;
-        for hit in self.structured_hits(query, filters, false)?.into_values() {
+        crate::trace!("g) search(): metadata_hits -> {} documentos", by_document.len());
+        let structured = self.structured_hits(query, filters, false)?;
+        crate::trace!("g) search(): structured_hits -> {} documentos", structured.len());
+        for hit in structured.into_values() {
             keep_best(&mut by_document, hit);
         }
-        let fts_query = terms
+        // Los términos obligatorios son los de CONTENIDO. La gramática de la
+        // consulta —«estoy buscando…», «¿cuándo…?»— no describe el documento
+        // y exigirla dentro del AND anulaba búsquedas cuyas palabras de
+        // contenido coincidían todas. Si la pregunta fuera sólo gramática no
+        // quedaría nada que exigir, así que en ese caso se conservan tal cual.
+        let required = {
+            let filtered = content_terms(query);
+            if filtered.is_empty() {
+                terms.clone()
+            } else {
+                filtered
+            }
+        };
+        let fts_query = required
             .iter()
             .map(|term| format!("\"{}\"*", term.replace('"', "")))
             .collect::<Vec<_>>()
@@ -404,6 +435,7 @@ impl ToolEngine {
             // membrete repetido en resultado. El FTS solo complementa a los
             // campos extraídos y exige todos los términos útiles.
             .join(" AND ");
+        crate::trace!("g) search(): FTS query = {fts_query:?}");
         let connection = self.database.connect()?;
         let mut sql = String::from(
             "SELECT d.id, d.title, d.path, d.origin, d.ocr_status, d.ocr_confidence,
@@ -829,8 +861,10 @@ impl ToolEngine {
         limit: usize,
     ) -> Result<Option<Vec<SearchHit>>> {
         let pairs = self.structured_pairs_in_query(query, filters)?;
+        crate::trace!("g) structured_pairs_in_query -> {:?}", pairs.values().collect::<Vec<_>>());
         if pairs.is_empty() {
             return if self.query_names_field_with_value(query)? {
+                crate::trace!("g) strict_structured_hits: forma campo-valor sin valor existente -> CIERRA con 0 hits");
                 // La consulta sí tiene forma campo–valor, pero el valor no
                 // existe para ese campo. Es importante cerrar aquí: permitir
                 // FTS devolvería documentos con el mismo campo y otro valor.
@@ -849,6 +883,7 @@ impl ToolEngine {
             concept: field.clone(),
             equals: value.clone(),
         }));
+        crate::trace!("g) strict_structured_hits: filtros OBLIGATORIOS (AND en el mismo documento) = {required_filters:?}");
         let connection = self.database.connect()?;
         let mut sql = String::from(
             "SELECT d.id, d.title, d.path, d.origin, d.ocr_status, d.ocr_confidence, v.location, v.excerpt,
@@ -1164,6 +1199,8 @@ impl ToolEngine {
                 .iter()
                 .any(|needle| normalize_spanish(&title) == *needle);
             let origin_match = phrase_in(&normalized_query, &normalize_spanish(&origin));
+            let origin_says_it_all =
+                origin_match && !query_says_more_than_the_origin(query, &origin);
             let (score, location, excerpt, field) = if title_match {
                 (
                     130.0,
@@ -1173,7 +1210,16 @@ impl ToolEngine {
                 )
             } else if !exact_only && origin_match {
                 (
-                    90.0,
+                    // El nombre de la carpeta sólo puntúa como evidencia
+                    // cuando la pregunta no dice nada más: entonces la
+                    // procedencia ES lo consultado. Si la pregunta añade
+                    // cualquier palabra de contenido, la carpeta pasa por
+                    // debajo de una coincidencia real en el texto (20 + bm25),
+                    // porque compartir carpeta con lo preguntado no dice nada
+                    // de lo que el documento contiene — y una carpeta grande
+                    // arrastraba miles de documentos por delante del que sí
+                    // tenía el contenido pedido.
+                    if origin_says_it_all { 90.0 } else { 15.0 },
                     "metadato: carpeta de origen",
                     origin.clone(),
                     "carpeta de origen",
@@ -1300,7 +1346,14 @@ impl ToolEngine {
             } else if field_match {
                 Some(80.0)
             } else if origin_match {
-                Some(76.0)
+                // Misma razón que en `metadata_hits`: coincidir con el nombre
+                // de la carpeta no es evidencia de contenido en cuanto la
+                // pregunta dice algo más que ese nombre.
+                Some(if query_says_more_than_the_origin(query, &origin) {
+                    15.0
+                } else {
+                    76.0
+                })
             } else {
                 None
             };
@@ -1371,7 +1424,8 @@ impl ToolEngine {
         let mut statement = connection.prepare(
             "SELECT v.evidence_id, c.display_name, v.text_value, v.value_type,
                     v.identifier_canonical, v.location, v.excerpt,
-                    d.path, d.origin, d.ocr_status, d.ocr_confidence
+                    d.path, d.origin, d.ocr_status, d.ocr_confidence,
+                    EXISTS(SELECT 1 FROM entities e WHERE e.evidence_id = v.evidence_id)
              FROM extracted_values v
              JOIN documents d ON d.id = v.document_id
              JOIN concepts c ON c.id = v.concept_id
@@ -1388,6 +1442,7 @@ impl ToolEngine {
             let excerpt: String = row.get(6)?;
             let ocr_status: String = row.get(9)?;
             let confidence: Option<f64> = row.get(10)?;
+            let is_entity: bool = row.get(11)?;
             Ok(DocumentValue {
                 // La posición real la asigna el recorrido, no la consulta.
                 ordinal: 0,
@@ -1395,6 +1450,7 @@ impl ToolEngine {
                 value: text_value.clone(),
                 value_type,
                 identifier_canonical,
+                is_entity,
                 evidence: Evidence {
                     id: evidence_id,
                     document_id,
@@ -1423,6 +1479,246 @@ impl ToolEngine {
                 value
             })
             .collect())
+    }
+
+    /// ¿La pregunta nombra este valor, palabra por palabra?
+    ///
+    /// Mismo criterio que las anclas de `pinned_document`: hace falta un tramo
+    /// de al menos dos palabras consecutivas del valor escrito en la pregunta.
+    /// Una palabra suelta no lo nombra, sólo coincide con él.
+    pub fn value_named_by(question: &str, value: &str) -> bool {
+        let normalized_value = normalize_exact(value);
+        let words = normalized_value.split_whitespace().collect::<Vec<_>>();
+        longest_run_named_by(&normalize_exact(question), &words).is_some()
+    }
+
+    /// Documento único al que apuntan, combinadas, las pistas de la pregunta.
+    ///
+    /// Ninguna pista sale de una lista escrita en el código: son (a) valores
+    /// del propio acervo que la pregunta nombra y que pertenecen a un solo
+    /// campo —el ancla— y (b) el resto de las palabras de contenido de la
+    /// pregunta, comprobadas contra el texto, el nombre y la carpeta de cada
+    /// candidato. Un acervo distinto produce otras anclas sin tocar el motor.
+    ///
+    /// Sólo devuelve un documento cuando gana **solo**: un empate no elige
+    /// —devuelve `None` y la pregunta sigue exactamente el camino de antes—,
+    /// porque quedarse con uno de dos candidatos indistinguibles sería
+    /// adivinar cuál lee.
+    ///
+    /// `context` es la ruta del documento del que ya hablaba la conversación.
+    /// Sin ancla, la única forma de fijar uno es que la pregunta lo vuelva a
+    /// describir entero: **todas** sus palabras de contenido tienen que estar
+    /// en ese documento. Basta una que no esté para que la continuación deje
+    /// de hablar de él y la pregunta vuelva a la búsqueda normal.
+    pub fn pinned_document(&self, query: &str, context: Option<&str>) -> Result<Option<i64>> {
+        // Con una clave escrita en la pregunta no hace falta ninguna de estas
+        // pistas: el identificador ya localiza el documento por sí solo y su
+        // ruta —cerrada y literal— es más precisa que cualquier cruce de
+        // palabras. Esta ruta es justo para cuando esa clave no está.
+        if !canonical_identifier_candidates(query).is_empty()
+            || explicit_identifier_mode(query).is_some()
+        {
+            crate::trace!("f) pinned_document: ABORTA, la pregunta trae clave/identificador escrito");
+            return Ok(None);
+        }
+        let clues = content_terms(query);
+        crate::trace!("f) pinned_document: pistas (content_terms) = {:?}", clues);
+        if clues.is_empty() {
+            crate::trace!("f) pinned_document: ABORTA, sin pistas");
+            return Ok(None);
+        }
+        let inherited = match context {
+            Some(path) => self.document_by_path(path)?.map(|document| document.id),
+            None => None,
+        };
+        let anchored = self.anchored_documents(query)?;
+        crate::trace!(
+            "f) anchored_documents -> {}",
+            match &anchored {
+                None => "None (la pregunta NO anclo nada)".to_string(),
+                Some(set) => format!("{} candidatos", set.len()),
+            }
+        );
+        if let Some(mut candidates) = anchored {
+            // El documento del que ya hablaba la conversación compite como un
+            // candidato más. No gana por estar ahí: gana sólo si cubre más
+            // pistas que cualquier otro, que es justo lo que significa que la
+            // pregunta lo siga describiendo a él.
+            if let Some(document_id) = inherited {
+                candidates.insert(document_id);
+            }
+            let decision = match candidates.len() {
+                0 => Ok(None),
+                1 => Ok(candidates.iter().copied().next()),
+                _ => self.best_covered(&candidates, &clues, inherited),
+            };
+            crate::trace!("f) pinned_document DECIDE: {:?}", decision.as_ref().ok());
+            return decision;
+        }
+        // Sin ancla, la única forma de seguir hablando del mismo documento es
+        // que la pregunta lo vuelva a describir entero. Una sola palabra de
+        // contenido no describe un documento: describe una categoría.
+        if clues.len() < 2 {
+            crate::trace!("f) pinned_document: sin ancla y <2 pistas -> None");
+            return Ok(None);
+        }
+        let Some(document_id) = inherited else {
+            crate::trace!("f) pinned_document: sin ancla y sin documento heredado -> None");
+            return Ok(None);
+        };
+        let covered = self.covered_clues(document_id, &clues)?;
+        crate::trace!(
+            "f) pinned_document: sin ancla, heredado cubre {covered}/{} pistas",
+            clues.len()
+        );
+        Ok((covered == clues.len()).then_some(document_id))
+    }
+
+    /// Documentos que cumplen todas las anclas de la pregunta.
+    ///
+    /// Un ancla es un tramo de la pregunta que nombra, palabra por palabra, a
+    /// un valor ya extraído del acervo —«Roble Grupo» dentro de «Roble Grupo
+    /// (CLI-2020-0056)»— y que en todo el acervo pertenece a **un solo**
+    /// campo. Esa unicidad es lo que la vuelve una condición y no una
+    /// coincidencia: si el mismo texto fuera valor de dos campos distintos, no
+    /// se sabría cuál está nombrando la pregunta y no se ancla nada.
+    ///
+    /// Se exige un tramo de dos palabras como mínimo. Una palabra suelta
+    /// («ventas») aparece dentro de demasiados valores como para señalar a
+    /// ninguno.
+    ///
+    /// `None` significa «la pregunta no ancló nada», que no es lo mismo que
+    /// «ancló y no hay documentos» (conjunto vacío).
+    fn anchored_documents(&self, query: &str) -> Result<Option<HashSet<i64>>> {
+        let normalized_query = normalize_exact(query);
+        if normalized_query.is_empty() {
+            return Ok(None);
+        }
+        let query_words = normalized_query
+            .split_whitespace()
+            .collect::<HashSet<&str>>();
+        let connection = self.database.connect()?;
+        let mut statement =
+            connection.prepare("SELECT document_id, concept_id, text_value FROM extracted_values")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut by_run: HashMap<String, (HashSet<i64>, HashSet<i64>)> = HashMap::new();
+        for row in rows {
+            let (document_id, concept_id, text_value) = row?;
+            let normalized = normalize_exact(&text_value);
+            let words = normalized.split_whitespace().collect::<Vec<_>>();
+            if words.len() < 2 || !words.iter().any(|word| query_words.contains(word)) {
+                continue;
+            }
+            let Some(run) = longest_run_named_by(&normalized_query, &words) else {
+                continue;
+            };
+            let entry = by_run.entry(run).or_default();
+            entry.0.insert(concept_id);
+            entry.1.insert(document_id);
+        }
+        // Las anclas se suman, no se intersecan. Una pregunta puede nombrar de
+        // pasada un valor de otro documento —«una minuta de ventas» es, en
+        // algún archivo, el título literal de otra minuta— y exigir que TODAS
+        // se cumplan a la vez dejaba el conjunto vacío justo cuando una de
+        // ellas sí era la buena. Cumplir varias no se pierde: las palabras de
+        // cada ancla son también pistas, así que el documento que las cumple
+        // todas cubre más que el que sólo cumple una y gana por su cuenta.
+        let mut candidates: Option<HashSet<i64>> = None;
+        for (run, (concepts, documents)) in by_run.into_iter() {
+            if concepts.len() != 1 {
+                crate::trace!(
+                    "f) ancla DESCARTADA por regla `concepts.len() != 1`: tramo {:?} pertenece a {} campos, en {} documentos",
+                    run, concepts.len(), documents.len()
+                );
+                continue;
+            }
+            crate::trace!(
+                "f) ancla ACEPTADA: tramo {:?} (1 campo), aporta {} documentos",
+                run, documents.len()
+            );
+            candidates
+                .get_or_insert_with(HashSet::new)
+                .extend(documents);
+        }
+        // Un ancla que señala a media carpeta no es un ancla: leer cada
+        // candidato para compararlos cuesta, y con tantos la pregunta no está
+        // señalando a ninguno en particular.
+        Ok(candidates.filter(|documents| documents.len() <= MAX_PINNED_CANDIDATES))
+    }
+
+    /// El candidato que cubre más pistas de la pregunta, si hay uno solo que
+    /// las cubra. Un empate no elige por su cuenta: dos documentos que
+    /// responden igual de bien a lo escrito no se distinguen, y quedarse con
+    /// uno sería inventar la diferencia.
+    ///
+    /// La única cosa que desempata es la conversación. Si uno de los
+    /// candidatos empatados es el documento del que ya se estaba hablando, la
+    /// continuación habla de ése: eso es lo que significa «esa minuta» o «la
+    /// minuta de ventas de Tijuana» dicho dos turnos seguidos. No es una
+    /// preferencia por lo reciente —el documento heredado sólo entra en el
+    /// desempate si cubre TANTAS pistas como el mejor—, y sin conversación
+    /// previa no hay nada que desempatar y se devuelve `None`.
+    fn best_covered(
+        &self,
+        candidates: &HashSet<i64>,
+        clues: &[String],
+        inherited: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let mut ordered = candidates.iter().copied().collect::<Vec<_>>();
+        ordered.sort_unstable();
+        let mut best = 0;
+        let mut winners: Vec<i64> = Vec::new();
+        for document_id in ordered {
+            let covered = self.covered_clues(document_id, clues)?;
+            crate::trace!("f) best_covered: doc {document_id} cubre {covered}/{} pistas", clues.len());
+            if covered > best {
+                best = covered;
+                winners.clear();
+            }
+            if covered == best {
+                winners.push(document_id);
+            }
+        }
+        if best == 0 {
+            return Ok(None);
+        }
+        crate::trace!("f) best_covered: mejor={best}, empatados={winners:?}, heredado={inherited:?}");
+        Ok(match winners.as_slice() {
+            [only] => Some(*only),
+            several => inherited.filter(|document_id| several.contains(document_id)),
+        })
+    }
+
+    /// Cuántas de las pistas están escritas en el documento. Se miran las tres
+    /// procedencias que el índice ya tiene por documento —su texto, su nombre
+    /// de archivo y su carpeta—, con la misma comparación por raíz que usa la
+    /// recuperación.
+    fn covered_clues(&self, document_id: i64, clues: &[String]) -> Result<usize> {
+        let connection = self.database.connect()?;
+        let (title, origin): (String, String) = connection.query_row(
+            "SELECT title, origin FROM documents WHERE id = ?1",
+            [document_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut statement =
+            connection.prepare("SELECT content FROM chunks WHERE document_id = ?1")?;
+        let mut words = search_terms(&format!("{title} {origin}"));
+        for content in statement
+            .query_map([document_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        {
+            words.extend(search_terms(&content));
+        }
+        Ok(clues
+            .iter()
+            .filter(|clue| words.iter().any(|word| stems_match(word, clue)))
+            .count())
     }
 
     pub fn origin_summaries(&self) -> Result<Vec<OriginSummary>> {
@@ -1881,6 +2177,7 @@ impl ToolEngine {
                 continue;
             }
             if field_named {
+                crate::trace!("c)   filtro EXPLICITO (la pregunta nombra el campo): {field} = {value}");
                 explicit_values.push(normalize_spanish(&value));
                 explicit.push(ToolFilter {
                     concept: field,
@@ -1910,7 +2207,16 @@ impl ToolEngine {
                 .collect::<HashSet<_>>();
             if distinct_fields.len() == 1 {
                 let (concept, equals) = candidates[0].clone();
+                crate::trace!(
+                    "c)   filtro IMPLICITO (valor {:?} nombrado sin nombrar el campo, unico campo posible): {concept} = {equals}",
+                    implicit_value
+                );
                 explicit.push(ToolFilter { concept, equals });
+            } else {
+                crate::trace!(
+                    "c)   valor implicito {:?} DESCARTADO: {} campos posibles",
+                    implicit_value, distinct_fields.len()
+                );
             }
         }
         explicit.sort_by(|left, right| {
@@ -2017,9 +2323,14 @@ impl ToolEngine {
     ) -> Result<Vec<ToolFilter>> {
         let written = self.written_filters(query)?;
         if !written.is_empty() {
+            crate::trace!("c) resolved_filters: ESCRITOS (campo: valor) -> {:?}", written.filters);
             return Ok(written.filters);
         }
-        self.filters_from_query(query, origin, allow_implicit_values)
+        let inferred = self.filters_from_query(query, origin, allow_implicit_values)?;
+        crate::trace!(
+            "c) resolved_filters: INFERIDOS (allow_implicit_values={allow_implicit_values}, origin={origin:?}) -> {inferred:?}"
+        );
+        Ok(inferred)
     }
 
     pub fn query_documents(
@@ -3264,6 +3575,48 @@ fn content_terms(query: &str) -> Vec<String> {
         "y",
         "busca",
         "buscar",
+        "buscando",
+        "buscamos",
+        "busco",
+        "estoy",
+        "estamos",
+        "estaba",
+        "estuvo",
+        "necesito",
+        "necesitamos",
+        "quiero",
+        "quisiera",
+        "queria",
+        "podrias",
+        "puedes",
+        "puede",
+        "dame",
+        "muestrame",
+        "mostrar",
+        "revisar",
+        "revisando",
+        "reviso",
+        "encontrar",
+        "encuentro",
+        "saber",
+        "sabes",
+        "ayudame",
+        "ayuda",
+        "favor",
+        "gracias",
+        "hola",
+        "era",
+        "eran",
+        "fue",
+        "fueron",
+        "sea",
+        "ser",
+        "estan",
+        "existen",
+        "campo",
+        "campos",
+        "dato",
+        "datos",
         "documentacion",
         "documento",
         "documentos",
@@ -3493,6 +3846,53 @@ fn requests_exact_but_incomplete(query: &str) -> bool {
         .any(|word| matches!(word, "exactamente" | "exactly"));
     requests_exactness && exact_query_tokens(query).is_empty()
 }
+
+/// ¿La pregunta dice algo más que el nombre de la carpeta que coincidió?
+///
+/// El nombre de una carpeta es metadato del índice, no prueba de que el
+/// documento sea el pedido. Cuando la pregunta se agota en ese nombre
+/// («¿qué hay en ventas?») la procedencia ES lo consultado; en cuanto la
+/// pregunta añade cualquier otra palabra de contenido, compartir carpeta con
+/// lo preguntado deja de decir nada sobre lo que el documento contiene.
+fn query_says_more_than_the_origin(query: &str, origin: &str) -> bool {
+    let origin_terms = search_terms(origin);
+    content_terms(query).iter().any(|term| {
+        !origin_terms
+            .iter()
+            .any(|origin_term| stems_match(origin_term, term))
+    })
+}
+
+/// El tramo más largo de palabras consecutivas de un valor que la pregunta
+/// escribe tal cual. Devuelve `None` si no llega a dos palabras: con una sola
+/// no se está nombrando ese valor, se está usando una palabra que además
+/// aparece en él.
+fn longest_run_named_by(normalized_query: &str, words: &[&str]) -> Option<String> {
+    let mut best: Option<String> = None;
+    let mut best_length = 0;
+    for start in 0..words.len() {
+        for end in ((start + 2)..=words.len()).rev() {
+            if end - start <= best_length {
+                break;
+            }
+            let run = words[start..end].join(" ");
+            // Dos palabras, pero dos palabras CON CONTENIDO: «de ventas» no
+            // nombra ningún valor —es una preposición y una palabra que está
+            // en cientos de campos—, y como ancla arrastraba media carpeta.
+            if search_terms(&run).len() >= 2 && whole_phrase_in(normalized_query, &run) {
+                best_length = end - start;
+                best = Some(run);
+                break;
+            }
+        }
+    }
+    best
+}
+
+/// Cuántos candidatos como mucho compara `pinned_document` leyéndolos. Por
+/// encima de este número la pregunta no está señalando a un documento sino a
+/// un conjunto, y la respuesta correcta sigue siendo la lista de siempre.
+const MAX_PINNED_CANDIDATES: usize = 120;
 
 fn phrase_in(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() || needle.len() < 3 {
