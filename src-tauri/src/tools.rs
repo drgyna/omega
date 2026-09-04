@@ -1115,6 +1115,22 @@ impl ToolEngine {
             );
         }
         let mut hits = by_document.into_values().collect::<Vec<_>>();
+        // El AND de los pares obligatorios no encontró ningún documento. Eso
+        // no significa «el acervo no tiene nada»: los pares los construyó esta
+        // misma capa a partir de la pregunta, y dos condiciones genuinas que
+        // en el acervo apuntan a documentos distintos —cada una satisfacible
+        // por su cuenta, pero nunca a la vez— arman una condición imposible
+        // que ningún documento puede cumplir. Devolver aquí un conjunto vacío
+        // pero explícito cerraba la búsqueda entera: ni FTS ni los metadatos
+        // llegaban a intentarse, y la respuesta era una negativa con aspecto
+        // de dato agotado. Se devuelve `None` —«esta ruta no decide»— y la
+        // búsqueda sigue su camino de siempre.
+        if hits.is_empty() {
+            crate::trace!(
+                "g) strict_structured_hits: el AND de los pares obligatorios sale VACIO -> None (no cierra; siguen FTS y metadatos)"
+            );
+            return Ok(None);
+        }
         hits.sort_by(|left, right| {
             right
                 .score
