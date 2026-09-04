@@ -1984,10 +1984,26 @@ impl ToolEngine {
         })
     }
 
-    /// Cuántas de las pistas están escritas en el documento. Se miran las tres
-    /// procedencias que el índice ya tiene por documento —su texto, su nombre
-    /// de archivo y su carpeta—, con la misma comparación por raíz que usa la
-    /// recuperación.
+    /// Cuántas de las pistas están escritas en el documento. Se miran su
+    /// nombre de archivo, su carpeta y **lo que el documento registra como
+    /// dato**: el nombre y el valor de cada campo extraído, con la misma
+    /// comparación por raíz que usa la recuperación.
+    ///
+    /// Deliberadamente NO se mira el texto libre de los fragmentos. Un
+    /// documento de negocio arrastra párrafos de forma —avisos de privacidad,
+    /// descargos, texto de plantilla— que son idénticos en todo el acervo; el
+    /// corpus de notaría, por ejemplo, cierra sus 100 documentos con la misma
+    /// frase «no constituye una escritura, poder, testamento, certificación ni
+    /// asesoría legal real». Contando esas palabras, «escritura», «poder»,
+    /// «testamento» y «certificación» quedaban cubiertas por CUALQUIER
+    /// documento, y la cobertura dejaba de decir si la pregunta describe a
+    /// éste: una escritura cubría al 100% una pregunta sobre una certificación
+    /// y la conversación seguía sobre el documento equivocado, con sello de
+    /// verificada.
+    ///
+    /// El nombre del campo entra junto al valor porque es la mitad que suele
+    /// compartir vocabulario con la pregunta: «¿hasta cuándo tiene vigencia?»
+    /// se reconoce en «Vigencia indicada», no en «2028-03-11».
     fn covered_clues(&self, document_id: i64, clues: &[String]) -> Result<usize> {
         let connection = self.database.connect()?;
         let (title, origin): (String, String) = connection.query_row(
@@ -1995,14 +2011,10 @@ impl ToolEngine {
             [document_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut statement =
-            connection.prepare("SELECT content FROM chunks WHERE document_id = ?1")?;
         let mut words = search_terms(&format!("{title} {origin}"));
-        for content in statement
-            .query_map([document_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        {
-            words.extend(search_terms(&content));
+        for value in self.document_values(document_id)? {
+            words.extend(search_terms(&value.field));
+            words.extend(search_terms(&value.value));
         }
         Ok(clues
             .iter()
