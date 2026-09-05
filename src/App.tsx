@@ -1,4 +1,4 @@
-import { Fragment, FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
 import { Answer, AnswerReading, AnswerScope, AppStatus, ConceptSummary, IndexReport, SourceSummary, ViewName, api, displayError } from "./api";
 
 const EMPTY_STATUS: AppStatus = {
