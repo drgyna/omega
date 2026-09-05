@@ -1810,7 +1810,7 @@ impl ToolEngine {
         let uncovered = self.clues_not_covered(document_id, &clues)?;
         let mut all_uncovered_are_grammar = true;
         for clue in &uncovered {
-            if self.clue_names_something_in_the_corpus(clue)? {
+            if is_universal_scope_word(clue) || self.clue_names_something_in_the_corpus(clue)? {
                 all_uncovered_are_grammar = false;
                 break;
             }
@@ -4321,6 +4321,22 @@ fn predicate_after_verb(query: &str) -> Option<String> {
         .trim_matches(|c: char| !c.is_alphanumeric())
         .to_owned();
     (!predicate.is_empty()).then_some(predicate)
+}
+
+/// «Todo/toda/todos/todas», «corpus», «acervo»: cuantificadores que declaran
+/// alcance universal por su cuenta —la misma familia de palabras que
+/// `Signals::whole_scope` en planner.rs usa para distinguir «todo el acervo»
+/// de «no dijo nada sobre el alcance»—.
+///
+/// Aunque una de estas palabras no nombre ningún campo ni valor del acervo,
+/// NO es gramática inerte para `pinned_document`: perdonarla como si lo
+/// fuera confundía «¿a cuánto asciende el total facturado por todo el
+/// despacho?» —una pregunta que declara su propio alcance sobre el acervo
+/// entero— con una continuación sobre el documento que ya se discutía, y el
+/// fijado secuestraba una suma que debía calcularse sobre las 70 facturas
+/// del acervo, devolviendo el valor de una sola.
+fn is_universal_scope_word(clue: &str) -> bool {
+    matches!(clue, "todo" | "toda" | "todos" | "todas" | "corpus" | "acervo")
 }
 
 /// Conserva sólo términos de contenido. La lista contiene palabras de
