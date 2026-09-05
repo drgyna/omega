@@ -1924,17 +1924,25 @@ impl ToolEngine {
         let mut implicit: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (field, value, value_type) in rows {
             let field_terms = search_terms(&field);
-            let value_terms = search_terms(&value);
-            if value_terms.is_empty() || value_terms.len() > 8 {
-                continue;
-            }
             let field_named = terms_contain_all(&query_terms, &field_terms);
-            let value_named = if value.chars().any(char::is_numeric) {
-                whole_phrase_in(&exact_query, &normalize_exact(&value))
-            } else {
-                terms_contain_all(&query_terms, &value_terms)
+            // Un valor compuesto por un nombre legible y un código de máquina
+            // —entre paréntesis, o al otro lado de un guion largo— no lo
+            // escribe nadie completo en una pregunta: el código es un dato
+            // interno, no algo que una persona recuerde o pronuncie. Se
+            // prueba primero el valor tal cual y, si no encaja, cada
+            // segmento legible por separado (`value_segments`). El filtro
+            // que termina aplicándose siempre usa el valor COMPLETO y real
+            // del acervo —nunca el segmento que hizo coincidir—, así que
+            // esto nunca acorta lo que se cita ni lo que se verifica: sólo
+            // decide qué documento es candidato.
+            let Some(matched_segment) = value_segments(&value)
+                .into_iter()
+                .find(|segment| segment_matches(segment, &query_terms, &exact_query))
+            else {
+                continue;
             };
-            if !value_named {
+            let value_terms = search_terms(&matched_segment);
+            if value_terms.is_empty() || value_terms.len() > 8 {
                 continue;
             }
             // La pregunta usa esa palabra como NOMBRE de campo, no como
@@ -1962,19 +1970,26 @@ impl ToolEngine {
                 });
             } else if allow_implicit_values
                 && (value_terms.len() >= 2 || value_type == "state")
-                && terms_contain_all(&unquoted_terms, &value_terms)
+                && segment_matches(&matched_segment, &unquoted_terms, &exact_query)
             {
+                // Se agrupa por lo que la pregunta realmente dijo —el
+                // segmento coincidente—, no por el valor completo: así dos
+                // valores distintos que comparten el mismo nombre legible
+                // («Ymex Logística», con dos códigos internos distintos)
+                // caen en el mismo grupo y se detectan como ambiguos, en vez
+                // de colarse como dos filtros del mismo campo que ningún
+                // documento podría cumplir a la vez.
                 implicit
-                    .entry(normalize_spanish(&value))
+                    .entry(normalize_spanish(&matched_segment))
                     .or_default()
                     .push((field, value));
             }
         }
 
-        for (implicit_value, candidates) in implicit {
+        for (implicit_segment, candidates) in implicit {
             if explicit_values
                 .iter()
-                .any(|explicit_value| whole_phrase_in(explicit_value, &implicit_value))
+                .any(|explicit_value| whole_phrase_in(explicit_value, &implicit_segment))
             {
                 continue;
             }
@@ -1982,7 +1997,16 @@ impl ToolEngine {
                 .iter()
                 .map(|(field, _)| canonical_key(field))
                 .collect::<HashSet<_>>();
-            if distinct_fields.len() == 1 {
+            let distinct_values = candidates
+                .iter()
+                .map(|(_, value)| normalize_spanish(value))
+                .collect::<HashSet<_>>();
+            // Un mismo nombre legible que corresponde a más de un valor real
+            // del acervo (mismo campo, códigos distintos) no se puede
+            // resolver por sí solo: aplicar cualquiera de los dos sería
+            // adivinar. Se descarta el filtro entero y se deja que el resto
+            // de criterios de la pregunta —o una aclaración— decidan.
+            if distinct_fields.len() == 1 && distinct_values.len() == 1 {
                 let (concept, equals) = candidates[0].clone();
                 explicit.push(ToolFilter { concept, equals });
             }
@@ -3278,6 +3302,82 @@ fn terms_contain_all(haystack: &[String], needles: &[String]) -> bool {
 
 fn prefix_terms_match(left: &str, right: &str) -> bool {
     left.len().min(right.len()) >= 4 && (left.starts_with(right) || right.starts_with(left))
+}
+
+/// Los segmentos legibles de un valor guardado, cuando ese valor combina un
+/// nombre con un código de máquina. Dos formas genéricas, ninguna de un rubro
+/// concreto:
+///   - «Nombre (CÓDIGO)»: el paréntesis se quita, en cualquier posición de la
+///     cadena (no sólo al final), porque un rol puede seguir después:
+///     «Pablo Sandoval Farías (EMP-2024-0039) — Ejecutivo de Ventas».
+///   - «CÓDIGO — Nombre» o «Nombre — CÓDIGO»: un guion largo separa las dos
+///     partes; se prueba el lado que NO tiene forma de código.
+/// El valor completo original siempre es el primer elemento, así que ninguna
+/// coincidencia que ya funcionaba deja de funcionar.
+fn value_segments(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let mut segments = vec![trimmed.to_owned()];
+    let without_parens = remove_parenthetical_spans(trimmed);
+    if without_parens != trimmed && !without_parens.is_empty() {
+        segments.push(without_parens.clone());
+    }
+    for base in [trimmed.to_owned(), without_parens] {
+        if let Some((left, right)) = base.split_once(" — ") {
+            let (left, right) = (left.trim(), right.trim());
+            if looks_like_a_code(left) && !looks_like_a_code(right) && !right.is_empty() {
+                segments.push(right.to_owned());
+            } else if looks_like_a_code(right) && !looks_like_a_code(left) && !left.is_empty() {
+                segments.push(left.to_owned());
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    segments.retain(|segment| !segment.is_empty() && seen.insert(segment.clone()));
+    segments
+}
+
+/// Quita todo lo que esté entre paréntesis, en cualquier posición, y
+/// normaliza los espacios que deja el hueco.
+fn remove_parenthetical_spans(value: &str) -> String {
+    let mut result = String::new();
+    let mut depth = 0i32;
+    for ch in value.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            _ if depth == 0 => result.push(ch),
+            _ => {}
+        }
+    }
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// ¿Esta cadena tiene la forma de un código de máquina? Letras y dígitos
+/// mezclados, sin espacios: «PLT-06», «SKU-00360», «CLI-2020-0056», «EMP-2024-0039».
+/// Un nombre real casi nunca tiene esta forma, así que basta para distinguir
+/// qué lado de un separador es el código y cuál el nombre legible, sin una
+/// lista de prefijos de ningún rubro.
+fn looks_like_a_code(text: &str) -> bool {
+    !text.is_empty()
+        && !text.contains(' ')
+        && text.chars().any(|c| c.is_ascii_digit())
+        && text.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// ¿Coincide este segmento (el valor completo, o uno de sus segmentos
+/// legibles) con la pregunta? Numérico se compara como frase literal
+/// completa; el resto, por conjunto de términos — el mismo criterio que ya
+/// usaba `filters_from_query` para el valor completo, aplicado ahora a
+/// cualquiera de sus segmentos.
+fn segment_matches(segment: &str, terms: &[String], exact_query: &str) -> bool {
+    if segment.chars().any(char::is_numeric) {
+        whole_phrase_in(exact_query, &normalize_exact(segment))
+    } else {
+        let segment_terms = search_terms(segment);
+        !segment_terms.is_empty()
+            && segment_terms.len() <= 8
+            && terms_contain_all(terms, &segment_terms)
+    }
 }
 
 /// Conserva sólo términos de contenido. La lista contiene palabras de
@@ -5052,4 +5152,25 @@ fn concept_named_in(concepts: &[ConceptSummary], text: &str) -> Option<ConceptSu
         }
     }
     best
+}
+
+#[cfg(test)]
+mod temp_diag {
+    use super::*;
+    use crate::db::Database;
+
+    #[test]
+    fn diag_roble_grupo() {
+        let path = "/private/tmp/claude-501/-Users-davidramirez-omega/6a5015e3-c9fe-4bdc-af5e-4576fd2ab2cc/scratchpad/manual50/omega-manual50.sqlite3";
+        let tools = ToolEngine::new(Database::open(path).unwrap());
+        for question in [
+            "Estoy buscando una minuta de ventas relacionada con Roble Grupo y la planta de Tijuana. ¿Cuándo se registró?",
+            "Necesito revisar el contrato con Ymex Logística que se llevó en Veracruz. ¿Cuánto se estimó gastar?",
+            "¿Cuánto se facturó por los rodamientos para Fortaleza de México?",
+        ] {
+            eprintln!("=== {question}");
+            let inferred = tools.filters_from_query(question, None, true).unwrap();
+            eprintln!("filters_from_query = {:?}", inferred);
+        }
+    }
 }

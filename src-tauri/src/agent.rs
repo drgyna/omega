@@ -252,17 +252,22 @@ impl Agent {
             // El resto de las rutas de recuperación —búsqueda literal, texto
             // libre— no llevan filtros en el plan porque no los aplican al
             // buscar. El conjunto que el usuario cree tener delante, en
-            // cambio, sí está acotado por lo que él escribió: «¿qué documentos
-            // hay en la carpeta ventas con Moneda: EUR?». Recordar esos pares
-            // —sólo los que escribió con «Campo: valor», nunca uno inferido—
-            // es lo que permite que el turno siguiente («de esos, ¿cuántos
-            // …?») herede ese conjunto en vez de empezar del acervo entero.
-            _ => (
-                self.tools.written_filters(question)?.filters,
-                plan.origin.clone(),
-                None,
-                None,
-            ),
+            // cambio, sí está acotado por lo que él escribió o nombró: «¿qué
+            // documentos hay en la carpeta ventas con Moneda: EUR?» escribe
+            // el par; «una minuta relacionada con Roble Grupo» sólo lo
+            // nombra en prosa, y `resolved_filters` es la misma inferencia
+            // que ya usó `free_text_answer` para encontrar el documento. Sin
+            // esto, un turno de texto libre que sí acertó no dejaba nada que
+            // el siguiente («de esos, ¿quién…?») pudiera heredar.
+            _ => {
+                let written = self.tools.written_filters(question)?.filters;
+                let filters = if written.is_empty() {
+                    self.tools.resolved_filters(question, plan.origin.as_deref(), true)?
+                } else {
+                    written
+                };
+                (filters, plan.origin.clone(), None, None)
+            }
         };
         state.concept = concept;
         state.group_by = group_by;
@@ -903,20 +908,151 @@ impl Agent {
                     plan.origin.as_deref(),
                     sample_limit,
                 )?;
+                // «Estoy buscando X, ¿[campo]?» llega aquí por el verbo
+                // "buscando"/"revisando" —que también dispara un listado—,
+                // pero no pide un conteo ni una lista: pide el valor de un
+                // campo concreto del documento que esos criterios ya
+                // identifican. Con un alcance pequeño y completo (no
+                // recortado) y una interrogación de campo propia, se intenta
+                // primero la síntesis directa; si no aplica, sigue el
+                // listado de siempre — cero cambio de comportamiento para
+                // una pregunta que sí es un conteo o una lista.
+                if result.document_count > 0
+                    && result.document_count as usize <= sample_limit
+                    && asks_for_a_specific_value(question)
+                {
+                    let documents = self.tools.documents_matching(
+                        &plan.filters,
+                        plan.origin.as_deref(),
+                        None,
+                    )?;
+                    let hits = self.hits_for_documents(&documents)?;
+                    if let Some(synthesis) = answer::synthesize(&self.tools, question, &hits)? {
+                        let mut answer = Answer::verified(synthesis.text, synthesis.citations);
+                        answer.verified &= synthesis.verified;
+                        apply_legal_guidance_note(question, &mut answer);
+                        return Ok((answer, synthesis.subject));
+                    }
+                }
                 Ok((
                     document_answer(result, &plan.filters, plan.origin.as_deref()),
                     None,
                 ))
             }
-            QueryIntent::FreeText => {
-                let result =
-                    self.tools
-                        .search_text(question, plan.origin.as_deref(), MAX_TEXT_CITATIONS)?;
-                Ok((text_answer(question, result), None))
-            }
+            QueryIntent::FreeText => self.free_text_answer(question, plan.origin.as_deref()),
             QueryIntent::BoundedSearch => self.legacy_answer(question, 20),
             QueryIntent::LegacySearch => self.legacy_answer(question, usize::MAX),
         }
+    }
+
+    /// Texto libre: la pregunta no llegó por ninguna de las rutas
+    /// estructuradas (conteo, agregación, listado con filtro escrito), pero
+    /// puede seguir nombrando una entidad concreta en prosa —"Roble Grupo",
+    /// "Tijuana"— que el índice sí reconoce. Se intenta primero acotar por
+    /// esos criterios, igual que ya hace `CountDocuments`/`ListDocuments`
+    /// con filtros escritos; sólo cuando ninguno resuelve se cae al texto
+    /// libre por contenido, como esta ruta siempre hizo.
+    fn free_text_answer(
+        &self,
+        question: &str,
+        origin: Option<&str>,
+    ) -> Result<(Answer, Option<String>)> {
+        let filters = self.tools.resolved_filters(question, origin, true)?;
+        if !filters.is_empty() {
+            let documents = self.tools.documents_matching(&filters, origin, None)?;
+            if !documents.is_empty() {
+                let hits = self.hits_for_documents(&documents)?;
+                let (mut answer, subject) =
+                    self.answer_from_hits(question, hits, MAX_TEXT_CITATIONS)?;
+                answer.scope = Some(AnswerScope {
+                    filters: filters.clone(),
+                    origin: origin.map(str::to_owned),
+                    document_count: Some(documents.len() as i64),
+                    ..AnswerScope::default()
+                });
+                apply_legal_guidance_note(question, &mut answer);
+                return Ok((answer, subject));
+            }
+            // Ningún documento cumple TODOS los criterios a la vez. Si cada
+            // uno existe por separado en el acervo, es una incompatibilidad
+            // real —no una ausencia total— y se explica en vez de dejar que
+            // el texto libre los mezcle en una respuesta que parece
+            // verificada sin serlo.
+            if filters.len() > 1 {
+                let mut alternatives = Vec::new();
+                let mut all_exist_separately = true;
+                for filter in &filters {
+                    let count = self
+                        .tools
+                        .documents_matching(std::slice::from_ref(filter), origin, None)?
+                        .len();
+                    all_exist_separately &= count > 0;
+                    alternatives.push(format!(
+                        "{}: {} — {} {}",
+                        filter.concept,
+                        filter.equals,
+                        count,
+                        if count == 1 { "documento" } else { "documentos" }
+                    ));
+                }
+                if all_exist_separately {
+                    return Ok((
+                        clarify(Clarification {
+                            question: "Los criterios existen en el índice, pero no juntos en un mismo documento. No los combinaré como una respuesta verificada. ¿Qué criterio quieres conservar?".into(),
+                            options: alternatives,
+                            reason: "criterios_incompatibles".into(),
+                        }),
+                        None,
+                    ));
+                }
+            }
+        }
+        // Sin filtros que acoten un documento —o ninguno coincidió con
+        // nada—: texto libre por contenido (FTS). Se intenta la síntesis de
+        // campo sobre esos resultados —antes esta ruta nunca lo hacía—; si
+        // no aplica, un extracto legible del acervo es más útil que un
+        // recuento vacío de "N resultados".
+        let result = self.tools.search_text(question, origin, MAX_TEXT_CITATIONS)?;
+        if result.hits.is_empty() {
+            return Ok((no_evidence_answer(), None));
+        }
+        let (mut answer, subject) =
+            if let Some(synthesis) = answer::synthesize(&self.tools, question, &result.hits)? {
+                let mut answer = Answer::verified(synthesis.text, synthesis.citations);
+                answer.verified &= synthesis.verified;
+                (answer, synthesis.subject)
+            } else {
+                (text_excerpt_answer(result), None)
+            };
+        apply_legal_guidance_note(question, &mut answer);
+        Ok((answer, subject))
+    }
+
+    /// Los valores conocidos de un grupo de documentos, como evidencia lista
+    /// para `answer::synthesize`: la misma forma que produce una búsqueda de
+    /// texto libre, pero acotada al conjunto que ya se sabe coherente.
+    fn hits_for_documents(&self, documents: &[tools::DocumentRef]) -> Result<Vec<SearchHit>> {
+        let mut hits = Vec::new();
+        for document in documents {
+            let title = if document.title.is_empty() {
+                document
+                    .path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(&document.path)
+                    .to_owned()
+            } else {
+                document.title.clone()
+            };
+            for value in self.tools.document_values(document.id)? {
+                hits.push(SearchHit {
+                    title: title.clone(),
+                    score: 100.0,
+                    evidence: value.evidence,
+                });
+            }
+        }
+        Ok(hits)
     }
 
     fn legacy_answer(&self, question: &str, limit: usize) -> Result<(Answer, Option<String>)> {
@@ -924,7 +1060,21 @@ impl Agent {
         // completa de una recortada. Sin esa señal, un listado que llega justo
         // al tope se presenta igual que uno que agotó el acervo, y las cifras
         // que aparecen en su texto ("20 valores") se leen como un total.
-        let mut hits = self.tools.search(question, &[], limit.saturating_add(1))?;
+        let hits = self.tools.search(question, &[], limit.saturating_add(1))?;
+        self.answer_from_hits(question, hits, limit)
+    }
+
+    /// Redacta una respuesta a partir de un conjunto de evidencia ya
+    /// reunido, sin importar de dónde vino —búsqueda genérica, texto libre
+    /// acotado por criterios coherentes—. Intenta primero una síntesis de
+    /// campo precisa; si no aplica, cae a un listado de la evidencia
+    /// encontrada.
+    fn answer_from_hits(
+        &self,
+        question: &str,
+        mut hits: Vec<SearchHit>,
+        limit: usize,
+    ) -> Result<(Answer, Option<String>)> {
         let truncated = hits.len() > limit;
         hits.truncate(limit);
         if hits.is_empty() {
@@ -1243,10 +1393,33 @@ fn aggregate_answer(
     }
 }
 
-fn text_answer(question: &str, result: TextQueryResult) -> Answer {
-    if result.hits.is_empty() {
-        return no_evidence_answer();
-    }
+/// ¿La pregunta pide el valor de un campo concreto, y no un conteo o un
+/// listado de documentos? «Cuándo», «quién», «cómo» siempre lo son. «Qué» y
+/// «cuál» lo son salvo cuando preguntan directamente por los documentos
+/// mismos («qué documentos hay», «cuáles archivos») — ahí la pregunta sigue
+/// siendo un listado.
+fn asks_for_a_specific_value(question: &str) -> bool {
+    const CONTAINER_ROOTS: &[&str] = &[
+        "document", "archiv", "expedient", "registr", "caso", "carpet", "file",
+    ];
+    let words = normalize_exact(question)
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let is_container = |word: &str| CONTAINER_ROOTS.iter().any(|root| word.starts_with(root));
+    words.iter().enumerate().any(|(index, word)| match word.as_str() {
+        "cuando" | "quien" | "quienes" | "como" => true,
+        "que" | "cual" | "cuales" | "cuanto" | "cuanta" | "cuantos" | "cuantas" => {
+            !words.get(index + 1).is_some_and(|next| is_container(next))
+        }
+        _ => false,
+    })
+}
+
+/// Respuesta de texto libre sin síntesis de campo: extractos legibles del
+/// acervo. Más honesto que un recuento vacío de "N resultados" cuando la
+/// síntesis no encuentra un campo concreto que extraer.
+fn text_excerpt_answer(result: TextQueryResult) -> Answer {
     let excerpts = result
         .hits
         .iter()
@@ -1254,29 +1427,32 @@ fn text_answer(question: &str, result: TextQueryResult) -> Answer {
         .map(|hit| format!("- {}", hit.evidence.excerpt.trim()))
         .collect::<Vec<_>>()
         .join("\n");
-    let legal = asks_for_legal_guidance(question);
-    let mut answer = Answer::verified(
+    Answer::verified(
         format!(
-            "Encontré evidencia pertinente en {} documentos. Extractos del acervo:\n\n{}{}",
-            result.document_count,
-            excerpts,
-            if legal {
-                "\n\nEsta respuesta se limita al material indexado y no sustituye asesoría legal ni una fuente oficial."
-            } else {
-                ""
-            }
+            "Encontré evidencia pertinente en {} documentos. Extractos del acervo:\n\n{excerpts}",
+            result.document_count
         ),
         result.hits.into_iter().map(|hit| hit.evidence).collect(),
-    );
-    if legal {
-        const LEGAL: &str = "Contenido extractivo del acervo local; no constituye asesoría legal.";
-        // La nota legal se suma a la advertencia de OCR, no la reemplaza.
-        answer.warning = Some(match answer.warning {
-            Some(ocr) => format!("{ocr} {LEGAL}"),
-            None => LEGAL.to_owned(),
-        });
+    )
+}
+
+/// El motor sólo cita lo que el acervo dice; nunca sustituye una fuente
+/// oficial ni asesoría profesional, así que una pregunta legal lleva una nota
+/// adicional, sumada a la advertencia de OCR si ya había una.
+fn apply_legal_guidance_note(question: &str, answer: &mut Answer) {
+    if !asks_for_legal_guidance(question) {
+        return;
     }
-    answer
+    const LEGAL: &str = "Contenido extractivo del acervo local; no constituye asesoría legal.";
+    answer.warning = Some(match answer.warning.take() {
+        Some(ocr) => format!("{ocr} {LEGAL}"),
+        None => LEGAL.to_owned(),
+    });
+    if !answer.text.contains("no sustituye asesoría legal") {
+        answer.text.push_str(
+            "\n\nEsta respuesta se limita al material indexado y no sustituye asesoría legal ni una fuente oficial.",
+        );
+    }
 }
 
 /// Un listado que llega justo al tope interno no puede presentarse como si

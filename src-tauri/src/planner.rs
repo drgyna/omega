@@ -1491,6 +1491,53 @@ fn duplicate_relationship_kind(question: &str) -> Option<DuplicateComparisonKind
     None
 }
 
+/// ¿La pregunta pide la relación misma, como su objeto? Frases fijas y
+/// estrechas, igual que `duplicate_relationship_kind`: la relación tiene que
+/// ser lo preguntado —"qué relación", "cómo se relaciona"—, no una cláusula
+/// descriptiva que sólo ayuda a ubicar un documento («una minuta relacionada
+/// con X, ¿cuándo se registró?» no pregunta por ninguna relación).
+fn asks_for_the_relation_itself(question: &str) -> bool {
+    let normalized = normalize_exact(question);
+    const PHRASES: &[&str] = &[
+        "que relacion",
+        "cual es la relacion",
+        "cual es su relacion",
+        "como se relaciona",
+        "como estan relacionados",
+        "como estan relacionadas",
+        "que vinculo",
+        "cual es el vinculo",
+        "cual es su vinculo",
+        "como se vincula",
+        "que conexion",
+        "cual es la conexion",
+    ];
+    PHRASES.iter().any(|phrase| normalized.contains(phrase))
+}
+
+/// ¿Pide enumerar los documentos definidos por su relación con algo —«qué
+/// documentos están relacionados con X», «cuáles archivos se vinculan a
+/// Y»—? Aquí el sujeto de la pregunta es el propio conjunto de documentos, a
+/// diferencia de una cláusula descriptiva que sólo ubica UN documento
+/// mientras la pregunta real es otra («una minuta relacionada con X,
+/// ¿cuándo se registró?»). La señal es estructural: un interrogativo
+/// («qué», «cuáles») seguido inmediatamente de una palabra de contenedor.
+fn asks_which_documents_are_related(question: &str, marks: &Signals) -> bool {
+    if !marks.related {
+        return false;
+    }
+    let words = normalize_exact(question)
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    words.iter().enumerate().any(|(index, word)| {
+        matches!(word.as_str(), "que" | "cual" | "cuales")
+            && words.get(index + 1).is_some_and(|next| {
+                CONTAINER_WORDS.iter().any(|root| next.starts_with(root))
+            })
+    })
+}
+
 fn plan_inner(
     tools: &ToolEngine,
     question: &str,
@@ -1773,7 +1820,16 @@ fn plan_inner(
     // Pedir el expediente o las relaciones de algo que no produce clave estable
     // no puede resolverse con una búsqueda de texto presentada como verificada:
     // la pregunta era por un vínculo, y ese vínculo no existe.
-    if (marks.related || (marks.summary && marks.container))
+    //
+    // `marks.related` por sí sola es demasiado ancha: «una minuta relacionada
+    // con Roble Grupo» usa "relacionada" como cláusula descriptiva para
+    // ubicar el documento, no como la pregunta. La relación tiene que ser el
+    // OBJETO de la pregunta —"qué relación", "cómo se relaciona"— para que
+    // esta ruta se dispare; si no, una pregunta con su propio dato concreto
+    // (fecha, monto, responsable) se rendía antes de buscar nada.
+    if (asks_for_the_relation_itself(question)
+        || asks_which_documents_are_related(question, &marks)
+        || (marks.summary && marks.container))
         && marks.container
         && relations::identifier_candidates(tools, question)?.is_empty()
     {
@@ -1910,7 +1966,17 @@ fn plan_inner(
         return Ok(StructuredPlan::retrieval());
     }
 
-    if reference == Reference::Explicit && !state.has_context() {
+    // Un deíctico es una señal de continuidad posible, no una orden ciega:
+    // si el turno ya trae su propio criterio resoluble —un valor, un
+    // identificador, una carpeta— la pregunta se explica sola y no hace
+    // falta contexto previo. Sólo se rehúsa cuando, además de la referencia,
+    // no hay nada propio con qué buscar.
+    if reference == Reference::Explicit
+        && !state.has_context()
+        && tools.resolved_filters(question, None, true)?.is_empty()
+        && tools.match_origin(question)?.is_none()
+        && relations::identifier_candidates(tools, question)?.is_empty()
+    {
         return Ok(StructuredPlan::clarify(
             "referencia_sin_contexto",
             "No sé a qué te refieres: esta conversación aún no tiene un resultado anterior. ¿Puedes decirme qué documentos o qué campo quieres?",
@@ -2200,8 +2266,14 @@ fn plan_inner(
 
     let Some(operation) = operation else {
         // Referencia explícita sin operación reconocible: puede ser un filtro
-        // sobre el conjunto anterior («de esos, ¿cuáles son de X?»).
-        if reference == Reference::Explicit && !scope.filters.is_empty() {
+        // sobre el conjunto anterior («de esos, ¿cuáles son de X?»). Eso sólo
+        // tiene sentido cuando había algo anterior que filtrar
+        // (`state.set`); si no lo había, el deíctico no heredó nada y
+        // `scope.filters` viene enteramente de lo que la propia pregunta
+        // nombra («ese contrato de Ymex Logística» en un turno nuevo) — ahí
+        // la pregunta pide un dato, no un conteo, y la retoma la ruta de
+        // recuperación normal.
+        if reference == Reference::Explicit && !scope.filters.is_empty() && state.set.is_some() {
             // Filtrar el conjunto anterior devuelve documentos, no una cifra
             // sobre el campo que se estuviera calculando antes.
             scope.concept = None;
