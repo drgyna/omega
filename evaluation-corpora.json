@@ -2,17 +2,6 @@
   "version": 1,
   "seed": 5600,
   "corpora": [
-    { "id": "yates", "path": "corpus-prueba-agencia-yates", "enabled": true },
-    { "id": "notaria", "path": "corpus-prueba-notaria", "enabled": true },
-    { "id": "despacho-legal", "path": "corpus-prueba-despacho-legal", "enabled": true },
-    { "id": "ferreteria", "path": "corpus-prueba-ferreteria", "enabled": true },
-    { "id": "seguros", "path": "corpus-prueba-seguros", "enabled": true },
-    { "id": "restaurante", "path": "corpus-prueba-restaurante", "enabled": true },
-    {
-      "id": "formatos-extremos",
-      "path": "corpus-prueba-formatos-extremos",
-      "fixture": "evaluation-formatos-extremos.json",
-      "enabled": true
-    }
+    { "id": "despacho-legal", "path": "corpus-prueba-despacho-legal", "enabled": true }
   ]
 }
