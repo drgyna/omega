@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Omega
 
 Omega es una aplicación de escritorio local para conversar con los documentos de un negocio,
