@@ -14,7 +14,6 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-anyhow = "1"
 calamine = "0.30"
 csv = "1"
 libc = "0.2"
