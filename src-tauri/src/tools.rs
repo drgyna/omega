@@ -100,6 +100,30 @@ const QUESTION_WORDS: &[&str] = &[
 /// anterior deja de alcanzar al campo que venga después.
 const CONDITION_MARKERS: &[&str] = &["cuya", "cuyas", "cuyo", "cuyos", "donde"];
 
+/// Verbos con los que el español introduce el predicado de una frase: los
+/// atributivos («los poderes SON revocables») y el posesivo («los contratos
+/// TIENEN cláusula»). Son las dos maneras en que una pregunta afirma una
+/// condición sobre el sujeto, y ambas son clase cerrada de la gramática —ser,
+/// estar, tener— igual que las cópulas de `PAIR_JOINERS`. Lo que sigue al
+/// verbo es el criterio, diga lo que diga; aquí no hay ni una palabra de
+/// ningún rubro de negocio.
+///
+/// Olvidar una forma sólo hace que no se detecte el predicado, nunca que se
+/// detecte uno que no está: el error posible es callar, no inventar.
+const PREDICATE_VERBS: &[&str] = &[
+    "era", "eran", "es", "esta", "estaba", "estaban", "estan", "este", "esten", "estuvieron",
+    "estuvo", "fue", "fueron", "sea", "sean", "sera", "seran", "son", "tenga", "tengan", "tenia",
+    "tenian", "tiene", "tienen", "tuvieron", "tuvo",
+];
+
+/// Partículas de negación y privación del español. Cuando una de ellas
+/// precede al campo que la pregunta nombra, la pregunta afirma lo contrario
+/// de lo que dice el nombre, y suponerle el valor afirmativo sería el error
+/// inverso al que este punto corrige.
+const NEGATION_WORDS: &[&str] = &[
+    "carece", "carecen", "carecia", "carecian", "ni", "no", "sin", "tampoco",
+];
+
 impl QuestionFieldRoles {
     pub fn new(query: &str) -> Self {
         Self {
@@ -2452,6 +2476,24 @@ impl ToolEngine {
         origin: Option<&str>,
         allow_implicit_values: bool,
     ) -> Result<Vec<ToolFilter>> {
+        Ok(self
+            .filters_and_unapplied_criteria(query, origin, allow_implicit_values)?
+            .filters)
+    }
+
+    /// Lo mismo que `filters_from_query`, declarando además qué criterio de la
+    /// pregunta se quedó sin filtro.
+    ///
+    /// Un campo se descarta hoy en cuanto su VALOR no aparece en la pregunta,
+    /// sin mirar si el CAMPO sí estaba escrito. Cuando lo estaba, lo que queda
+    /// no es «la pregunta no puso condiciones» sino «se perdió una», y quien
+    /// conteste tiene que poder distinguirlas.
+    pub fn filters_and_unapplied_criteria(
+        &self,
+        query: &str,
+        origin: Option<&str>,
+        allow_implicit_values: bool,
+    ) -> Result<ResolvedFilters> {
         let query_terms = search_terms(query);
         let exact_query = normalize_exact(query);
         let field_name_tokens = written_field_name_tokens(query);
@@ -2488,10 +2530,37 @@ impl ToolEngine {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
+        // El dominio de cada campo DENTRO DE ESTE MISMO ALCANCE, medido sobre
+        // las filas que la consulta de arriba acaba de traer: qué valores
+        // distintos registra el acervo para él. Se toma antes del recorrido
+        // porque ése descarta filas por su valor y dejaría el dominio
+        // incompleto. Es la única fuente admisible para decir de qué tipo es
+        // un campo: contar sus valores reales, nunca leer su nombre.
+        let mut domain: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (field, value, _) in &rows {
+            let values = domain.entry(canonical_key(field)).or_default();
+            let normalized = normalize_exact(value);
+            if !values.iter().any(|known| normalize_exact(known) == normalized) {
+                values.push(value.clone());
+            }
+        }
+
+        // Lo que la pregunta AFIRMA del sujeto. Un criterio vive ahí: «los
+        // contratos TIENEN cláusula…». Lo que va antes del verbo es el sujeto
+        // —aquello que se cuenta—, y confundirlo con una condición hace decir
+        // que se perdió un criterio que nadie puso: en «¿cuántos poderes son
+        // revocables?», «poderes» alcanza por prefijo al campo «Poderdante»
+        // sin que la pregunta lo haya nombrado nunca.
+        let predicate = predicate_after_verb(query);
+        let predicate_terms = predicate.as_deref().map(search_terms);
         let roles = QuestionFieldRoles::new(query);
         let mut explicit = Vec::new();
         let mut explicit_values = Vec::new();
         let mut implicit: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        // Campos que la pregunta escribe enteros sin escribir ninguno de sus
+        // valores. Se anotan aquí, antes del descarte por valor, porque es ahí
+        // donde hoy desaparecen sin dejar rastro.
+        let mut named_without_value: BTreeMap<String, String> = BTreeMap::new();
         for (field, value, value_type) in rows {
             let field_terms = search_terms(&field);
             let value_terms = search_terms(&value);
@@ -2505,6 +2574,15 @@ impl ToolEngine {
                 terms_contain_all(&query_terms, &value_terms)
             };
             if !value_named {
+                // Sin verbo no hay dónde cortar la frase y se mira entera;
+                // con él, sólo cuenta el campo nombrado en el predicado.
+                let inside_predicate = match &predicate_terms {
+                    Some(terms) => terms_contain_all(terms, &field_terms),
+                    None => true,
+                };
+                if field_named && inside_predicate {
+                    named_without_value.insert(canonical_key(&field), field.clone());
+                }
                 continue;
             }
             // La pregunta usa esa palabra como NOMBRE de campo, no como
@@ -2592,7 +2670,79 @@ impl ToolEngine {
         let explicit = drop_values_that_name_a_filtered_field(explicit);
         let explicit = collapse_spelling_variants(explicit, &self.list_concepts(None)?);
         let explicit = self.drop_values_that_the_acervo_reads_as_a_field(explicit)?;
-        Ok(prefer_literal_values(explicit, &exact_query))
+        let mut filters = prefer_literal_values(explicit, &exact_query);
+
+        // Un campo que sí acabó en un filtro —por otro de sus valores, o por
+        // la ruta implícita— no es ningún criterio perdido.
+        for filter in &filters {
+            named_without_value.remove(&canonical_key(&filter.concept));
+        }
+
+        let mut unapplied_criteria = Vec::new();
+        for (key, field) in named_without_value {
+            let values = domain.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+            match affirmative_of_closed_yes_no(values) {
+                // El dominio medido del campo es el par cerrado sí/no: la
+                // pregunta que lo nombra sin decir cuál de los dos quiere sólo
+                // puede estar pidiendo el afirmativo.
+                Some(affirmative) if allow_implicit_values && !question_negates(query, &field) => {
+                    crate::trace!(
+                        "c)   filtro BINARIO INFERIDO (campo {field} nombrado sin valor; dominio medido = {values:?}): {field} = {affirmative}"
+                    );
+                    filters.push(ToolFilter {
+                        concept: field,
+                        equals: affirmative,
+                    });
+                }
+                _ => {
+                    crate::trace!(
+                        "c)   criterio NO APLICADO (campo {field} nombrado sin valor; dominio medido = {values:?})"
+                    );
+                    unapplied_criteria.push(field);
+                }
+            }
+        }
+        filters.sort_by(|left, right| {
+            canonical_key(&left.concept)
+                .cmp(&canonical_key(&right.concept))
+                .then_with(|| {
+                    normalize_spanish(&left.equals).cmp(&normalize_spanish(&right.equals))
+                })
+        });
+
+        // Segunda forma del mismo defecto: la pregunta afirma algo del sujeto
+        // —«los poderes SON revocables»— y ni una sola palabra de eso que
+        // afirma llegó a ningún filtro ni al alcance. Ahí no hay campo que
+        // nombrar porque el acervo no registra nada parecido, pero el criterio
+        // se perdió igual.
+        if unapplied_criteria.is_empty() {
+            if let (Some(predicate), Some(predicate_terms)) = (predicate, predicate_terms) {
+                let mut known = Vec::new();
+                for filter in &filters {
+                    known.extend(search_terms(&filter.concept));
+                    known.extend(search_terms(&filter.equals));
+                }
+                if let Some(origin) = origin {
+                    known.extend(search_terms(origin));
+                }
+                let covered = predicate_terms.iter().any(|term| {
+                    known
+                        .iter()
+                        .any(|known| stems_match(known, term) || prefix_terms_match(known, term))
+                });
+                if !predicate_terms.is_empty() && !covered {
+                    crate::trace!(
+                        "c)   criterio NO APLICADO (predicado {predicate:?}: ninguna de sus palabras llego a un filtro ni al alcance)"
+                    );
+                    unapplied_criteria.push(predicate);
+                }
+            }
+        }
+
+        Ok(ResolvedFilters {
+            filters,
+            unapplied_criteria,
+        })
     }
 
     /// Descarta el filtro **inferido** cuyo valor es, para el propio acervo,
@@ -2680,16 +2830,68 @@ impl ToolEngine {
         origin: Option<&str>,
         allow_implicit_values: bool,
     ) -> Result<Vec<ToolFilter>> {
+        Ok(self
+            .resolved_filters_and_gaps(query, origin, allow_implicit_values)?
+            .filters)
+    }
+
+    /// Lo mismo que `resolved_filters`, conservando el criterio que se quedó
+    /// sin filtro.
+    ///
+    /// Los pares «Campo: valor» escritos por el usuario no dejan hueco alguno:
+    /// ahí el usuario dijo campo y valor, y `written_filters` ya declara por su
+    /// cuenta lo que no supo resolver.
+    pub fn resolved_filters_and_gaps(
+        &self,
+        query: &str,
+        origin: Option<&str>,
+        allow_implicit_values: bool,
+    ) -> Result<ResolvedFilters> {
         let written = self.written_filters(query)?;
         if !written.is_empty() {
             crate::trace!("c) resolved_filters: ESCRITOS (campo: valor) -> {:?}", written.filters);
-            return Ok(written.filters);
+            return Ok(ResolvedFilters {
+                filters: written.filters,
+                unapplied_criteria: Vec::new(),
+            });
         }
-        let inferred = self.filters_from_query(query, origin, allow_implicit_values)?;
+        let inferred = self.filters_and_unapplied_criteria(query, origin, allow_implicit_values)?;
         crate::trace!(
-            "c) resolved_filters: INFERIDOS (allow_implicit_values={allow_implicit_values}, origin={origin:?}) -> {inferred:?}"
+            "c) resolved_filters: INFERIDOS (allow_implicit_values={allow_implicit_values}, origin={origin:?}) -> {:?}; criterios sin aplicar -> {:?}",
+            inferred.filters, inferred.unapplied_criteria
         );
         Ok(inferred)
+    }
+
+    /// ¿Este documento concreto cumple los filtros del plan?
+    ///
+    /// Pregunta lo mismo que `query_documents`, con el mismo `append_filters`
+    /// y contra la misma tabla, pero acotado a un solo documento. Reusar el
+    /// predicado —en vez de recomparar los valores en Rust— es lo que
+    /// garantiza que «el documento cumple los filtros» signifique exactamente
+    /// «el documento saldría en el conjunto filtrado»: mismas claves
+    /// canónicas, misma distinción numérico/literal, sin una segunda
+    /// normalización que pueda divergir de la primera.
+    ///
+    /// Sin filtros no hay nada que comprobar y la respuesta es que sí.
+    pub fn document_matches_filters(
+        &self,
+        document_id: i64,
+        filters: &[ToolFilter],
+    ) -> Result<bool> {
+        if filters.is_empty() {
+            return Ok(true);
+        }
+        let connection = self.database.connect()?;
+        let mut sql = String::from("SELECT COUNT(*) FROM documents d WHERE d.id = ?");
+        let mut parameters: Vec<Box<dyn ToSql>> = vec![Box::new(document_id)];
+        append_filters(&mut sql, &mut parameters, filters);
+        let matches: i64 = connection.query_row(
+            &sql,
+            params_from_iter(parameters.iter().map(|value| value.as_ref())),
+            |row| row.get(0),
+        )?;
+        Ok(matches > 0)
     }
 
     pub fn query_documents(
@@ -3874,6 +4076,82 @@ fn terms_contain_all(haystack: &[String], needles: &[String]) -> bool {
 
 fn prefix_terms_match(left: &str, right: &str) -> bool {
     left.len().min(right.len()) >= 4 && (left.starts_with(right) || right.starts_with(left))
+}
+
+/// El valor afirmativo de un campo **si** su dominio medido es exactamente el
+/// par cerrado «sí»/«no».
+///
+/// Dos condiciones, y las dos se comprueban sobre los valores que el índice
+/// tiene, nunca sobre el nombre del campo: que sean dos, y que sean esos dos.
+/// «sí» y «no» son la única partícula binaria del español —no una lista de
+/// negocio—, así que un campo cuyo dominio es ese par no admite más lectura
+/// que la afirmativa cuando la pregunta lo nombra a secas.
+///
+/// Cualquier otro par de dos valores devuelve `None`: un campo categórico con
+/// dos opciones («Presencial»/«Remoto») no dice cuál quiere quien lo nombra, y
+/// suponer una sería inventarse el filtro.
+fn affirmative_of_closed_yes_no(values: &[String]) -> Option<String> {
+    if values.len() != 2 {
+        return None;
+    }
+    let mut affirmative = None;
+    let mut negative = false;
+    for value in values {
+        match normalize_exact(value).as_str() {
+            "si" => affirmative = Some(value.clone()),
+            "no" => negative = true,
+            _ => return None,
+        }
+    }
+    affirmative.filter(|_| negative)
+}
+
+/// ¿La pregunta niega el campo que nombra?
+///
+/// Se mira lo escrito ANTES del campo: ahí es donde el español pone la
+/// negación y los verbos de privación («no tienen X», «carecen de X»). Si el
+/// campo no aparece escrito con esas mismas palabras, se mira la pregunta
+/// entera; equivocarse hacia el lado de no suponer nada es el error barato.
+fn question_negates(query: &str, field: &str) -> bool {
+    let words = normalize_exact(query)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let needle = normalize_exact(field)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let start = (!needle.is_empty() && needle.len() <= words.len())
+        .then(|| {
+            (0..=words.len() - needle.len())
+                .find(|&start| words[start..start + needle.len()] == needle[..])
+        })
+        .flatten();
+    let before = match start {
+        Some(start) => &words[..start],
+        None => &words[..],
+    };
+    before
+        .iter()
+        .any(|word| NEGATION_WORDS.contains(&word.as_str()))
+}
+
+/// Lo que la pregunta afirma del sujeto: el texto que sigue al primer verbo
+/// atributivo o posesivo.
+///
+/// Es la forma de la frase, no su vocabulario: «… son revocables», «… tienen
+/// cláusula de rescisión anticipada». Sin uno de esos verbos no hay predicado
+/// que aislar y se devuelve `None`, que es la respuesta prudente.
+fn predicate_after_verb(query: &str) -> Option<String> {
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    let at = words
+        .iter()
+        .position(|word| PREDICATE_VERBS.contains(&normalize_exact(word).as_str()))?;
+    let predicate = words[at + 1..]
+        .join(" ")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_owned();
+    (!predicate.is_empty()).then_some(predicate)
 }
 
 /// Conserva sólo términos de contenido. La lista contiene palabras de
@@ -5440,6 +5718,22 @@ impl ToolEngine {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+}
+
+/// Los filtros de una pregunta **más** los criterios que la pregunta nombró y
+/// que ningún filtro llegó a aplicar.
+///
+/// La lista de filtros por sí sola no distingue dos situaciones opuestas: una
+/// pregunta que no puso ninguna condición, y una que puso una que el motor no
+/// supo convertir en filtro. Quien redacta la respuesta necesita esa
+/// diferencia; sin ella dice «cumplen simultáneamente los criterios» después
+/// de haber tirado uno en silencio.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedFilters {
+    pub filters: Vec<ToolFilter>,
+    /// Criterios nombrados en la pregunta que no acabaron en ningún filtro,
+    /// tal como conviene nombrarlos al contestar.
+    pub unapplied_criteria: Vec<String>,
 }
 
 /// Un par «Campo: valor» escrito por el usuario y ya resuelto contra el acervo.

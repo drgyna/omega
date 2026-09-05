@@ -43,6 +43,45 @@ fn negative_money_is_indexed_and_summed_with_its_real_sign() {
     assert_eq!(scope.excluded_count, Some(0));
 }
 
+/// Un campo numérico que la pregunta ya nombra dice por sí mismo de qué se
+/// totaliza, así que pedir su total es pedir una suma. Las palabras genéricas
+/// de dinero o cantidad («importe», «monto», «cantidad», «unidades») existen
+/// para el caso contrario —una pregunta que no nombra ningún campo— y exigirlas
+/// también aquí dejaba sin sumar la forma más directa de pedir una suma: la
+/// pregunta caía en la búsqueda del campo y contestaba «— N valores», una frase
+/// sin ninguna cifra.
+#[test]
+fn a_total_of_a_named_numeric_field_is_summed_without_a_generic_money_word() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    write_record(
+        root,
+        "uno.md",
+        &[("Folio", "TOT-01"), ("Total de piezas", "120")],
+    );
+    write_record(
+        root,
+        "dos.md",
+        &[("Folio", "TOT-02"), ("Total de piezas", "45")],
+    );
+    let engine = index(root);
+
+    let summed = engine
+        .ask_in_conversation("c1", "¿A cuánto asciende el total de piezas?")
+        .unwrap();
+    assert!(summed.text.contains("165"), "{}", summed.text);
+    let scope = summed.scope.expect("alcance declarado");
+    assert_eq!(scope.value_count, Some(2));
+
+    // Y «total» sin ningún campo nombrado se sigue leyendo como cierre de
+    // frase, no como suma: eso es un conteo de documentos, no una cifra.
+    let counted = engine
+        .ask_in_conversation("c2", "¿Cuántos documentos hay en total?")
+        .unwrap();
+    assert!(!counted.text.contains("165"), "{}", counted.text);
+    assert!(counted.text.contains("documento"), "{}", counted.text);
+}
+
 #[test]
 fn an_explicit_euro_symbol_is_indexed_and_rendered_as_eur() {
     let fixture = tempfile::tempdir().unwrap();

@@ -1005,6 +1005,34 @@ impl Agent {
             None => None,
         };
         crate::trace!("e) pinned = {:?}", pinned.as_ref().map(|d| d.path.clone()));
+        // Anclar no es lo mismo que cumplir. Una pregunta con dos condiciones
+        // puede quedar anclada por una sola de ellas —basta que un valor sea
+        // único en el acervo— y entonces el documento fijado satisface esa
+        // condición pero contradice la otra. Contestar desde él sería publicar
+        // un dato de un documento que la propia pregunta excluye, y con sello
+        // de verificado, porque el valor citado sí está literalmente ahí: lo
+        // falso no es la cita, es que ese documento sea el que se preguntaba.
+        //
+        // El planificador ya calculó las condiciones en `plan.filters`. Si el
+        // documento fijado no las cumple todas, se descarta —también como
+        // sujeto de la conversación, para que el turno siguiente no herede un
+        // documento que estas condiciones excluyen— y la pregunta sigue su
+        // camino de siempre: la rama de conteo/lista con esos mismos filtros,
+        // que devolverá el conjunto vacío honesto.
+        let pinned = match pinned {
+            Some(document)
+                if !self
+                    .tools
+                    .document_matches_filters(document.id, &plan.filters)? =>
+            {
+                crate::trace!(
+                    "e) FIJADO DESCARTADO: el documento no cumple los filtros del plan ({:?})",
+                    plan.filters
+                );
+                None
+            }
+            other => other,
+        };
         if let Some(document) = &pinned {
             // Fijar el documento no autoriza a contestar cualquier cosa sobre
             // él: `answer_about_document` sólo responde si la pregunta nombra
@@ -1066,7 +1094,12 @@ impl Agent {
                 );
                 crate::trace!("h) composicion: document_answer (fallback generico de conteo)");
                 Ok((
-                    document_answer(result, &plan.filters, plan.origin.as_deref()),
+                    document_answer(
+                        result,
+                        &plan.filters,
+                        plan.origin.as_deref(),
+                        &plan.unapplied_criteria,
+                    ),
                     None,
                 ))
             }
@@ -1211,7 +1244,22 @@ fn document_answer(
     result: DocumentQueryResult,
     filters: &[ToolFilter],
     origin: Option<&str>,
+    unapplied_criteria: &[String],
 ) -> Answer {
+    // La pregunta nombró un criterio que no llegó a ser filtro. Contar con los
+    // demás daría una cifra donde cada palabra es cierta y el conjunto no: el
+    // número existe, pero no es el de los documentos que cumplen lo que se
+    // preguntó. Es la misma lección que el censo ya aprendió en su ruta —
+    // cuando hay un filtro que no se sabe aplicar, no se cuenta nada; se dice.
+    if !unapplied_criteria.is_empty() {
+        crate::trace!("h) composicion: criterio nombrado sin aplicar -> {unapplied_criteria:?}");
+        return Answer::unverified(format!(
+            "No apliqué {} «{}»: la pregunta {} nombra, pero no llegó a convertirse en ningún filtro sobre el acervo. No doy el conteo de los criterios restantes, porque la cifra parecería cumplirlos todos.",
+            report::plural(unapplied_criteria.len(), "el criterio", "los criterios"),
+            unapplied_criteria.join("», «"),
+            report::plural(unapplied_criteria.len(), "lo", "los"),
+        ));
+    }
     if result.document_count == 0 {
         return no_evidence_answer();
     }

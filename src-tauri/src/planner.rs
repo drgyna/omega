@@ -33,6 +33,12 @@ pub struct QueryPlan {
     pub intent: QueryIntent,
     pub filters: Vec<ToolFilter>,
     pub origin: Option<String>,
+    /// Criterios que la pregunta nombró y que no llegaron a `filters`. Sin
+    /// esta lista, un plan con cero filtros es indistinguible de una pregunta
+    /// que no puso condiciones, y la respuesta acaba diciendo que los
+    /// documentos «cumplen simultáneamente los criterios» sin haber aplicado
+    /// uno de los que se le pidieron.
+    pub unapplied_criteria: Vec<String>,
 }
 
 pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
@@ -67,6 +73,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             intent: QueryIntent::Inventory,
             filters: vec![],
             origin: None,
+            unapplied_criteria: Vec::new(),
         });
     }
     // Conteo por formato de archivo. Va **antes** del corte por señal exacta
@@ -84,6 +91,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
                 intent: QueryIntent::CountByFormat(request),
                 filters,
                 origin,
+                unapplied_criteria: Vec::new(),
             });
         }
     }
@@ -93,6 +101,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             intent: QueryIntent::Exact,
             filters: vec![],
             origin: None,
+            unapplied_criteria: Vec::new(),
         });
     }
 
@@ -128,25 +137,44 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             .map(|concept| concept.display_name.as_str()),
     );
     let group_by = possible_group;
+    // Un campo numérico que la pregunta YA nombra dice por sí mismo de qué se
+    // totaliza. Las palabras genéricas de dinero o cantidad existen para el
+    // caso contrario —cuando la pregunta no nombra ningún campo y hace falta
+    // alguna señal de que se habla de valores—, así que exigirlas también aquí
+    // dejaba sin sumar la forma más directa de pedir una suma: nombrar el campo
+    // y pedir su total. La condición no mira ninguna palabra del negocio: sólo
+    // si la pregunta dice «total»/«acumulado» y si el campo que ella misma
+    // nombró es de tipo numérico según el índice.
+    //
+    // Sin campo numérico resuelto no cambia nada, así que «¿cuántos documentos
+    // hay en total?» —que no nombra ningún campo— se sigue leyendo como conteo.
+    let numeric_target = target.as_ref().is_some_and(|concept| {
+        matches!(
+            concept.value_type.as_str(),
+            "money" | "number" | "percentage"
+        )
+    });
+    let totals_a_named_field = numeric_target && question_mentions_a_total(question);
+    let asks_sum = asks_sum || totals_a_named_field;
+    crate::trace!(
+        "c) planner::plan totals_a_named_field={totals_a_named_field} (numeric_target={numeric_target}) -> asks_sum={asks_sum}"
+    );
     let explicitly_scopes_origin = has("carpet")
         || has("categori")
         || has("origen")
         || has("fuente")
         || has("folder")
         || has("source");
-    let filters = tools.resolved_filters(
+    let resolved = tools.resolved_filters_and_gaps(
         question,
         origin.as_deref(),
         (asks_count || asks_list) && !explicitly_scopes_origin,
     )?;
+    let filters = resolved.filters;
 
     let asks_value_count = asks_count && has("valor");
     if asks_sum || asks_group || asks_value_count {
         if let Some(target) = target.as_ref() {
-            let numeric_target = matches!(
-                target.value_type.as_str(),
-                "money" | "number" | "percentage"
-            );
             if !asks_sum || numeric_target {
                 return Ok(QueryPlan {
                     intent: QueryIntent::Aggregate(AggregateRequest {
@@ -163,6 +191,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
                     }),
                     filters: vec![],
                     origin,
+                    unapplied_criteria: Vec::new(),
                 });
             }
         }
@@ -174,6 +203,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             intent: QueryIntent::CountDocuments,
             filters,
             origin,
+            unapplied_criteria: resolved.unapplied_criteria,
         });
     }
     if asks_list && !filters.is_empty() {
@@ -182,6 +212,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             intent: QueryIntent::ListDocuments,
             filters,
             origin,
+            unapplied_criteria: resolved.unapplied_criteria,
         });
     }
     let natural = normalize_exact(question);
@@ -195,6 +226,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             intent: QueryIntent::LegacySearch,
             filters: vec![],
             origin,
+            unapplied_criteria: Vec::new(),
         });
     }
     if asks_count || (asks_list && origin.is_some()) || question_word {
@@ -203,6 +235,7 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             intent: QueryIntent::FreeText,
             filters: vec![],
             origin,
+            unapplied_criteria: Vec::new(),
         });
     }
     if asks_list {
@@ -211,12 +244,14 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
             intent: QueryIntent::BoundedSearch,
             filters: vec![],
             origin,
+            unapplied_criteria: Vec::new(),
         });
     }
     Ok(QueryPlan {
         intent: QueryIntent::LegacySearch,
         filters: vec![],
         origin,
+        unapplied_criteria: Vec::new(),
     })
 }
 

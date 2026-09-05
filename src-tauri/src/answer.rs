@@ -26,7 +26,7 @@ use crate::{
         canonical_identifier, normalize_exact, normalize_literal, normalize_spanish, search_terms,
         stems_match,
     },
-    tools::{DocumentValue, SignRecord, ToolEngine},
+    tools::{DocumentValue, FieldRole, QuestionFieldRoles, SignRecord, ToolEngine},
     verifier::value_is_supported,
 };
 
@@ -112,6 +112,43 @@ static FILLER_ROOTS: LazyLock<HashSet<String>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Palabras interrogativas, en los dos idiomas que el resto del archivo ya
+/// reconoce. Lo que se usa de ellas es su AUSENCIA: una pregunta que no lleva
+/// ninguna es una pregunta de sí/no.
+///
+/// No es `QUESTION_FILLER` —esa mezcla los interrogativos con otras palabras
+/// que tampoco nombran un campo («documento», «valor», «es»)— ni la lista
+/// `QUESTION_WORDS` de `tools.rs`, que deja fuera «qué» y «cómo» a propósito
+/// porque allí incluir de más marca campos como preguntados por error. Aquí el
+/// riesgo corre al revés: incluir de más sólo hace que la regla se abstenga de
+/// actuar, así que la lista se toma deliberadamente amplia.
+const INTERROGATIVE_WORDS: &[&str] = &[
+    "como", "cual", "cuales", "cuando", "cuanta", "cuantas", "cuanto", "cuantos", "donde", "que",
+    "quien", "quienes", "how", "what", "when", "where", "which", "who", "whom", "whose", "why",
+];
+
+static INTERROGATIVE_ROOTS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    INTERROGATIVE_WORDS
+        .iter()
+        .map(|word| normalize_spanish(word))
+        .collect()
+});
+
+/// ¿La pregunta pide el valor de algún campo, o sólo espera un sí o un no?
+///
+/// Se lee de la forma de la frase, nunca de un vocabulario de negocio: si no
+/// aparece ninguna palabra interrogativa, la pregunta no está pidiendo el
+/// valor de nada —afirma algo sobre el documento y espera confirmación.
+///
+/// Se mira la pregunta cruda y no los términos ya filtrados porque
+/// `search_terms` descarta «que» como palabra vacía, y con ella se perdería
+/// justo uno de los interrogativos que esta lectura necesita ver.
+fn asks_for_a_field_value(question: &str) -> bool {
+    normalize_spanish(question)
+        .split_whitespace()
+        .any(|word| INTERROGATIVE_ROOTS.contains(word))
+}
+
 /// Palabras que nombran al continente, no al contenido. Sirven para reconocer
 /// que una pregunta habla de los documentos en sí ("qué documentos se
 /// relacionan con X") y no de un campo suyo.
@@ -183,6 +220,11 @@ pub fn synthesize(
         Some((_, text)) => search_terms(text),
         None => Vec::new(),
     };
+    // Y el campo por el que se localizó tampoco lo nombra: «cuyo X es ABC-123»
+    // escribe «X» para señalar el registro, no para pedirlo.
+    let premise = identifier
+        .as_ref()
+        .map(|(_, text)| LocatorPremise::new(question, text));
 
     if let Some((canonical, text)) = &identifier {
         // Una pregunta por los documentos relacionados habla del acervo, no de
@@ -207,6 +249,7 @@ pub fn synthesize(
                 &terms,
                 &type_words,
                 &identifier_words,
+                premise.as_ref(),
                 canonical,
                 text,
                 hits,
@@ -215,7 +258,15 @@ pub fn synthesize(
             }
         }
     }
-    shared_field_answer(tools, question, &terms, &type_words, &identifier_words, hits)
+    shared_field_answer(
+        tools,
+        question,
+        &terms,
+        &type_words,
+        &identifier_words,
+        premise.as_ref(),
+        hits,
+    )
 }
 
 // -------------------------------------------------------------------------
@@ -365,6 +416,7 @@ fn asked_for_another_field(
     terms: &[String],
     type_words: &[String],
     identifier_words: &[String],
+    premise: Option<&LocatorPremise>,
     groups: &BTreeMap<String, Vec<usize>>,
     hits: &[SearchHit],
 ) -> Result<Option<Synthesis>> {
@@ -384,7 +436,16 @@ fn asked_for_another_field(
         .collect::<Vec<_>>();
     let asked = match explicitly_quoted_field(question, &catalogue)
         .map(FieldMatch::Resolved)
-        .unwrap_or_else(|| resolve_field(&catalogue, terms, type_words, identifier_words))
+        .unwrap_or_else(|| {
+            resolve_field(
+                question,
+                &catalogue,
+                terms,
+                type_words,
+                identifier_words,
+                premise,
+            )
+        })
     {
         FieldMatch::Resolved(name) => name,
         FieldMatch::NotRequested | FieldMatch::Ambiguous => return Ok(None),
@@ -420,6 +481,7 @@ fn shared_field_answer(
     terms: &[String],
     type_words: &[String],
     identifier_words: &[String],
+    premise: Option<&LocatorPremise>,
     hits: &[SearchHit],
 ) -> Result<Option<Synthesis>> {
     match quoted_field_in_located_document(tools, question, hits)? {
@@ -460,6 +522,7 @@ fn shared_field_answer(
             terms,
             type_words,
             identifier_words,
+            premise,
             &groups,
             hits,
         )? {
@@ -476,8 +539,16 @@ fn shared_field_answer(
             .collect::<Vec<_>>();
         let resolved = match explicitly_quoted_field(question, &vocabulary)
             .map(FieldMatch::Resolved)
-            .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words, identifier_words))
-        {
+            .unwrap_or_else(|| {
+                resolve_field(
+                    question,
+                    &vocabulary,
+                    terms,
+                    type_words,
+                    identifier_words,
+                    premise,
+                )
+            }) {
             FieldMatch::Resolved(name) => name,
             FieldMatch::NotRequested | FieldMatch::Ambiguous => return Ok(None),
         };
@@ -857,6 +928,7 @@ fn identified_field_answer(
     terms: &[String],
     type_words: &[String],
     identifier_words: &[String],
+    premise: Option<&LocatorPremise>,
     identifier: &str,
     identifier_text: &str,
     hits: &[SearchHit],
@@ -867,7 +939,16 @@ fn identified_field_answer(
     let vocabulary = distinct_fields(documents.iter().flat_map(|context| context.values.iter()));
     let shared_field = match explicitly_quoted_field(question, &vocabulary)
         .map(FieldMatch::Resolved)
-        .unwrap_or_else(|| resolve_field(&vocabulary, terms, type_words, identifier_words))
+        .unwrap_or_else(|| {
+            resolve_field(
+                question,
+                &vocabulary,
+                terms,
+                type_words,
+                identifier_words,
+                premise,
+            )
+        })
     {
         // La pregunta no nombra ningún campo del acervo. Antes de rendirse:
         // puede que lo entrecomillado no sea un campo sino la ETIQUETA de una
@@ -953,7 +1034,14 @@ fn identified_field_answer(
     let FieldMatch::Resolved(field) = explicitly_quoted_field(question, &principal_vocabulary)
         .map(FieldMatch::Resolved)
         .unwrap_or_else(|| {
-            resolve_field(&principal_vocabulary, terms, type_words, identifier_words)
+            resolve_field(
+                question,
+                &principal_vocabulary,
+                terms,
+                type_words,
+                identifier_words,
+                premise,
+            )
         })
     else {
         return Ok(unresolved(
@@ -1420,7 +1508,14 @@ pub fn question_names_a_field(question: &str, vocabulary: &[String]) -> bool {
     }
     let terms = search_terms(question);
     matches!(
-        resolve_field(vocabulary, &terms, &[], &identifier_terms_in(question)),
+        resolve_field(
+            question,
+            vocabulary,
+            &terms,
+            &[],
+            &identifier_terms_in(question),
+            None
+        ),
         FieldMatch::Resolved(_)
     )
 }
@@ -1578,15 +1673,69 @@ pub fn field_named_in_full(question: &str, vocabulary: &[String]) -> Option<Stri
         .cloned()
 }
 
+/// La premisa que localizó el documento: el identificador que el usuario
+/// escribió, más la lectura gramatical de la pregunta que dice qué papel juega
+/// cada nombre de campo respecto de él.
+///
+/// `resolve_field` puntúa un campo por cuántas palabras suyas están escritas en
+/// la pregunta, y ya descuenta las que sólo nombran el TIPO de la entidad y las
+/// del VALOR del identificador. Faltaba el tercer caso: la palabra que nombra
+/// al campo POR EL QUE se localizó el documento («…cuyo X es ABC-123»). Esa
+/// palabra está en la pregunta para señalar el registro, igual que el propio
+/// identificador, no para pedir un dato. Sin descontarla, el campo localizador
+/// empataba con el pedido y el motor terminaba devolviendo, sellado como dato
+/// extraído, el mismo identificador que el usuario acababa de teclear.
+struct LocatorPremise {
+    roles: QuestionFieldRoles,
+    identifier_text: String,
+}
+
+impl LocatorPremise {
+    fn new(question: &str, identifier_text: &str) -> Self {
+        Self {
+            roles: QuestionFieldRoles::new(question),
+            identifier_text: identifier_text.to_owned(),
+        }
+    }
+
+    /// Este nombre de campo sólo sirve para señalar el documento.
+    ///
+    /// Dos condiciones de forma, ninguna de vocabulario:
+    ///
+    /// * el campo está escrito PEGADO al identificador —con nada entre medio
+    ///   salvo cópulas y artículos—, que es exactamente lo que
+    ///   `QuestionFieldRoles` ya llama condición; y
+    /// * ninguna palabra interrogativa alcanza a ese campo.
+    ///
+    /// La segunda condición es la que mantiene viva «¿cuál es el estado de
+    /// ABC-123?»: ahí «estado» también queda pegado al identificador (sólo
+    /// «de» en medio), pero «cuál» lo señala, así que se pide, no localiza.
+    /// El papel de campo preguntado se consulta con un valor vacío a
+    /// propósito: sin valor que emparejar no hay condición posible, y `role`
+    /// devuelve entonces la marca interrogativa sola.
+    fn only_locates(&self, field: &str) -> bool {
+        self.roles.role(field, &self.identifier_text) == FieldRole::Restriction
+            && self.roles.role(field, "") != FieldRole::Asked
+    }
+}
+
 fn resolve_field(
+    question: &str,
     vocabulary: &[String],
     terms: &[String],
     type_words: &[String],
     identifier_words: &[String],
+    premise: Option<&LocatorPremise>,
 ) -> FieldMatch {
+    let asks_for_a_value = asks_for_a_field_value(question);
     let mut best: Option<(usize, usize, String)> = None;
     let mut tied = false;
     for name in vocabulary {
+        // Un campo que la pregunta sólo escribe para señalar el documento no
+        // compite por ser el campo pedido, aunque sus palabras coincidan.
+        if premise.is_some_and(|premise| premise.only_locates(name)) {
+            continue;
+        }
         let field_terms = search_terms(name);
         let has_significant_term = field_terms.iter().any(|term| !FILLER_ROOTS.contains(term));
         if !has_significant_term {
@@ -1611,6 +1760,23 @@ fn resolve_field(
             continue;
         }
         let unmatched = field_terms.len() - matched;
+        // Un nombre de varias palabras queda nombrado cuando la pregunta
+        // escribe el nombre entero o, al menos, la palabra que lo encabeza: en
+        // español el sintagma se lee por su primera palabra y las de detrás la
+        // especifican («Forma de X» es una forma; «X de Y» sigue siendo X).
+        // Si de un nombre compuesto sólo calzó alguna de las palabras de
+        // detrás, la primera no, y encima la pregunta no pide el valor de nada
+        // —no lleva ninguna interrogativa—, lo que hubo fue un choque de
+        // raíces entre el verbo de la pregunta y una palabra suelta del
+        // nombre, no una petición de ese campo. Sin ninguna interrogativa que
+        // respalde la lectura, esa coincidencia parcial no basta para
+        // adjudicar el campo, y quedarse sin candidato es la salida honesta.
+        let head_matched = field_terms
+            .first()
+            .is_some_and(|head| terms.iter().any(|term| stems_match(term, head)));
+        if !asks_for_a_value && unmatched > 0 && !head_matched {
+            continue;
+        }
         match &best {
             None => best = Some((matched, unmatched, name.clone())),
             Some((best_matched, best_unmatched, _)) => {
@@ -2069,17 +2235,21 @@ mod tests {
     fn a_query_word_never_names_a_field_by_itself() {
         let vocabulary = vec!["Documento".to_owned(), "Estado".to_owned()];
         let requested = resolve_field(
+            "Busca el documento ABC-123",
             &vocabulary,
             &search_terms("Busca el documento ABC-123"),
             &[],
             &[],
+            None,
         );
         assert!(matches!(requested, FieldMatch::NotRequested));
         let asked = resolve_field(
+            "¿Cuál es el estado de ABC-123?",
             &vocabulary,
             &search_terms("¿Cuál es el estado de ABC-123?"),
             &[],
             &[],
+            None,
         );
         assert!(matches!(asked, FieldMatch::Resolved(name) if name == "Estado"));
     }
@@ -2088,10 +2258,12 @@ mod tests {
     fn an_equally_scored_field_is_ambiguous_instead_of_arbitrary() {
         let vocabulary = vec!["Precio pactado".to_owned(), "Precio estimado".to_owned()];
         let requested = resolve_field(
+            "¿Cuál es el precio de ABC-123?",
             &vocabulary,
             &search_terms("¿Cuál es el precio de ABC-123?"),
             &[],
             &[],
+            None,
         );
         assert!(matches!(requested, FieldMatch::Ambiguous));
     }
@@ -2104,12 +2276,75 @@ mod tests {
         // largo que comparte una palabra.
         let vocabulary = vec!["Estado".to_owned(), "Estado de conservación".to_owned()];
         let requested = resolve_field(
+            "¿Cuál es el estado de ABC-123?",
             &vocabulary,
             &search_terms("¿Cuál es el estado de ABC-123?"),
             &[],
             &[],
+            None,
         );
         assert!(matches!(requested, FieldMatch::Resolved(name) if name == "Estado"));
+    }
+
+    #[test]
+    fn a_question_without_an_interrogative_needs_the_head_of_a_compound_name() {
+        // «¿Ya se …?» no pide el valor de ningún campo: no lleva interrogativa.
+        // Si de un nombre de dos palabras sólo calza la de detrás —porque su
+        // raíz choca con la del verbo— no se ha nombrado ese campo, y elegirlo
+        // publicaría un dato ajeno a lo preguntado con sello de verificado.
+        let vocabulary = vec!["Modo de traslado".to_owned(), "Situación".to_owned()];
+        let collision = "¿Ya se trasladó el bulto ABC-123?";
+        let resolved = resolve_field(
+            collision,
+            &vocabulary,
+            &search_terms(collision),
+            &[],
+            &[],
+            None,
+        );
+        assert!(matches!(resolved, FieldMatch::NotRequested));
+
+        // Con una interrogativa delante, la misma coincidencia parcial vuelve
+        // a valer: ahí sí se está pidiendo el valor de un campo.
+        let asked = "¿Cuál es el traslado del bulto ABC-123?";
+        let resolved = resolve_field(asked, &vocabulary, &search_terms(asked), &[], &[], None);
+        assert!(matches!(resolved, FieldMatch::Resolved(name) if name == "Modo de traslado"));
+
+        // Y sin interrogativa, nombrar la PRIMERA palabra sigue bastando: la
+        // regla sólo descarta las coincidencias que dejan el núcleo sin
+        // nombrar, no toda coincidencia parcial.
+        let vocabulary = vec!["Situación declarada".to_owned()];
+        let head = "¿Ya cambió la situación de ABC-123?";
+        let resolved = resolve_field(head, &vocabulary, &search_terms(head), &[], &[], None);
+        assert!(matches!(resolved, FieldMatch::Resolved(name) if name == "Situación declarada"));
+    }
+
+    #[test]
+    fn the_field_that_only_locates_the_document_never_competes_with_the_asked_one() {
+        // «cuya X es ABC-123» escribe X pegado al identificador: es la premisa
+        // que señala el documento, no el dato pedido. Sin descontarla empata
+        // con el campo preguntado y la respuesta termina siendo el mismo
+        // identificador que el usuario acababa de escribir.
+        let question = "¿Quién es el responsable del registro cuya referencia es ABC-123?";
+        let vocabulary = vec!["Responsable".to_owned(), "Referencia".to_owned()];
+        let terms = search_terms(question);
+        let premise = LocatorPremise::new(question, "ABC-123");
+        let resolved = resolve_field(question, &vocabulary, &terms, &[], &[], Some(&premise));
+        assert!(matches!(resolved, FieldMatch::Resolved(name) if name == "Responsable"));
+        // Sin premisa los dos campos empatan: ése era exactamente el defecto.
+        assert!(matches!(
+            resolve_field(question, &vocabulary, &terms, &[], &[], None),
+            FieldMatch::Ambiguous
+        ));
+
+        // Estar pegado al identificador no basta: si una interrogativa alcanza
+        // al campo, se pide. «¿Cuál es el estado de ABC-123?» sólo tiene «de»
+        // entre los dos y sigue preguntando por «Estado».
+        let asked = "¿Cuál es el estado de ABC-123?";
+        let vocabulary = vec!["Estado".to_owned()];
+        let premise = LocatorPremise::new(asked, "ABC-123");
+        let resolved = resolve_field(asked, &vocabulary, &search_terms(asked), &[], &[], Some(&premise));
+        assert!(matches!(resolved, FieldMatch::Resolved(name) if name == "Estado"));
     }
 
     #[test]
@@ -2123,20 +2358,24 @@ mod tests {
 
         // "propiedad" desempata: sin ella los dos "Estado de..." empatarían.
         let asked = resolve_field(
+            "¿Cuál es el estado de la propiedad ABC-123?",
             &vocabulary,
             &search_terms("¿Cuál es el estado de la propiedad ABC-123?"),
             &type_words,
             &[],
+            None,
         );
         assert!(matches!(asked, FieldMatch::Resolved(name) if name == "Estado de la propiedad"));
 
         // "color" no coincide con nada; la única coincidencia sería el tipo, y
         // por sí solo no habilita ningún campo.
         let invented = resolve_field(
+            "¿Cuál es el color de la propiedad ABC-123?",
             &vocabulary,
             &search_terms("¿Cuál es el color de la propiedad ABC-123?"),
             &type_words,
             &[],
+            None,
         );
         assert!(matches!(invented, FieldMatch::NotRequested));
     }
