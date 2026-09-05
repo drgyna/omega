@@ -48,7 +48,14 @@ pub fn plan(tools: &ToolEngine, question: &str) -> Result<QueryPlan> {
     // dice de qué es el total («¿cuántos documentos hay en total?»); en cuanto
     // nombra una categoría de valor —«el total de los importes»— es una suma, y
     // contestarla con un número de documentos era responder otra pregunta.
-    let totals_a_value = has("total") && generic_value_category(question).is_some();
+    //
+    // «Total» no cuenta si ya quedó reclamado como el NOMBRE de un campo que
+    // un par «Campo: valor» escrito resolvió («Importe total: Pendiente» es un
+    // filtro, no una petición de sumar el importe total).
+    let total_terms = terms_outside_resolved_written_fields(tools, question, &terms)?;
+    let totals_a_value =
+        total_terms.iter().any(|term| term.starts_with("total"))
+            && generic_value_category(&total_terms).is_some();
     let asks_count = (has("cuant") || has("numer") || has("conte") || has("how") || has("total"))
         && !totals_a_value;
     let asks_sum = has("sum") || has("totaliz") || has("add") || totals_a_value;
@@ -434,7 +441,7 @@ fn requested_value_category(
     tools: &ToolEngine,
     question: &str,
 ) -> Result<Option<&'static str>> {
-    if let Some(category) = generic_value_category(question) {
+    if let Some(category) = generic_value_category(&search_terms(question)) {
         return Ok(Some(category));
     }
     if question_mentions_a_total(question)
@@ -445,8 +452,7 @@ fn requested_value_category(
     Ok(None)
 }
 
-fn generic_value_category(question: &str) -> Option<&'static str> {
-    let terms = search_terms(question);
+fn generic_value_category(terms: &[String]) -> Option<&'static str> {
     let mentions = |list: &[&str]| {
         list.iter().any(|word| {
             search_terms(word)
@@ -1414,7 +1420,38 @@ const MAXIMUM_WORDS: &[&str] = &["mas", "mayor", "mayores", "alto", "alta", "alt
 const MINIMUM_WORDS: &[&str] = &["menos", "menor", "menores", "bajo", "baja", "bajos", "bajas"];
 const DIFFERENCE_WORDS: &[&str] = &["diferencia", "diferencias", "resta", "restar", "difference"];
 
-fn signals(question: &str) -> Signals {
+/// Términos de la pregunta que no forman parte del NOMBRE de un campo ya
+/// resuelto como par escrito «Campo: valor».
+///
+/// «Importe total: Pendiente» ya reclamó «importe» y «total» como el nombre
+/// de un filtro, no como una petición de sumar: sin restarlos, la señal de
+/// «pide un total» los veía sueltos en la pregunta —aparecen, cómo no, si son
+/// el propio nombre de un campo— y convertía dos filtros ya resueltos en una
+/// suma que nadie pidió. Estructural, no de vocabulario: no mira qué campo
+/// es, sólo si sus palabras ya quedaron explicadas por un par escrito que el
+/// propio acervo confirmó.
+fn terms_outside_resolved_written_fields(
+    tools: &ToolEngine,
+    question: &str,
+    terms: &[String],
+) -> Result<Vec<String>> {
+    let written = tools.written_filters(question)?;
+    if written.filters.is_empty() {
+        return Ok(terms.to_vec());
+    }
+    let field_terms = written
+        .filters
+        .iter()
+        .flat_map(|filter| search_terms(&filter.concept))
+        .collect::<Vec<_>>();
+    Ok(terms
+        .iter()
+        .filter(|term| !field_terms.iter().any(|field_term| stems_match(term, field_term)))
+        .cloned()
+        .collect())
+}
+
+fn signals(tools: &ToolEngine, question: &str) -> Result<Signals> {
     let terms = search_terms(question);
     let words = normalize_exact(question)
         .split_whitespace()
@@ -1432,9 +1469,16 @@ fn signals(question: &str) -> Signals {
     // valor. (El caso en que el objeto lo nombra una moneda —«el total en
     // MXN»— lo añade `plan_inner`, que sí puede consultar las monedas del
     // acervo; aquí no hay acceso al índice.)
-    let totals_a_value =
-        (has("total") || has("acumulad")) && generic_value_category(question).is_some();
-    Signals {
+    //
+    // Las dos palabras se miran fuera de lo que un par «Campo: valor» ya
+    // escrito reclamó como el NOMBRE de un campo: si no queda nada fuera de
+    // eso, «total»/«acumulado» son parte de un filtro que el usuario ya
+    // resolvió, no una petición de sumar.
+    let total_terms = terms_outside_resolved_written_fields(tools, question, &terms)?;
+    let totals_a_value = (total_terms.iter().any(|term| term.starts_with("total"))
+        || total_terms.iter().any(|term| term.starts_with("acumulad")))
+        && generic_value_category(&total_terms).is_some();
+    Ok(Signals {
         count: has("cuant") || has("numer") || has("conte") || has("how"),
         sum: has("sum") || has("totaliz") || totals_a_value,
         average: has("promedi") || word("media") || has("average"),
@@ -1458,7 +1502,7 @@ fn signals(question: &str) -> Signals {
         calendar: CALENDAR_WORDS.iter().any(|value| word(value)),
         multiply: has("multiplic"),
         divide: has("dividi") || has("division"),
-    }
+    })
 }
 
 /// Campos que una aclaración ya resolvió y que el plan no debe volver a
@@ -1528,7 +1572,7 @@ pub fn plan_structured(
 /// misma operación de la pregunta original para cada campo ofrecido, en vez
 /// de obligar a elegir uno solo.
 fn compute_all_options(tools: &ToolEngine, pending: &PendingChoice) -> Result<StructuredPlan> {
-    let marks = signals(&pending.question);
+    let marks = signals(tools, &pending.question)?;
     let operation = requested_operation(&marks).unwrap_or(Operation::Sum);
     let mut scope = PlannedScope {
         filters: pending.set.filters.clone(),
@@ -1636,7 +1680,7 @@ fn plan_inner(
     // de las dos la alcanzaba: la primera manda a búsqueda literal cualquier
     // pregunta con comillas, y la segunda exige que los DOS operandos sean
     // campos nombrados del acervo, cosa que «el importe» no es.
-    let mut marks = signals(question);
+    let mut marks = signals(tools, question)?;
     // «El total en MXN» nombra su objeto con la moneda en vez de con la palabra
     // «importe». `signals` no puede verlo —no conoce el acervo—, así que la
     // moneda se comprueba aquí, contra las que el índice realmente tiene: sin
