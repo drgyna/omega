@@ -110,7 +110,7 @@ const CONDITION_MARKERS: &[&str] = &["cuya", "cuyas", "cuyo", "cuyos", "donde"];
 ///
 /// Olvidar una forma sólo hace que no se detecte el predicado, nunca que se
 /// detecte uno que no está: el error posible es callar, no inventar.
-const PREDICATE_VERBS: &[&str] = &[
+pub(crate) const PREDICATE_VERBS: &[&str] = &[
     "era", "eran", "es", "esta", "estaba", "estaban", "estan", "este", "esten", "estuvieron",
     "estuvo", "fue", "fueron", "sea", "sean", "sera", "seran", "son", "tenga", "tengan", "tenia",
     "tenian", "tiene", "tienen", "tuvieron", "tuvo",
@@ -2790,25 +2790,45 @@ impl ToolEngine {
         // nombrar porque el acervo no registra nada parecido, pero el criterio
         // se perdió igual.
         if unapplied_criteria.is_empty() {
-            if let (Some(predicate), Some(predicate_terms)) = (predicate, predicate_terms) {
-                let mut known = Vec::new();
-                for filter in &filters {
-                    known.extend(search_terms(&filter.concept));
-                    known.extend(search_terms(&filter.equals));
+            let mut known = Vec::new();
+            for filter in &filters {
+                known.extend(search_terms(&filter.concept));
+                known.extend(search_terms(&filter.equals));
+            }
+            if let Some(origin) = origin {
+                known.extend(search_terms(origin));
+            }
+            let lands = |term: &String| {
+                known
+                    .iter()
+                    .any(|known| stems_match(known, term) || prefix_terms_match(known, term))
+            };
+            match (predicate, predicate_terms) {
+                (Some(predicate), Some(predicate_terms)) => {
+                    let covered = predicate_terms.iter().any(&lands);
+                    if !predicate_terms.is_empty() && !covered {
+                        crate::trace!(
+                            "c)   criterio NO APLICADO (predicado {predicate:?}: ninguna de sus palabras llego a un filtro ni al alcance)"
+                        );
+                        unapplied_criteria.push(predicate);
+                    }
                 }
-                if let Some(origin) = origin {
-                    known.extend(search_terms(origin));
-                }
-                let covered = predicate_terms.iter().any(|term| {
-                    known
-                        .iter()
-                        .any(|known| stems_match(known, term) || prefix_terms_match(known, term))
-                });
-                if !predicate_terms.is_empty() && !covered {
-                    crate::trace!(
-                        "c)   criterio NO APLICADO (predicado {predicate:?}: ninguna de sus palabras llego a un filtro ni al alcance)"
-                    );
-                    unapplied_criteria.push(predicate);
+                // Tercera forma del mismo defecto, y la más silenciosa: la
+                // pregunta no trae ningún verbo copulativo reconocible —basta
+                // una letra de menos («stan» por «están») para que deje de
+                // serlo—, así que no hay dónde cortar sujeto y predicado y la
+                // salvaguarda de arriba no llega a mirar nada. Sin verbo, el
+                // sujeto se reconoce solo: es lo que SÍ aterrizó en la carpeta
+                // o en un filtro. Lo que no aterrizó en ninguno de los dos es
+                // exactamente lo que se perdió, y sin esta rama se perdía en
+                // silencio: el conteo salía con un criterio menos y sellado.
+                _ => {
+                    if let Some(stranded) = stranded_span(query, &lands) {
+                        crate::trace!(
+                            "c)   criterio NO APLICADO (sin verbo que separe sujeto y predicado; {stranded:?} no llego a un filtro ni al alcance)"
+                        );
+                        unapplied_criteria.push(stranded);
+                    }
                 }
             }
         }
@@ -4216,6 +4236,50 @@ fn question_negates(query: &str, field: &str) -> bool {
 /// Es la forma de la frase, no su vocabulario: «… son revocables», «… tienen
 /// cláusula de rescisión anticipada». Sin uno de esos verbos no hay predicado
 /// que aislar y se devuelve `None`, que es la respuesta prudente.
+/// El trozo de la pregunta que viene DESPUÉS del sujeto y cuyas palabras de
+/// contenido no llegaron a ninguna parte: ni a un filtro, ni al nombre de la
+/// carpeta que fijó el alcance.
+///
+/// Se usa sólo cuando la pregunta no trae verbo copulativo reconocible y por
+/// tanto `predicate_after_verb` no tiene dónde cortar. El corte se hace
+/// entonces con la otra señal de orden que el español ya da: el sujeto es lo
+/// que se cuenta, y lo que se cuenta es justamente lo que sí aterrizó en el
+/// alcance o en un filtro; los complementos van detrás. Así, la última palabra
+/// que aterrizó marca el final del sujeto, y sólo se miran las que vienen
+/// después. Sin ese corte, «¿cuántos documentos hay en la carpeta calidad?»
+/// denunciaba «carpeta» —una palabra que va DELANTE del nombre de la carpeta y
+/// que no es ningún criterio— como criterio perdido.
+///
+/// Se apoya en `content_terms`, que ya descarta el vocabulario con el que se
+/// formulan las preguntas, y devuelve el tramo que va de la primera a la
+/// última palabra huérfana, para nombrar el criterio perdido como una frase y
+/// no como una lista de raíces.
+///
+/// Devuelve `None` cuando nada quedó huérfano detrás del sujeto, y también
+/// cuando ninguna palabra aterrizó: sin sujeto reconocido no hay corte que
+/// hacer, y denunciar la pregunta entera sería adivinar.
+fn stranded_span(query: &str, lands: &dyn Fn(&String) -> bool) -> Option<String> {
+    let stranded = content_terms(query)
+        .into_iter()
+        .filter(|term| !lands(term))
+        .collect::<HashSet<_>>();
+    if stranded.is_empty() {
+        return None;
+    }
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    let orphan = |word: &&str| search_terms(word).iter().any(|term| stranded.contains(term));
+    let landed = |word: &&str| search_terms(word).iter().any(|term| lands(term));
+    let subject_ends = words.iter().rposition(landed)?;
+    let tail = words.get(subject_ends + 1..)?;
+    let first = tail.iter().position(orphan)?;
+    let last = tail.iter().rposition(orphan)?;
+    let span = tail[first..=last]
+        .join(" ")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_owned();
+    (!span.is_empty()).then_some(span)
+}
+
 fn predicate_after_verb(query: &str) -> Option<String> {
     let words = query.split_whitespace().collect::<Vec<_>>();
     let at = words

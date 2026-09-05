@@ -26,7 +26,7 @@ use crate::{
         canonical_identifier, normalize_exact, normalize_literal, normalize_spanish, search_terms,
         stems_match,
     },
-    tools::{DocumentValue, FieldRole, QuestionFieldRoles, SignRecord, ToolEngine},
+    tools::{DocumentValue, FieldRole, PREDICATE_VERBS, QuestionFieldRoles, SignRecord, ToolEngine},
     verifier::value_is_supported,
 };
 
@@ -420,12 +420,12 @@ fn asked_for_another_field(
     groups: &BTreeMap<String, Vec<usize>>,
     hits: &[SearchHit],
 ) -> Result<Option<Synthesis>> {
-    let Some(found) = groups
+    let Some((found, found_value)) = groups
         .values()
         .next()
         .and_then(|group| group.first())
         .and_then(|index| field_value(&hits[*index]))
-        .map(|(field, _)| field.to_owned())
+        .map(|(field, value)| (field.to_owned(), value.to_owned()))
     else {
         return Ok(None);
     };
@@ -448,7 +448,35 @@ fn asked_for_another_field(
         })
     {
         FieldMatch::Resolved(name) => name,
-        FieldMatch::NotRequested | FieldMatch::Ambiguous => return Ok(None),
+        // Ningún campo del acervo se llama como lo que la pregunta pide. Con
+        // varios grupos de evidencia eso acaba en el mensaje genérico, que no
+        // afirma nada; aquí no, porque el atajo de un solo grupo sí afirma —y
+        // sella— el único campo encontrado, que suele ser el propio folio que
+        // el usuario tecleó. Basta una letra cambiada («conclucion» por
+        // «conclusión») para llegar hasta aquí, y contestar entonces con otro
+        // campo es responder otra pregunta con el sello de confianza puesto.
+        FieldMatch::NotRequested | FieldMatch::Ambiguous => {
+            let unrecognized =
+                unrecognized_field_words(question, terms, type_words, identifier_words);
+            if unrecognized.is_empty() || !echoes_the_written_identifier(question, &found_value) {
+                return Ok(None);
+            }
+            crate::trace!(
+                "h) answer::asked_for_another_field: campo pedido NO RECONOCIDO -> {unrecognized:?}"
+            );
+            let file = hits
+                .first()
+                .map(|hit| file_name(&hit.evidence))
+                .unwrap_or_default();
+            return Ok(unresolved(
+                format!(
+                    "Sin concluir: no reconozco «{}» como un campo del acervo, y lo único que encontré de {file} es su «{found}», que es el identificador que tú escribiste. No voy a devolvértelo como si fuera el dato que pediste.",
+                    unrecognized.join(" ")
+                ),
+                &[],
+                hits.iter().map(|hit| hit.evidence.clone()).collect(),
+            ));
+        }
     };
     if normalize_exact(&asked) == normalize_exact(&found) {
         return Ok(None);
@@ -919,6 +947,83 @@ fn load_documents<'a>(
         });
     }
     Ok(documents)
+}
+
+/// El único valor encontrado es el identificador que el propio usuario acaba
+/// de teclear.
+///
+/// Se apoya en `canonical_identifier`, la misma regla con la que el motor
+/// decide en todas partes qué valor identifica un registro: mezcla letras y
+/// dígitos y sólo admite separadores. Un valor que no es identificador —una
+/// frase literal entrecomillada, un nombre, un importe— nunca entra aquí, y
+/// por eso una búsqueda que sí encontró contenido real conserva su respuesta.
+fn echoes_the_written_identifier(question: &str, value: &str) -> bool {
+    let Some(canonical) = canonical_identifier(value) else {
+        return false;
+    };
+    question
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter_map(canonical_identifier)
+        .any(|written| written == canonical)
+}
+
+/// Las palabras con que la pregunta nombra el dato que pide, cuando ninguna de
+/// ellas resultó ser un campo del acervo.
+///
+/// Tres condiciones de forma, ninguna de vocabulario de negocio:
+///
+///  * la pregunta lleva una palabra interrogativa, es decir pide el valor de
+///    algo y no un sí o un no;
+///  * queda al menos una palabra que no es ni relleno de consulta, ni el
+///    identificador que localizó el documento, ni la palabra que nombra el
+///    tipo de la entidad, ni una cifra, ni uno de los verbos copulativos con
+///    los que el propio motor separa sujeto de predicado; y
+///  * quien llama ya intentó resolver un campo con esas palabras y no lo
+///    consiguió.
+///
+/// Cuando las tres se cumplen, la pregunta pidió un campo que el motor no
+/// reconoció. Basta una letra cambiada —«conclucion» por «conclusión»— para
+/// llegar aquí. Responder entonces con el único campo que la búsqueda trajo
+/// —casi siempre el propio folio que el usuario acaba de teclear— es contestar
+/// otra pregunta y sellarla como verificada; decir que no se reconoció la
+/// palabra es la salida honesta, y la misma que ya se da cuando la palabra no
+/// se escribe con errores pero el campo no existe.
+fn unrecognized_field_words(
+    question: &str,
+    terms: &[String],
+    type_words: &[String],
+    identifier_words: &[String],
+) -> Vec<String> {
+    if !asks_for_a_field_value(question) {
+        return Vec::new();
+    }
+    let copulas = PREDICATE_VERBS
+        .iter()
+        .map(|verb| normalize_spanish(verb))
+        .collect::<HashSet<_>>();
+    let names_something = |term: &String| {
+        !FILLER_ROOTS.contains(term)
+            && !copulas.contains(term)
+            && !type_words.contains(term)
+            && !identifier_words.contains(term)
+            && !term.chars().all(|character| character.is_numeric())
+    };
+    // Se devuelven las palabras tal como el usuario las escribió: la respuesta
+    // tiene que poder citarlas para que se vea cuál no se entendió.
+    question
+        .split_whitespace()
+        .filter(|word| {
+            search_terms(word)
+                .iter()
+                .any(|term| terms.contains(term) && names_something(term))
+        })
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_owned()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 fn identified_field_answer(
