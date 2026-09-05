@@ -1775,11 +1775,29 @@ impl ToolEngine {
             return decision;
         }
         // Sin ancla, la única forma de seguir hablando del mismo documento es
-        // que la pregunta lo vuelva a describir entero. Una sola palabra de
-        // contenido no describe un documento: describe una categoría.
+        // que la pregunta lo vuelva a describir entero —o que su única pista
+        // nombre, letra por letra, un CAMPO real del documento heredado—.
+        // «¿Y quién es el cliente?» después de hablar de una factura nombra
+        // "cliente", y el esquema del documento heredado ya reconoce esa
+        // palabra como el nombre de uno de sus propios campos: es una señal de
+        // forma mucho más fuerte que una palabra de contenido cualquiera, que
+        // sólo describiría una categoría («¿y en qué estado procesal está?»
+        // sigue sin fijar nada, porque ningún documento tiene un campo
+        // llamado "procesal"). Sin esta comprobación adicional, una sola
+        // palabra de contenido no describe un documento.
         if clues.len() < 2 {
-            crate::trace!("f) pinned_document: sin ancla y <2 pistas -> None");
-            return Ok(None);
+            let Some(document_id) = inherited else {
+                crate::trace!(
+                    "f) pinned_document: sin ancla y <2 pistas, sin documento heredado -> None"
+                );
+                return Ok(None);
+            };
+            let names_a_field = self.clue_names_a_field_of(document_id, &clues[0])?;
+            crate::trace!(
+                "f) pinned_document: sin ancla, 1 pista ({:?}) nombra campo del heredado = {names_a_field}",
+                clues[0]
+            );
+            return Ok(names_a_field.then_some(document_id));
         }
         let Some(document_id) = inherited else {
             crate::trace!("f) pinned_document: sin ancla y sin documento heredado -> None");
@@ -2076,6 +2094,16 @@ impl ToolEngine {
             .iter()
             .filter(|clue| words.iter().any(|word| stems_match(word, clue)))
             .count())
+    }
+
+    /// ¿Nombra `clue`, letra por letra, el CAMPO (no el valor) de un documento
+    /// concreto? Es una cuenta sobre el propio esquema del documento: un
+    /// acervo distinto reconoce otros campos sin tocar esta función.
+    fn clue_names_a_field_of(&self, document_id: i64, clue: &str) -> Result<bool> {
+        Ok(self
+            .document_values(document_id)?
+            .iter()
+            .any(|value| search_terms(&value.field).iter().any(|term| stems_match(term, clue))))
     }
 
     /// Cuánto distingue cada campo, leído del propio acervo: un campo que casi
