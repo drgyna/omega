@@ -119,6 +119,114 @@ pub fn stems_match(a: &str, b: &str) -> bool {
     shorter.len() >= 5 && longer.len() - shorter.len() == 1 && longer.starts_with(shorter)
 }
 
+/// A partir de cuántas letras se admite UNA errata en un término del acervo
+/// —un nombre de campo, una palabra de un valor—.
+///
+/// El número está medido, no elegido: sobre el vocabulario real del corpus de
+/// prueba (345 raíces distintas de nombres de campo y de valores), admitir una
+/// errata desde 5 letras confunde «acto» con «actor», «firma» con «forma»,
+/// «forma» con «norma» y —el peor— «estad» (el campo «Estado») con «estrad»
+/// (el apellido «Estrada»). Desde 6 sobrevive esa última. Desde 7 no queda
+/// ningún par de términos realmente distintos que se confundan: el único que
+/// cae dentro es «dictamen»/«dictamin», que son la misma palabra.
+///
+/// El acervo es vocabulario ABIERTO —crece con cada documento que se indexa—,
+/// así que su margen tiene que ser el que aguante vocabulario que todavía no
+/// existe. De ahí que sea más estricto que el de las listas cerradas.
+const TYPO_FROM_ACERVO: usize = 7;
+
+/// Lo mismo para el vocabulario CERRADO del propio motor: los verbos
+/// copulativos, las partículas de negación y las palabras con las que se
+/// formula una pregunta. Son unas 130 palabras conocidas de antemano y ajenas
+/// a cualquier giro de negocio, así que su riesgo se puede medir entero: con
+/// una errata desde 5 letras, de las 335 palabras del corpus de prueba sólo
+/// una se leería mal —el apellido «Terán» como «serán»—, y el resto de los
+/// choques son la misma palabra que ya estaba en la lista («documento» /
+/// «documentos»). Cinco es además la longitud mínima que hace falta para que
+/// «stan» pueda leerse como «están», que es el caso que motivó todo esto.
+const TYPO_FROM_CLOSED: usize = 5;
+
+/// A partir de cuántas letras se admiten DOS erratas. Una palabra larga se
+/// teclea peor y tiene más margen antes de parecerse a otra: en el corpus de
+/// prueba, subir a dos desde diez letras no confunde ningún par nuevo, ni
+/// dentro del acervo ni contra el vocabulario cerrado.
+const SECOND_TYPO_FROM: usize = 10;
+
+fn typo_budget(known: &[char], first: usize) -> usize {
+    if known.len() >= SECOND_TYPO_FROM {
+        2
+    } else if known.len() >= first {
+        1
+    } else {
+        0
+    }
+}
+
+/// Distancia de edición de Damerau en su variante OSA —una letra de más, de
+/// menos, cambiada, o dos letras adyacentes intercambiadas— comparada contra
+/// un tope, sin calcularla entera cuando ya se pasó.
+///
+/// Las cuatro operaciones son exactamente los cuatro errores de dedo que se
+/// cometen escribiendo deprisa. No hay ninguna regla de español aquí: es
+/// aritmética sobre caracteres, así que funciona igual sobre el vocabulario de
+/// cualquier giro de negocio.
+fn within_edit_distance(left: &[char], right: &[char], budget: usize) -> bool {
+    if left.len().abs_diff(right.len()) > budget {
+        return false;
+    }
+    let mut before_previous: Vec<usize> = Vec::new();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for i in 1..=left.len() {
+        let mut current = vec![0usize; right.len() + 1];
+        current[0] = i;
+        for j in 1..=right.len() {
+            let substitution = usize::from(left[i - 1] != right[j - 1]);
+            let mut best = (previous[j] + 1)
+                .min(current[j - 1] + 1)
+                .min(previous[j - 1] + substitution);
+            if i > 1 && j > 1 && left[i - 1] == right[j - 2] && left[i - 2] == right[j - 1] {
+                best = best.min(before_previous[j - 2] + 1);
+            }
+            current[j] = best;
+        }
+        if current.iter().min().copied().unwrap_or(usize::MAX) > budget {
+            return false;
+        }
+        before_previous = previous;
+        previous = current;
+    }
+    previous[right.len()] <= budget
+}
+
+fn matches_with_typos(term: &str, known: &str, first: usize) -> bool {
+    let term = term.chars().collect::<Vec<_>>();
+    let known = known.chars().collect::<Vec<_>>();
+    let budget = typo_budget(&known, first);
+    budget > 0 && within_edit_distance(&term, &known, budget)
+}
+
+/// `stems_match` más tolerancia a erratas contra un término **del acervo**.
+///
+/// El segundo argumento es siempre el término conocido —el nombre de campo o
+/// la palabra del valor que el índice sí tiene—, porque es su longitud la que
+/// fija cuánta errata se admite: la palabra del usuario puede venir con letras
+/// de más o de menos y no sirve para medir.
+///
+/// No sustituye a `stems_match`: lo llama primero. Una coincidencia exacta o
+/// morfológica sigue siendo eso, y quien use esta función tiene que poder
+/// distinguirla de una coincidencia por errata, para que la segunda nunca le
+/// gane a la primera ni se resuelva al azar entre dos candidatos.
+pub fn stems_match_with_typos(term: &str, known: &str) -> bool {
+    stems_match(term, known) || matches_with_typos(term, known, TYPO_FROM_ACERVO)
+}
+
+/// Igual, pero contra una palabra del vocabulario cerrado del propio motor.
+/// Se compara palabra con palabra —sin raíces— porque así es como esas listas
+/// se consultan en el resto del código.
+pub fn written_like(word: &str, known: &str) -> bool {
+    word == known || matches_with_typos(word, known, TYPO_FROM_CLOSED)
+}
+
 /// Reduce hasta que ninguna regla vuelva a aplicar, en vez de una sola pasada.
 ///
 /// Un sustantivo español que YA termina en "-és"/"-es" en singular (interés,
@@ -225,6 +333,40 @@ mod tests {
         // Un caso que ya converge exactamente sigue funcionando igual (el
         // camino corto de `a == b`, sin depender de la tolerancia).
         assert!(stems_match(&root_token("papel"), &root_token("papeles")));
+    }
+
+    #[test]
+    fn a_typo_is_tolerated_in_proportion_to_the_length_of_the_known_word() {
+        // Los dos casos que motivaron la tolerancia.
+        assert!(stems_match_with_typos("apelasion", "apelacion"));
+        assert!(stems_match_with_typos("conclucion", "conclusion"));
+        // Las cuatro formas del error de dedo, sobre una palabra larga.
+        assert!(stems_match_with_typos("conclusionn", "conclusion")); // letra de mas
+        assert!(stems_match_with_typos("conclsion", "conclusion")); // letra de menos
+        assert!(stems_match_with_typos("conclusiin", "conclusion")); // letra cambiada
+        assert!(stems_match_with_typos("conclusino", "conclusion")); // transpuestas
+        // Una palabra corta no admite ninguna: ahi una letra ya distingue dos
+        // palabras distintas.
+        assert!(!stems_match_with_typos("acto", "actor"));
+        assert!(!stems_match_with_typos("firma", "forma"));
+        assert!(!stems_match_with_typos("estad", "estrad"));
+        // Y dos palabras largas realmente distintas siguen siendo distintas.
+        assert!(!stems_match_with_typos("apelacion", "operacion"));
+        assert!(!stems_match_with_typos("rescision", "revision"));
+    }
+
+    #[test]
+    fn the_closed_vocabulary_of_the_engine_tolerates_a_typo_from_five_letters() {
+        // El caso del encargo: «stan» por «están».
+        assert!(written_like("stan", "estan"));
+        assert!(written_like("tinen", "tienen"));
+        // Cuatro letras siguen sin margen.
+        assert!(!written_like("er", "era"));
+        assert!(!written_like("so", "son"));
+        // Y una palabra del acervo no se convierte en verbo por parecerse de
+        // lejos: «estado» esta a dos letras de «estan», no a una.
+        assert!(!written_like("estado", "estan"));
+        assert!(!written_like("estado", "esta"));
     }
 
     #[test]

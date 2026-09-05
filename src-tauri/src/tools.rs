@@ -19,7 +19,7 @@ use crate::{
     },
     normalize::{
         canonical_identifier, canonical_key, normalize_exact, normalize_literal, normalize_spanish,
-        search_terms, stems_match,
+        search_terms, stems_match, stems_match_with_typos, written_like,
     },
 };
 
@@ -2641,11 +2641,13 @@ impl ToolEngine {
             if value_terms.is_empty() || value_terms.len() > 8 {
                 continue;
             }
-            let field_named = terms_contain_all(&query_terms, &field_terms);
+            let field_named = terms_contain_all_with_typos(&query_terms, &field_terms);
+            // Un valor con cifras se exige literal: una errata dentro de un
+            // importe o de un folio cambia el dato, no la ortografía.
             let value_named = if value.chars().any(char::is_numeric) {
                 whole_phrase_in(&exact_query, &normalize_exact(&value))
             } else {
-                terms_contain_all(&query_terms, &value_terms)
+                terms_contain_all_with_typos(&query_terms, &value_terms)
             };
             if !value_named {
                 // Sin verbo no hay dónde cortar la frase y se mira entera;
@@ -2696,7 +2698,7 @@ impl ToolEngine {
                 });
             } else if allow_implicit_values
                 && (value_terms.len() >= 2 || value_type == "state")
-                && terms_contain_all(&unquoted_terms, &value_terms)
+                && terms_contain_all_with_typos(&unquoted_terms, &value_terms)
             {
                 implicit
                     .entry(normalize_spanish(&value))
@@ -2799,9 +2801,9 @@ impl ToolEngine {
                 known.extend(search_terms(origin));
             }
             let lands = |term: &String| {
-                known
-                    .iter()
-                    .any(|known| stems_match(known, term) || prefix_terms_match(known, term))
+                known.iter().any(|known| {
+                    stems_match_with_typos(term, known) || prefix_terms_match(known, term)
+                })
             };
             match (predicate, predicate_terms) {
                 (Some(predicate), Some(predicate_terms)) => {
@@ -4168,6 +4170,18 @@ fn terms_contain_all(haystack: &[String], needles: &[String]) -> bool {
         })
 }
 
+/// `terms_contain_all` admitiendo erratas en las palabras que el usuario
+/// escribió. Las agujas son siempre términos del acervo —el nombre de un campo
+/// o las palabras de un valor—, que es lo que fija cuánta errata se tolera.
+fn terms_contain_all_with_typos(haystack: &[String], needles: &[String]) -> bool {
+    !needles.is_empty()
+        && needles.iter().all(|needle| {
+            haystack.iter().any(|term| {
+                stems_match_with_typos(term, needle) || prefix_terms_match(term, needle)
+            })
+        })
+}
+
 fn prefix_terms_match(left: &str, right: &str) -> bool {
     left.len().min(right.len()) >= 4 && (left.starts_with(right) || right.starts_with(left))
 }
@@ -4282,9 +4296,16 @@ fn stranded_span(query: &str, lands: &dyn Fn(&String) -> bool) -> Option<String>
 
 fn predicate_after_verb(query: &str) -> Option<String> {
     let words = query.split_whitespace().collect::<Vec<_>>();
-    let at = words
-        .iter()
-        .position(|word| PREDICATE_VERBS.contains(&normalize_exact(word).as_str()))?;
+    // El verbo se reconoce aunque venga mal escrito: «stan» por «están» es un
+    // dedo que se saltó una letra, no una palabra distinta. Sin esto, el corte
+    // entre sujeto y predicado desaparecía por una sola letra y con él la
+    // lectura entera de lo que la pregunta afirma.
+    let at = words.iter().position(|word| {
+        let word = normalize_exact(word);
+        PREDICATE_VERBS
+            .iter()
+            .any(|verb| written_like(&word, verb))
+    })?;
     let predicate = words[at + 1..]
         .join(" ")
         .trim_matches(|c: char| !c.is_alphanumeric())

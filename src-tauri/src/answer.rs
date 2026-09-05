@@ -24,7 +24,7 @@ use crate::{
     model::{Evidence, SearchHit, TypedValue, ValueKind},
     normalize::{
         canonical_identifier, normalize_exact, normalize_literal, normalize_spanish, search_terms,
-        stems_match,
+        stems_match, stems_match_with_typos,
     },
     tools::{DocumentValue, FieldRole, PREDICATE_VERBS, QuestionFieldRoles, SignRecord, ToolEngine},
     verifier::value_is_supported,
@@ -1833,7 +1833,14 @@ fn resolve_field(
     premise: Option<&LocatorPremise>,
 ) -> FieldMatch {
     let asks_for_a_value = asks_for_a_field_value(question);
-    let mut best: Option<(usize, usize, String)> = None;
+    // Tres cifras por candidato, y el orden entre ellas es lo que impide que
+    // una errata le gane a una palabra bien escrita: primero cuántas palabras
+    // del nombre coinciden EXACTAMENTE, después cuántas coinciden contando las
+    // que sólo se parecen, y por último cuántas quedaron sin coincidir. Un
+    // campo nombrado con todas sus letras gana siempre a otro que sólo se le
+    // parece, y dos campos que se parecen igual de bien empatan — y un empate
+    // ya se responde preguntando, nunca eligiendo.
+    let mut best: Option<(usize, usize, usize, String)> = None;
     let mut tied = false;
     for name in vocabulary {
         // Un campo que la pregunta sólo escribe para señalar el documento no
@@ -1846,9 +1853,17 @@ fn resolve_field(
         if !has_significant_term {
             continue;
         }
-        let matched = field_terms
+        let matched_exactly = field_terms
             .iter()
             .filter(|term| terms.iter().any(|query_term| stems_match(query_term, term)))
+            .count();
+        let matched = field_terms
+            .iter()
+            .filter(|term| {
+                terms
+                    .iter()
+                    .any(|query_term| stems_match_with_typos(query_term, term))
+            })
             .count();
         // Un campo sólo está pedido si algo que la pregunta escribió POR SU
         // CUENTA lo nombra. Las palabras del identificador citado no cuentan,
@@ -1856,7 +1871,9 @@ fn resolve_field(
         // las de relleno: están en la pregunta porque hacían falta para
         // localizar el documento, no porque describan el dato que se busca.
         let has_real_match = field_terms.iter().any(|term| {
-            terms.iter().any(|query_term| stems_match(query_term, term))
+            terms
+                .iter()
+                .any(|query_term| stems_match_with_typos(query_term, term))
                 && !type_words.contains(term)
                 && !identifier_words.contains(term)
                 && !FILLER_ROOTS.contains(term)
@@ -1878,19 +1895,22 @@ fn resolve_field(
         // adjudicar el campo, y quedarse sin candidato es la salida honesta.
         let head_matched = field_terms
             .first()
-            .is_some_and(|head| terms.iter().any(|term| stems_match(term, head)));
+            .is_some_and(|head| terms.iter().any(|term| stems_match_with_typos(term, head)));
         if !asks_for_a_value && unmatched > 0 && !head_matched {
             continue;
         }
+        let score = (matched_exactly, matched, unmatched);
         match &best {
-            None => best = Some((matched, unmatched, name.clone())),
-            Some((best_matched, best_unmatched, _)) => {
-                if matched > *best_matched
-                    || (matched == *best_matched && unmatched < *best_unmatched)
+            None => best = Some((matched_exactly, matched, unmatched, name.clone())),
+            Some((best_exact, best_matched, best_unmatched, _)) => {
+                let current = (*best_exact, *best_matched, *best_unmatched);
+                if score.0 > current.0
+                    || (score.0 == current.0
+                        && (score.1 > current.1 || (score.1 == current.1 && score.2 < current.2)))
                 {
-                    best = Some((matched, unmatched, name.clone()));
+                    best = Some((matched_exactly, matched, unmatched, name.clone()));
                     tied = false;
-                } else if matched == *best_matched && unmatched == *best_unmatched {
+                } else if score == current {
                     tied = true;
                 }
             }
@@ -1899,7 +1919,7 @@ fn resolve_field(
     match best {
         None => FieldMatch::NotRequested,
         Some(_) if tied => FieldMatch::Ambiguous,
-        Some((_, _, name)) => FieldMatch::Resolved(name),
+        Some((_, _, _, name)) => FieldMatch::Resolved(name),
     }
 }
 
