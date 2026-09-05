@@ -1790,7 +1790,36 @@ impl ToolEngine {
             "f) pinned_document: sin ancla, heredado cubre {covered}/{} pistas",
             clues.len()
         );
-        Ok((covered == clues.len()).then_some(document_id))
+        if covered == clues.len() {
+            return Ok(Some(document_id));
+        }
+        if covered == 0 {
+            crate::trace!("f) pinned_document: 0 pistas cubiertas -> None");
+            return Ok(None);
+        }
+        // Ronda 2, punto 06: cobertura incompleta no siempre es un cambio de
+        // tema. Si TODAS las pistas que el heredado no cubre tampoco nombran
+        // nada en ningún documento del acervo —ni un campo, ni un valor, ni
+        // un título ni una carpeta—, son palabras de gramática («procesal»,
+        // «hasta», «quedó»: verbos y adjetivos que ningún documento registra
+        // como dato) y no señalan un tipo de documento distinto. Si aunque
+        // sea una sí nombra algo del acervo —el caso medido y peligroso:
+        // «testamento» tras fijar un poder que comparte el campo
+        // «vigencia»—, sigue sin heredar, exactamente como antes. La
+        // distinción es cuál pista falta, no un umbral distinto.
+        let uncovered = self.clues_not_covered(document_id, &clues)?;
+        let mut all_uncovered_are_grammar = true;
+        for clue in &uncovered {
+            if is_universal_scope_word(clue) || self.clue_names_something_in_the_corpus(clue)? {
+                all_uncovered_are_grammar = false;
+                break;
+            }
+        }
+        crate::trace!(
+            "f) pinned_document: pistas no cubiertas = {:?}, todas de gramática (no nombran nada en el acervo) = {all_uncovered_are_grammar}",
+            uncovered
+        );
+        Ok(all_uncovered_are_grammar.then_some(document_id))
     }
 
     /// Documentos que cumplen todas las anclas de la pregunta.
@@ -2076,6 +2105,72 @@ impl ToolEngine {
             .iter()
             .filter(|clue| words.iter().any(|word| stems_match(word, clue)))
             .count())
+    }
+
+    /// Pistas que el documento heredado NO cubre —ni en su título, ni en su
+    /// carpeta, ni en el nombre o valor de ninguno de sus campos—. Es la
+    /// misma bolsa de palabras que arma `covered_clues`; aquí interesa
+    /// CUÁLES faltan, no cuántas.
+    fn clues_not_covered(&self, document_id: i64, clues: &[String]) -> Result<Vec<String>> {
+        let connection = self.database.connect()?;
+        let (title, origin): (String, String) = connection.query_row(
+            "SELECT title, origin FROM documents WHERE id = ?1",
+            [document_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut words = search_terms(&format!("{title} {origin}"));
+        for value in self.document_values(document_id)? {
+            words.extend(search_terms(&value.field));
+            words.extend(search_terms(&value.value));
+        }
+        Ok(clues
+            .iter()
+            .filter(|clue| !words.iter().any(|word| stems_match(word, clue)))
+            .cloned()
+            .collect())
+    }
+
+    /// ¿Nombra `clue`, letra por letra, ALGO del acervo completo —el nombre
+    /// de un concepto, o el valor, título o carpeta de cualquier documento,
+    /// no sólo el heredado—?
+    ///
+    /// Distingue una palabra de pura gramática (no nombra nada en ningún
+    /// documento del acervo) de una que sí podría señalar un tipo de
+    /// documento o un campo distintos, aunque no sean los del documento
+    /// heredado. Sólo la primera es segura de perdonar cuando la cobertura
+    /// del heredado queda incompleta: es una cuenta sobre el propio índice,
+    /// no una lista de palabras.
+    fn clue_names_something_in_the_corpus(&self, clue: &str) -> Result<bool> {
+        let connection = self.database.connect()?;
+        let mut statement = connection.prepare("SELECT DISTINCT display_name FROM concepts")?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if names
+            .iter()
+            .any(|name| search_terms(name).iter().any(|term| stems_match(term, clue)))
+        {
+            return Ok(true);
+        }
+        let mut statement = connection.prepare("SELECT DISTINCT text_value FROM extracted_values")?;
+        let values = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if values
+            .iter()
+            .any(|value| search_terms(value).iter().any(|term| stems_match(term, clue)))
+        {
+            return Ok(true);
+        }
+        let mut statement = connection.prepare("SELECT DISTINCT title, origin FROM documents")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.iter().any(|(title, origin)| {
+            search_terms(&format!("{title} {origin}"))
+                .iter()
+                .any(|term| stems_match(term, clue))
+        }))
     }
 
     /// Cuánto distingue cada campo, leído del propio acervo: un campo que casi
@@ -4226,6 +4321,22 @@ fn predicate_after_verb(query: &str) -> Option<String> {
         .trim_matches(|c: char| !c.is_alphanumeric())
         .to_owned();
     (!predicate.is_empty()).then_some(predicate)
+}
+
+/// «Todo/toda/todos/todas», «corpus», «acervo»: cuantificadores que declaran
+/// alcance universal por su cuenta —la misma familia de palabras que
+/// `Signals::whole_scope` en planner.rs usa para distinguir «todo el acervo»
+/// de «no dijo nada sobre el alcance»—.
+///
+/// Aunque una de estas palabras no nombre ningún campo ni valor del acervo,
+/// NO es gramática inerte para `pinned_document`: perdonarla como si lo
+/// fuera confundía «¿a cuánto asciende el total facturado por todo el
+/// despacho?» —una pregunta que declara su propio alcance sobre el acervo
+/// entero— con una continuación sobre el documento que ya se discutía, y el
+/// fijado secuestraba una suma que debía calcularse sobre las 70 facturas
+/// del acervo, devolviendo el valor de una sola.
+fn is_universal_scope_word(clue: &str) -> bool {
+    matches!(clue, "todo" | "toda" | "todos" | "todas" | "corpus" | "acervo")
 }
 
 /// Conserva sólo términos de contenido. La lista contiene palabras de
