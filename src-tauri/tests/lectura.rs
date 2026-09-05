@@ -175,7 +175,7 @@ fn the_reading_never_changes_the_answer_or_its_citations() {
         "Muéstrame los documentos con Beta Activo.",
     ] {
         let direct = engine.ask(question).unwrap();
-        let conversational = engine.ask_in_conversation("prueba", question).unwrap();
+        let conversational = engine.ask_in_conversation(question, question).unwrap();
 
         assert_eq!(direct.text, conversational.text, "«{question}»");
         assert_eq!(
