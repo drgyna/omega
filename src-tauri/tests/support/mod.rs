@@ -121,14 +121,6 @@ impl SheetCell {
         }
     }
 
-    pub fn empty() -> Self {
-        Self {
-            value: None,
-            inline_text: None,
-            number_format: None,
-            formula: None,
-        }
-    }
 }
 
 pub fn column_name(mut index: usize) -> String {
@@ -263,37 +255,6 @@ pub fn write_pdf(path: &Path, lines: &[&str]) {
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_owned(),
         format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()),
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
-    ];
-    let mut output = b"%PDF-1.4\n".to_vec();
-    let mut offsets = vec![0usize];
-    for (index, object) in objects.iter().enumerate() {
-        offsets.push(output.len());
-        output.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
-    }
-    let xref = output.len();
-    output.extend_from_slice(
-        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
-    );
-    for offset in offsets.iter().skip(1) {
-        output.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    output.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
-            objects.len() + 1
-        )
-        .as_bytes(),
-    );
-    fs::write(path, output).unwrap();
-}
-
-/// PDF sin capa de texto: obliga a pasar por OCR.
-pub fn write_scanned_pdf(path: &Path) {
-    let objects = vec![
-        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_owned(),
-        "<< /Length 0 >>\nstream\n\nendstream".to_owned(),
     ];
     let mut output = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
