@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/davidramirez/Documents/omega-inmobiliaria-prueba/**)",
+      "Read(//Users/davidramirez/Documents/thoth-prueba-despacho-legal/**)",
+      "Read(//Users/davidramirez/Projects/**)",
+      "Read(//Users/davidramirez/.Trash/thoth-business-desktop/**)",
+      "Bash(echo \"=== Omega intacto ===\" *)",
+      "Read(//Users/davidramirez/.claude/projects/-Users-davidramirez/memory/**)",
+      "Read(//Users/davidramirez/Library/Logs/DiagnosticReports/**)",
+      "Read(//Users/davidramirez/Library/Application Support/CrashReporter/**)",
+      "Read(//Users/davidramirez/Library/Caches/claude-cli-nodejs/**)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(npm run *)",
+      "Bash(sqlite3 '/Users/davidramirez/Library/Application Support/com.omega.desktop/omega.db' 'PRAGMA table_info\\(extracted_values\\);')",
+      "Bash(sqlite3 '/Users/davidramirez/Library/Application Support/com.omega.desktop/omega.db' 'SELECT document_id, ordinal, row_ordinal, identifier_canonical, location FROM extracted_values WHERE identifier_canonical='\\\\''prop20260001'\\\\'' ORDER BY document_id;')",
+      "Bash(sqlite3 '/Users/davidramirez/Library/Application Support/com.omega.desktop/omega.db' 'SELECT COUNT\\(*\\) total, SUM\\(CASE WHEN ordinal IS NULL THEN 1 ELSE 0 END\\) null_ordinal FROM extracted_values;')",
+      "Bash(sqlite3 '/Users/davidramirez/Library/Application Support/com.omega.desktop/omega.db' 'SELECT id, path, indexed_at FROM source_folders;')",
+      "Bash(sqlite3 '/Users/davidramirez/Library/Application Support/com.omega.desktop/omega.db' 'SELECT indexed_at FROM documents ORDER BY indexed_at DESC LIMIT 3;')"
+    ]
+  }
+}
