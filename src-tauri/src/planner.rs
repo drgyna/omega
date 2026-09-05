@@ -1289,6 +1289,12 @@ struct Signals {
     multiply: bool,
     /// «dividir», «dividido», «división»: idem, para el cociente.
     divide: bool,
+    /// «corpus», «acervo», «todo/toda/todos/todas»: la pregunta declara por sí
+    /// misma un alcance universal —el acervo completo—, aunque esa palabra no
+    /// produzca ningún `ToolFilter` que filtrar. Sin esta señal, una pregunta
+    /// así se confundía con «la pregunta no acotó nada», que es justo la forma
+    /// de una continuación elíptica.
+    whole_scope: bool,
 }
 
 const CONTAINER_WORDS: &[&str] = &[
@@ -1458,6 +1464,7 @@ fn signals(question: &str) -> Signals {
         calendar: CALENDAR_WORDS.iter().any(|value| word(value)),
         multiply: has("multiplic"),
         divide: has("dividi") || has("division"),
+        whole_scope: any_word(&["corpus", "acervo", "todo", "toda", "todos", "todas"]),
     }
 }
 
@@ -2764,11 +2771,19 @@ fn resolve_scope(
     // referirse al conjunto que la conversación ya tiene delante. Si la
     // pregunta trae cualquier alcance propio, manda el suyo y no se hereda
     // nada: el contexto nunca añade un filtro que el usuario no pidió.
+    //
+    // «Todo el acervo» SÍ es alcance propio, aunque no produzca ningún
+    // `ToolFilter`: es, en español, el alcance más amplio posible, no la
+    // ausencia de alcance. Sin `!marks.whole_scope` aquí, una pregunta que
+    // declaraba su propio alcance universal se confundía con una que no decía
+    // nada sobre el alcance, y heredaba el identificador de la conversación
+    // anterior en vez del acervo completo que pidió.
     let elliptical = reference == Reference::None
         && wants_operation
         && own_filters.is_empty()
         && origin.is_none()
         && !own_period
+        && !marks.whole_scope
         && state.set.is_some();
     let inherit = reference == Reference::Explicit || elliptical;
     if inherit {
